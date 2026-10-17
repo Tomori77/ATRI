@@ -1,6 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const textSettings = ['format', 'model', 'baseUrl', 'timeZone', 'embeddingModel', 'embeddingBaseUrl'];
-const numberSettings = [
+const textSettings = ['format', 'model', 'baseUrl', 'timeZone', 'embeddingModel', 'embeddingBaseUrl'];const numberSettings = [
   'contextWindowTokens',
   'inputBudgetTokens',
   'maxOutputTokens',
@@ -227,8 +226,12 @@ function applySettings(c) {
   for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) $(key).checked = c[key];
   $('apiKey').placeholder = c.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
   $('tavilyKey').placeholder = c.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
+  $('embeddingApiKey').placeholder = c.hasEmbeddingApiKey
+    ? '已配置，留空保持原值'
+    : '留空则使用上方模型密钥';
   $('apiKey').value = '';
   $('tavilyKey').value = '';
+  $('embeddingApiKey').value = '';
   updateBudget();
 }
 function updateBudget() {
@@ -600,7 +603,7 @@ $('settings-form').onsubmit = (e) => {
   perform(async () => {
     const version = settingsVersion;
     const body = {};
-    for (const key of [...textSettings, 'apiKey', 'tavilyKey']) body[key] = $(key).value;
+    for (const key of [...textSettings, 'apiKey', 'tavilyKey', 'embeddingApiKey']) body[key] = $(key).value;
     for (const key of numberSettings) body[key] = $(key).valueAsNumber;
     body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
     for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) body[key] = $(key).checked;

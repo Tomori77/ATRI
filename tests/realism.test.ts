@@ -239,7 +239,8 @@ test('作息节律：活跃时段渲染成时间段提示', () => {
 test('主动联系提示词包含惦记的事与节律，回复长度镜像写入基础提示词', async (t) => {
   const now = Date.now();
   const model = new FakeModel(() => completion({ messages: ['还在忙吗'], memoryUpdates: [] }));
-  const f = fixture(t, model, { proactiveEnabled: true });
+  // 用例基于真实时钟取 now，安静时段随运行时刻变化，这里直接停用。
+  const f = fixture(t, model, { proactiveEnabled: true, quietStart: 0, quietEnd: 0 });
   f.store.ensurePeer('wechat:p', 'wechat', 'p', 'context', true);
   const source = f.store.ingest('wechat:p', 'src', '我明天面试', [], now - 26 * 3600000).message;
   f.store.addOpenLoop(
@@ -271,7 +272,7 @@ test('到期开环让 proactive 在沉默期照常触发且了结后归于安静
   t.mock.method(Date, 'now', () => now);
   t.mock.method(Math, 'random', () => 0);
   const model = new FakeModel(() => completion({ messages: ['面试顺利吗'], memoryUpdates: [] }));
-  const f = fixture(t, model, { proactiveEnabled: true });
+  const f = fixture(t, model, { proactiveEnabled: true, quietStart: 0, quietEnd: 0 });
   f.store.ensurePeer('wechat:p', 'wechat', 'p', 'context', true);
   const source = f.store.ingest('wechat:p', 'src', '我明天面试', [], now - 26 * 3600000).message;
   f.store.addOpenLoop(

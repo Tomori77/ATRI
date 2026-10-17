@@ -113,6 +113,38 @@ test('模型配置校验是原子的，空密钥保持原值', async (t) => {
   assert.equal(f.settings.config().model, 'new-model');
 });
 
+test('向量密钥独立于主密钥，留空回退主密钥，可单独清除', async (t) => {
+  const f = server(t);
+  assert.equal(f.settings.embedding().apiKey, 'hidden-test-model-key');
+  const saved = await f.app.inject({
+    method: 'PUT',
+    url: '/api/config',
+    headers: f.headers,
+    payload: { embeddingApiKey: 'hidden-embed-key' },
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(saved.json().hasEmbeddingApiKey, true);
+  assert.doesNotMatch(saved.body, /hidden-embed-key/);
+  assert.equal(f.settings.embedding().apiKey, 'hidden-embed-key');
+  const blank = await f.app.inject({
+    method: 'PUT',
+    url: '/api/config',
+    headers: f.headers,
+    payload: { embeddingApiKey: '   ' },
+  });
+  assert.equal(blank.statusCode, 200);
+  assert.equal(f.settings.embedding().apiKey, 'hidden-embed-key', '空值不覆盖已有密钥');
+  const cleared = await f.app.inject({
+    method: 'PUT',
+    url: '/api/config',
+    headers: f.headers,
+    payload: { clearEmbeddingApiKey: true },
+  });
+  assert.equal(cleared.statusCode, 200);
+  assert.equal(cleared.json().hasEmbeddingApiKey, false);
+  assert.equal(f.settings.embedding().apiKey, 'hidden-test-model-key', '清除后回退主密钥');
+});
+
 test('网页调试参数写入配置，并传递给模型请求与对话运行时', async (t) => {
   const f = server(t);
   const parameters = {

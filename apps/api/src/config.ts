@@ -26,6 +26,7 @@ export interface SavedConfig {
   temperature: number | null;
   embeddingEnabled: boolean;
   embeddingBaseUrl: string;
+  embeddingApiKey: string;
   embeddingModel: string;
   maxConcurrentPeers: number;
   debounceMs: number;
@@ -79,6 +80,7 @@ export class Settings {
       temperature: null,
       embeddingEnabled: false,
       embeddingBaseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
+      embeddingApiKey: env.EMBEDDING_API_KEY || '',
       embeddingModel: '',
       maxConcurrentPeers: 3,
       debounceMs: 800,
@@ -86,11 +88,12 @@ export class Settings {
     return { ...defaults, ...this.store.getSetting<Partial<SavedConfig>>('config', {}) };
   }
   publicConfig() {
-    const { apiKey, tavilyKey, ...rest } = this.config();
+    const { apiKey, tavilyKey, embeddingApiKey, ...rest } = this.config();
     return {
       ...rest,
       hasApiKey: !!apiKey,
       hasTavilyKey: !!tavilyKey,
+      hasEmbeddingApiKey: !!embeddingApiKey,
     };
   }
   update(input: Record<string, unknown>) {
@@ -102,8 +105,11 @@ export class Settings {
     if (typeof input.apiKey === 'string' && input.apiKey.trim()) next.apiKey = input.apiKey.trim();
     if (typeof input.tavilyKey === 'string' && input.tavilyKey.trim())
       next.tavilyKey = input.tavilyKey.trim();
+    if (typeof input.embeddingApiKey === 'string' && input.embeddingApiKey.trim())
+      next.embeddingApiKey = input.embeddingApiKey.trim();
     if (input.clearApiKey === true) next.apiKey = '';
     if (input.clearTavilyKey === true) next.tavilyKey = '';
+    if (input.clearEmbeddingApiKey === true) next.embeddingApiKey = '';
     if (input.format !== undefined) {
       if (!['openai', 'anthropic', 'gemini'].includes(String(input.format)))
         throw new Error('模型接口格式无效');
@@ -211,7 +217,7 @@ export class Settings {
     const c = this.config();
     return {
       baseUrl: c.embeddingBaseUrl || c.baseUrl,
-      apiKey: c.apiKey,
+      apiKey: c.embeddingApiKey || c.apiKey,
       model: c.embeddingModel,
       timeoutMs: Math.min(c.requestTimeoutSeconds, 60) * 1000,
     };
