@@ -24,7 +24,6 @@ import {
   PROMPT_MEMORIES,
   RECALL_CONTENT_MAX_CHARS,
   MEMORY_CONTENT_MAX_CHARS,
-  MEMORY_SOURCES_MAX,
   PROMPT_STICKERS,
   TOOL_RESERVE_MAX_TOKENS,
   CONTEXT_FLEX_FRACTION,
@@ -38,6 +37,7 @@ import {
   SILENCE_NOTIFY_MINUTES,
   SILENCE_HOURS_THRESHOLD,
   OPEN_LOOP_PROMPT_MAX,
+  NOTES_MAX_TOKENS,
   RHYTHM_MIN_BUCKET,
   DIARY_MAX_SECTIONS,
 } from './constants.js';
@@ -358,7 +358,7 @@ export class Agent {
         reserve -
         PROMPT_HEADROOM_TOKENS,
     );
-    const notes = trimToTokens(peer.notes, Math.min(1500, optional));
+    const notes = trimToTokens(peer.notes, Math.min(NOTES_MAX_TOKENS, optional));
     optional -= estimateTextTokens(notes);
     const memoryBudget = Math.min(3000, optional);
     const pickedMemories = [...memories];
@@ -637,7 +637,7 @@ export class Agent {
     const prompt =
       (kind === 'diary' ? this.o.prompt('persona') + '\n\n' : '') + this.o.prompt(kind);
     const budget = this.o.contextTokens();
-    const notes = trimToTokens(peer.notes, Math.min(1500, budget * 0.08));
+    const notes = trimToTokens(peer.notes, Math.min(NOTES_MAX_TOKENS, budget * 0.08));
     const memories = store.rankedMemories(peer.id, 12);
     while (
       memories.length &&

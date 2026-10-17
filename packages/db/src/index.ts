@@ -157,8 +157,7 @@ export const MEMORY_HALFLIFE_DAYS = 14;
 export const MEMORY_RECENCY_FLOOR = 0.35;
 export const MEMORY_STATED_WEIGHT = 2.2;
 export const MEMORY_INTERPRETATION_WEIGHT = 0.6;
-/** Open loops: ask about an arrangement once after it falls due, then retire. */
-export const OPEN_LOOP_ASK_AFTER_MS = 30 * 60000;
+/** Open loops: expire silently after this many days past due. */
 export const OPEN_LOOP_EXPIRE_DAYS = 7;
 /** Proactive brake: unanswered pings before the cooldown stretches to days. */
 export const PROACTIVE_IGNORE_LIMIT = 2;
@@ -168,6 +167,8 @@ export const MOOD_VALENCE_HALFLIFE_HOURS = 20;
 export const MOOD_ENERGY_HALFLIFE_HOURS = 8;
 /** Usage rollup: keep this many days of per-call rows, older ones aggregate. */
 export const USAGE_RETENTION_DAYS = 30;
+/** Hard character cap on stored topic notes. */
+export const NOTES_MAX_CHARS = 4000;
 
 export class Store {
   readonly sql: DatabaseSync;
@@ -819,7 +820,7 @@ export class Store {
       if (this.peer(task.peer_id)?.version === task.version)
         this.sql
           .prepare('UPDATE peers SET notes=?,notes_until=? WHERE id=?')
-          .run(notes.slice(0, 4000), through, task.peer_id);
+          .run(notes.slice(0, NOTES_MAX_CHARS), through, task.peer_id);
       this.finish(task.id);
     });
   }

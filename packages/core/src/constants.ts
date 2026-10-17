@@ -9,7 +9,6 @@ export const PROMPT_MEMORIES = 10;
 /** Per-item truncation for prompt materials. */
 export const RECALL_CONTENT_MAX_CHARS = 600;
 export const MEMORY_CONTENT_MAX_CHARS = 500;
-export const MEMORY_SOURCES_MAX = 3;
 export const PROMPT_STICKERS = 32;
 
 /** Fraction of the input budget reserved for tools and the latest turns. */
@@ -27,9 +26,9 @@ export const TOOL_RESULT_BUDGET_TOKENS = 6000;
 export const MAX_REPLY_PARTS = 6;
 export const MAX_MEMORY_UPDATES = 6;
 export const MAX_IMAGE_DESCRIPTIONS = 4;
-export const MAX_IMAGES_PER_TURN = 2;/** Notes (topic summary) limits. */
+export const MAX_IMAGES_PER_TURN = 2;
+/** Notes (topic summary) token cap inside prompts. */
 export const NOTES_MAX_TOKENS = 1500;
-export const NOTES_MAX_CHARS = 4000;
 /** Notes trigger: recent window length and its share of the input budget. */
 export const NOTES_MIN_MESSAGES = 20;
 export const NOTES_WINDOW = 200;
@@ -53,12 +52,9 @@ export const PROACTIVE_JITTER_MINUTES = 20;
 /** Proactive brake: after this many unanswered pings, pause for days. */
 export const PROACTIVE_IGNORE_LIMIT = 2;
 export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
-/** Open loops: ask once after due, expire silently after days. */
-export const OPEN_LOOP_ASK_AFTER_MS = 30 * 60000;
+/** Open loops: expire silently after this many days past due. */
 export const OPEN_LOOP_EXPIRE_DAYS = 7;
 export const OPEN_LOOP_PROMPT_MAX = 5;
-/** Mood state: pulse clamp per turn and prompt prose thresholds. */
-export const MOOD_PULSE_CLAMP = 0.35;
 /** Rhythm hint: minimum hourly messages before a bucket counts as habitual. */
 export const RHYTHM_MIN_BUCKET = 3;
 /** Embedding refresh: batch size per backfill pass. */
