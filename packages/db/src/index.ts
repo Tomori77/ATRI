@@ -2,6 +2,7 @@ import { DatabaseSync, backup } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { cosineSimilarity } from '@atri/llm';
 export { createBackup, restoreBackup } from './backup.js';
 
 export type TaskKind = 'chat' | 'notes' | 'diary' | 'proactive';
@@ -55,6 +56,8 @@ export interface Memory {
   kind: 'stated' | 'interpretation';
   sources: string[];
   status: string;
+  hits: number;
+  last_hit_at: number;
   created_at: number;
 }
 export interface DiarySection {
@@ -98,6 +101,14 @@ export interface SearchHit {
   memory_kind?: Memory['kind'];
   sources?: string[];
 }
+export interface EmbeddingVector {
+  id: string;
+  peer_id: string;
+  kind: SourceKind;
+  vector: Float32Array;
+  dims: number;
+  model: string;
+}
 type Row = Record<string, unknown>;
 const parse = <T>(value: unknown, fallback: T): T => {
   try {
@@ -106,7 +117,15 @@ const parse = <T>(value: unknown, fallback: T): T => {
     return fallback;
   }
 };
+/** A conservative, provider-independent estimate, not a model tokenizer. */
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
+/** Selection pressure for memory ranking: recency half-life (days) with a floor
+ *  so long-lived facts are never evicted by a flood of fresh interpretations,
+ *  and how much user-confirmed facts outrank subjective readings. */
+export const MEMORY_HALFLIFE_DAYS = 14;
+export const MEMORY_RECENCY_FLOOR = 0.35;
+export const MEMORY_STATED_WEIGHT = 2.2;
+export const MEMORY_INTERPRETATION_WEIGHT = 0.6;
 
 export class Store {
   readonly sql: DatabaseSync;
@@ -146,9 +165,15 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS memories (
         id TEXT PRIMARY KEY, peer_id TEXT NOT NULL REFERENCES peers(id), content TEXT NOT NULL, kind TEXT NOT NULL,
-        sources TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL,
+        sources TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+        hits INTEGER NOT NULL DEFAULT 0, last_hit_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
         UNIQUE(peer_id,source_hash)
       );
+      CREATE TABLE IF NOT EXISTS memory_embeddings (
+        id TEXT PRIMARY KEY, peer_id TEXT NOT NULL REFERENCES peers(id),
+        kind TEXT NOT NULL, vector BLOB NOT NULL, dims INTEGER NOT NULL, model TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS memory_embeddings_peer ON memory_embeddings(peer_id);
       CREATE TABLE IF NOT EXISTS diary_sections (
         id TEXT PRIMARY KEY, peer_id TEXT NOT NULL REFERENCES peers(id), task_id TEXT NOT NULL REFERENCES tasks(id),
         ordinal INTEGER NOT NULL, day TEXT NOT NULL, content TEXT NOT NULL, sources TEXT NOT NULL,
@@ -493,6 +518,8 @@ export class Store {
   }
   private index(id: string, peer: string, kind: SourceKind, content: string, at: number) {
     this.sql.prepare('DELETE FROM search_index WHERE id=?').run(id);
+    // Content changed: the stale vector must not survive the refresh.
+    this.sql.prepare('DELETE FROM memory_embeddings WHERE id=?').run(id);
     this.sql
       .prepare('INSERT INTO search_index(id,peer_id,kind,content,created_at) VALUES(?,?,?,?,?)')
       .run(id, peer, kind, content, at);
@@ -540,6 +567,41 @@ export class Store {
       )
       .all(peer)
       .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as Memory);
+  }
+  /** Memories ranked by usage, importance and recency for prompt inclusion. */
+  rankedMemories(peer: string, limit = 10): Memory[] {
+    const now = Date.now(),
+      halflifeMs = MEMORY_HALFLIFE_DAYS * 86400000;
+    const scored = this.memories(peer).map((m) => {
+      const age = Math.max(0, now - m.created_at);
+      const recency = Math.max(
+        MEMORY_RECENCY_FLOOR,
+        Math.pow(0.5, age / halflifeMs),
+      );
+      const kindWeight =
+        m.kind === 'stated' ? MEMORY_STATED_WEIGHT : MEMORY_INTERPRETATION_WEIGHT;
+      const hits = m.hits ?? 0;
+      return {
+        memory: m,
+        score: (1 + Math.sqrt(hits)) * recency * kindWeight,
+      };
+    });
+    return scored
+      .sort((a, b) => b.score - a.score || b.memory.created_at - a.memory.created_at)
+      .slice(0, limit)
+      .map((s) => s.memory);
+  }
+  /** Count prompt inclusions per memory so reused memories outrank one-offs. */
+  markMemoriesUsed(peer: string, ids: string[], now = Date.now()) {
+    const unique = [...new Set(ids)];
+    if (!unique.length) return;
+    const update = this.sql.prepare(
+      'UPDATE memories SET hits=hits+1, last_hit_at=? WHERE peer_id=? AND id=? AND status=?',
+    );
+    this.transaction(() => {
+      for (const id of unique)
+        update.run(now, peer, id, 'active');
+    });
   }
   private writeMemory(peer: string, update: MemoryUpdate, now: number) {
     const ids = [...new Set(update.sources)];
@@ -590,15 +652,29 @@ export class Store {
   correctMemory(peer: string, id: string, content: string) {
     this.transaction(() => {
       const original = this.sql
-        .prepare("SELECT id FROM memories WHERE peer_id=? AND id=? AND status='active'")
-        .get(peer, id);
+        .prepare("SELECT id,hits,last_hit_at FROM memories WHERE peer_id=? AND id=? AND status='active'")
+        .get(peer, id) as Row | undefined;
       if (!original) throw new Error('记忆不存在');
       const msg = this.ingest(peer, randomUUID(), `[管理页更正] ${content}`).message;
+      const carried = { hits: Number(original.hits ?? 0), at: Number(original.last_hit_at ?? 0) };
       this.writeMemory(
         peer,
         { content, kind: 'stated', sources: [msg.id], supersedes: [id] },
         Date.now(),
       );
+      if (carried.hits || carried.at) {
+        // A correction continues the same fact: carry over its usage history
+        // onto the newest row this correction just produced.
+        const newest = this.sql
+          .prepare(
+            "SELECT id FROM memories WHERE peer_id=? AND content=? AND status='active' ORDER BY created_at DESC LIMIT 1",
+          )
+          .get(peer, content.slice(0, 800)) as Row | undefined;
+        if (newest)
+          this.sql
+            .prepare('UPDATE memories SET hits=?,last_hit_at=? WHERE id=?')
+            .run(carried.hits, carried.at, String(newest.id));
+      }
       this.sql.prepare("UPDATE peers SET notes='',notes_until=0 WHERE id=?").run(peer);
     });
   }
@@ -699,12 +775,30 @@ export class Store {
             .run(mem.id);
         }
       for (const sourceId of invalid) this.unindex(sourceId);
+      this.dropEmbeddings(peer, [...invalid]);
       this.sql
         .prepare("UPDATE peers SET notes='',notes_until=0,version=version+1 WHERE id=?")
         .run(peer);
     });
   }
-  search(peer: string, query: string, limit = 6, kind?: SourceKind): SearchHit[] {
+  /** Rows needing embedding: indexed, not yet vectorized, newest first. */
+  pendingEmbeddings(peer: string, limit = 64): { id: string; kind: SourceKind; content: string; created_at: number }[] {
+    return this.sql
+      .prepare(
+        `SELECT s.id,s.kind,s.content,s.created_at FROM search_index s
+       LEFT JOIN memory_embeddings e ON e.id=s.id
+       WHERE s.peer_id=? AND e.id IS NULL
+       ORDER BY s.created_at DESC LIMIT ?`,
+      )
+      .all(peer, limit)
+      .map((r) => ({
+        id: String(r.id),
+        kind: String(r.kind) as SourceKind,
+        content: String(r.content),
+        created_at: Number(r.created_at),
+      }));
+  }
+  search(peer: string, query: string, limit = 6, kind?: SourceKind, queryVector?: Float32Array): SearchHit[] {
     const normalized = query.normalize('NFKC').toLowerCase();
     const words = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
     const terms = [
@@ -744,6 +838,19 @@ export class Store {
         )
         .all(peer, ...likeTerms, ...kindParameters),
     );
+    // Semantic candidates: rows that share no surface form with the query but
+    // are stored vectors — the whole point of hybrid retrieval.
+    if (queryVector) {
+      rows.push(
+        ...this.sql
+          .prepare(
+            `SELECT s.id,s.kind,s.content,s.created_at FROM memory_embeddings e JOIN search_index s ON s.id=e.id
+           WHERE e.peer_id=? ${kind ? 'AND s.kind=?' : ''}`,
+          )
+          .all(peer, ...(kind ? [kind] : []))
+          .map((r) => r as Row),
+      );
+    }
     return [...new Map(rows.map((r) => [r.id, r])).values()]
       .filter((r) => !kind || r.kind === kind)
       .map((r) => {
@@ -753,12 +860,34 @@ export class Store {
           ...r,
           created_at: Number(r.created_at),
           score: score + (score ? (r.kind === 'memory' ? 0.5 : r.kind === 'diary' ? 0.25 : 0) : 0),
-        } as unknown as SearchHit;
+          vector: this.vectorOf(String(r.id)),
+        } as unknown as Row & { vector?: Float32Array };
+      })
+      .filter((r) => (r as { score: number }).score > 0 || (r as { vector?: Float32Array }).vector)
+      .map((r) => {
+        const row = r as Row & { vector?: Float32Array };
+        // Hybrid: lexical score leads; semantic similarity lifts paraphrases
+        // that share no surface form with the query.
+        const semantic = queryVector && row.vector
+          ? Math.max(0, cosineSimilarity(queryVector, row.vector))
+          : 0;
+        const score = (row.score as number) + semantic * 4;
+        return { ...row, score } as unknown as SearchHit;
       })
       .filter((r) => r.score > 0)
       .sort((a, b) => b.score - a.score || b.created_at - a.created_at)
       .slice(0, Math.max(1, Math.min(limit, 20)))
       .map((hit) => this.describeHit(hit));
+  }
+  private vectorOf(id: string): Float32Array | undefined {
+    const row = this.sql
+      .prepare('SELECT vector FROM memory_embeddings WHERE id=?')
+      .get(id) as Row | undefined;
+    if (!row) return undefined;
+    const buf = row.vector as Buffer;
+    return new Float32Array(
+      buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+    );
   }
   recordUsage(
     peer: string,
@@ -787,6 +916,54 @@ export class Store {
         'SELECT u.purpose,u.input_tokens,u.output_tokens,u.duration_ms,u.created_at,p.address FROM usage u LEFT JOIN peers p ON p.id=u.peer_id ORDER BY u.id DESC LIMIT 12',
       )
       .all();
+  }
+  setEmbedding(id: string, peer: string, kind: SourceKind, vector: Float32Array, model: string, now = Date.now()) {
+    this.sql
+      .prepare(
+        'INSERT INTO memory_embeddings(id,peer_id,kind,vector,dims,model,created_at) VALUES(?,?,?,?,?,?,?) ' +
+          'ON CONFLICT(id) DO UPDATE SET vector=excluded.vector,dims=excluded.dims,model=excluded.model,created_at=excluded.created_at',
+      )
+      .run(id, peer, kind, Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength), vector.length, model, now);
+  }
+  setEmbeddings(items: { id: string; peer: string; kind: SourceKind; vector: Float32Array; model: string }[], now = Date.now()) {
+    this.transaction(() => {
+      for (const item of items) this.setEmbedding(item.id, item.peer, item.kind, item.vector, item.model, now);
+    });
+  }
+  embeddings(peer: string): EmbeddingVector[] {
+    return this.sql
+      .prepare('SELECT id,peer_id,kind,vector,dims,model FROM memory_embeddings WHERE peer_id=?')
+      .all(peer)
+      .map((r) => ({
+        id: String(r.id),
+        peer_id: String(r.peer_id),
+        kind: String(r.kind) as SourceKind,
+        vector: new Float32Array(
+          (r.vector as Buffer).buffer.slice(
+            (r.vector as Buffer).byteOffset,
+            (r.vector as Buffer).byteOffset + (r.vector as Buffer).byteLength,
+          ),
+        ),
+        dims: Number(r.dims),
+        model: String(r.model),
+      }));
+  }
+  embeddingStatus(): { count: number; models: string[] } {
+    const rows = this.sql
+      .prepare('SELECT model,count(*) AS n FROM memory_embeddings GROUP BY model')
+      .all();
+    return {
+      count: rows.reduce((sum, r) => sum + Number(r.n), 0),
+      models: rows.map((r) => String(r.model)),
+    };
+  }
+  dropEmbeddings(peer: string, ids?: string[]) {
+    if (ids) {
+      const del = this.sql.prepare('DELETE FROM memory_embeddings WHERE peer_id=? AND id=?');
+      this.transaction(() => {
+        for (const id of [...new Set(ids)]) del.run(peer, id);
+      });
+    } else this.sql.prepare('DELETE FROM memory_embeddings WHERE peer_id=?').run(peer);
   }
   async backup(destination: string) {
     mkdirSync(dirname(destination), { recursive: true });

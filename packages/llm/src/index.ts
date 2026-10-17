@@ -13,6 +13,8 @@ export interface ModelConfig {
   vision: boolean;
   contextWindowTokens?: number;
   inputBudgetTokens?: number;
+  embeddingModel?: string;
+  embeddingDims?: number;
 }
 export interface ToolDefinition {
   name: string;
@@ -303,5 +305,78 @@ export class HttpModel implements Model {
       inputTokens,
       outputTokens,
     };
+  }
+}
+
+/** Cosine similarity for equal-length vectors; zero-norm input yields 0. */
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length || !a.length) return 0;
+  let dot = 0,
+    normA = 0,
+    normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    normA += a[i]! * a[i]!;
+    normB += b[i]! * b[i]!;
+  }
+  return normA && normB ? dot / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
+}
+
+/**
+ * OpenAI-compatible /embeddings client. Works with any provider exposing the
+ * standard embeddings endpoint (OpenAI, DeepSeek via compatible gateways,
+ * SiliconFlow, local llama.cpp/OLLAMA servers).
+ */
+export class EmbeddingClient {
+  constructor(
+    private readonly getConfig: () => {
+      baseUrl?: string;
+      apiKey?: string;
+      model?: string;
+      timeoutMs?: number;
+    },
+    private readonly fetcher: typeof fetch = fetch,
+  ) {}
+  get configured(): boolean {
+    const c = this.getConfig();
+    return !!(c.model && c.apiKey && c.baseUrl);
+  }
+  get model(): string {
+    return this.getConfig().model ?? '';
+  }
+  async embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
+    const c = this.getConfig();
+    if (!c.model || !c.apiKey || !c.baseUrl) throw new Error('向量模型尚未配置');
+    const usable = texts.map((t) => t.slice(0, 6000)).map((t) => (t.trim() ? t : '(空)'));
+    const url = `${c.baseUrl.replace(/\/+$/, '')}/embeddings`;
+    const timeout = AbortSignal.timeout(c.timeoutMs ?? 30000);
+    let response: Response;
+    try {
+      response = await this.fetcher(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${c.apiKey}` },
+        body: JSON.stringify({ model: c.model, input: usable, encoding_format: 'float' }),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+    } catch (error) {
+      throw new Error(`向量服务连接失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+    if (!response.ok)
+      throw new Error(
+        `向量服务请求失败（HTTP ${response.status}）：${(await response.text().catch(() => '')).slice(0, 200)}`,
+      );
+    const data = (await response.json()) as {
+      data?: { index?: number; embedding: number[] }[];
+    };
+    if (!Array.isArray(data.data) || data.data.length !== usable.length)
+      throw new Error('向量服务返回条数不符');
+    const out = new Array<Float32Array>(usable.length);
+    for (const item of data.data) {
+      const index = typeof item.index === 'number' ? item.index : out.findIndex((v) => !v);
+      if (index < 0 || index >= out.length || out[index]) throw new Error('向量服务返回索引无效');
+      out[index] = new Float32Array(item.embedding);
+    }
+    if (out.some((v) => !v)) throw new Error('向量服务返回不完整');
+    return out;
   }
 }

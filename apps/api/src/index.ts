@@ -1,6 +1,6 @@
 import { resolve, join } from 'node:path';
 import { Store } from '@atri/db';
-import { HttpModel } from '@atri/llm';
+import { HttpModel, EmbeddingClient } from '@atri/llm';
 import { Runtime, TavilyWeb } from '@atri/core';
 import { Settings } from './config.js';
 import { Stickers } from './stickers.js';
@@ -13,6 +13,7 @@ const store = new Store(join(dataDir, 'atri.db'));
 const settings = new Settings(store, root);
 const stickers = new Stickers(root, dataDir, store);
 const bridge = new WeChatBridge(store, settings, stickers, (message) => console.warn(message));
+const embeddings = new EmbeddingClient(() => settings.embedding());
 const runtime = new Runtime({
   store,
   config: () => settings.runtime(),
@@ -26,6 +27,12 @@ const runtime = new Runtime({
   images: (message) => bridge.images(message),
   transport: bridge,
   log: (message, details) => console.warn(message, details),
+  embedder: embeddings,
+  embedQuery: async (query) => {
+    if (!embeddings.configured) return undefined;
+    const [vector] = await embeddings.embed([query]);
+    return vector && vector.some((v) => v !== 0) ? vector : undefined;
+  },
 });
 const app = createServer({ store, settings, stickers, bridge, runtime });
 let stopping = false;

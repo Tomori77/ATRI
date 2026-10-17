@@ -10,6 +10,7 @@ import type {
   WeixinMessage,
 } from "./types.js";
 import { ITEM_TYPE } from "./types.js";
+import { isPrivateHostLiteral } from "@atri/net";
 
 /**
  * Identify decrypted media from its magic bytes.
@@ -195,31 +196,6 @@ export function extractMediaRefs(msg: WeixinMessage): InboundMediaRef[] {
  * outbound URLs this way; this keeps the media path consistent with them.
  */
 const WECHAT_CDN_SUFFIXES = [".weixin.qq.com", ".qq.com"];
-
-const BLOCKED_HOSTS = new Set([
-  "localhost",
-  "localhost.localdomain",
-  "metadata",
-  "metadata.google.internal",
-]);
-
-/** Literal private / loopback / link-local addresses, without a DNS lookup. */
-function isPrivateHostLiteral(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (BLOCKED_HOSTS.has(h) || h.endsWith(".local")) return true;
-  if (h === "::1" || h === "::" || h.startsWith("fe80:") || h.startsWith("fc")) {
-    return true;
-  }
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (!v4) return false;
-  const [a, b] = [Number(v4[1]), Number(v4[2])];
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 169 && b === 254) return true; // link-local / cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return false;
-}
 
 /**
  * Whether an inbound `full_url` is safe to fetch.

@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@atri/db": "*",
-    "@atri/llm": "*"
+    "@atri/llm": "*",
+    "@atri/net": "*"
   }
 }

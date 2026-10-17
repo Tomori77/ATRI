@@ -24,6 +24,7 @@ test('跨午夜安静时段、静默时间和每日次数限制', (t) => {
 test('同一天主动联系可跳过，不反复调用模型', async (t) => {
   const now = Date.parse('2026-09-13T06:00:00Z');
   t.mock.method(Date, 'now', () => now);
+  t.mock.method(Math, 'random', () => 0);
   const model = new FakeModel(() => completion({ messages: [], memoryUpdates: [] }));
   const f = fixture(t, model, { proactiveEnabled: true, diaryHour: 23 });
   f.store.ensurePeer('wechat:p', 'wechat', 'p', 'context', true);

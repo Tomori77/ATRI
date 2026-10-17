@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const textSettings = ['format', 'model', 'baseUrl', 'timeZone'];
+const textSettings = ['format', 'model', 'baseUrl', 'timeZone', 'embeddingModel', 'embeddingBaseUrl'];
 const numberSettings = [
   'contextWindowTokens',
   'inputBudgetTokens',
@@ -10,6 +10,8 @@ const numberSettings = [
   'quietStart',
   'quietEnd',
   'proactiveAfterHours',
+  'maxConcurrentPeers',
+  'debounceMs',
 ];
 const formatNumber = (value) => (Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—');
 const purposeName = (value) =>
@@ -222,7 +224,7 @@ async function loadSettings() {
 function applySettings(c) {
   for (const key of [...textSettings, ...numberSettings]) $(key).value = c[key];
   $('temperature').value = c.temperature ?? '';
-  for (const key of ['vision', 'proactiveEnabled']) $(key).checked = c[key];
+  for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) $(key).checked = c[key];
   $('apiKey').placeholder = c.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
   $('tavilyKey').placeholder = c.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('apiKey').value = '';
@@ -567,7 +569,7 @@ $('settings-form').onsubmit = (e) => {
     for (const key of [...textSettings, 'apiKey', 'tavilyKey']) body[key] = $(key).value;
     for (const key of numberSettings) body[key] = $(key).valueAsNumber;
     body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
-    for (const key of ['vision', 'proactiveEnabled']) body[key] = $(key).checked;
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) body[key] = $(key).checked;
     const saved = await api('/api/config', 'PUT', body);
     if (version === settingsVersion) {
       applySettings(saved);

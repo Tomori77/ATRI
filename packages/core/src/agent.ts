@@ -3,6 +3,27 @@ import type { Model, ModelMessage, ToolDefinition } from '@atri/llm';
 import { estimateRequestTokens, estimateTextTokens, trimToTokens } from '@atri/llm';
 import { parseJson, parseMemories, parseReply, type Sticker, type ParsedReply } from './reply.js';
 import type { WebTools } from './web.js';
+import {
+  RECALL_QUERY_MESSAGES,
+  RECALL_QUERY_MAX_CHARS,
+  RECALL_HITS,
+  PROMPT_MEMORIES,
+  RECALL_CONTENT_MAX_CHARS,
+  MEMORY_CONTENT_MAX_CHARS,
+  MEMORY_SOURCES_MAX,
+  PROMPT_STICKERS,
+  TOOL_RESERVE_MAX_TOKENS,
+  CONTEXT_FLEX_FRACTION,
+  PROMPT_HEADROOM_TOKENS,
+  MAX_TOOL_ROUNDS,
+  MAX_TOOL_CALLS,
+  MAX_REPLY_ATTEMPTS,
+  TOOL_RESULT_BUDGET_TOKENS,
+  MAX_IMAGES_PER_TURN,
+  STICKER_RECENT_SHOWN,
+  SILENCE_NOTIFY_MINUTES,
+  SILENCE_HOURS_THRESHOLD,
+} from './constants.js';
 
 export type PromptName = 'persona' | 'chat' | 'diary' | 'context_notes';
 export interface AgentOptions {
@@ -15,6 +36,8 @@ export interface AgentOptions {
   contextTokens: () => number;
   turnTimeoutMs: () => number;
   images?: (message: Message) => Promise<string[]>;
+  /** Optional semantic search support; when absent, search stays lexical. */
+  embedQuery?: (query: string) => Promise<Float32Array | undefined>;
 }
 const object = (properties: Record<string, unknown>, required: string[]) => ({
   type: 'object',
@@ -57,6 +80,44 @@ export function renderMessage(m: Message): string {
     .join('\n');
   return `[来源 ${m.id} | ${new Date(m.created_at).toISOString()}]\n${m.content}${media ? '\n' + media : ''}`;
 }
+/** Time-awareness: how the current moment relates to the last message. */
+export function renderTimeGap(now: number, lastAt: number, timeZone: string): string {
+  const gapMs = Math.max(0, now - lastAt);
+  const minutes = Math.floor(gapMs / 60000);
+  const formatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone,
+    dateStyle: 'full',
+    timeStyle: 'short',
+  });
+  const moment = `现在是${formatter.format(new Date(now))}`;
+  if (gapMs < SILENCE_NOTIFY_MINUTES * 60000)
+    return `${moment}（距上一条消息不到 ${Math.max(1, minutes)} 分钟，是连续聊天）`;
+  if (gapMs < 24 * 3600000) {
+    const hours = Math.floor(gapMs / 3600000);
+    const text = hours >= 1 ? `${hours} 小时` : `${minutes} 分钟`;
+    const note =
+      gapMs >= SILENCE_HOURS_THRESHOLD * 3600000 ? '，中间有一段明显的空白' : '';
+    return `${moment}（距上一条消息约 ${text}${note}）`;
+  }
+  const days = Math.floor(gapMs / 86400000);
+  return `${moment}（距上一条消息已有 ${days} 天，中间没有聊过天）`;
+}
+export interface RecentStickerUse {
+  slug: string;
+  at: number;
+}
+/** Extract recently sent stickers from assistant history for anti-repetition. */
+export function recentStickerUse(history: Message[]): RecentStickerUse[] {
+  const uses: RecentStickerUse[] = [];
+  for (const m of history) {
+    if (m.role !== 'assistant') continue;
+    for (const match of m.content.matchAll(/\[表情：([^】\]]+?)\]/g)) {
+      uses.push({ slug: match[1]!.trim(), at: m.created_at });
+      if (uses.length >= STICKER_RECENT_SHOWN * 2) break;
+    }
+  }
+  return uses.slice(-STICKER_RECENT_SHOWN);
+}
 export class Agent {
   constructor(private readonly o: AgentOptions) {}
   private async complete(
@@ -89,38 +150,56 @@ export class Agent {
       .filter((u) => u.sources.length > 0 && u.sources.every((id) => available.has(id)))
       .map((u) => ({ ...u, supersedes: u.supersedes?.filter((id) => available.has(id)) }));
   }
-  async reply(task: Task, parentSignal?: AbortSignal): Promise<ParsedReply> {
+  /** Budget planning: choose system prompt, recalled material and recent turns. */
+  private async planReply(task: Task, peer: { id: string; notes: string }, history: Message[], now: number) {
     const { store } = this.o;
-    const peer = store.peer(task.peer_id)!;
-    const signal = parentSignal
-      ? AbortSignal.any([parentSignal, AbortSignal.timeout(this.o.turnTimeoutMs())])
-      : AbortSignal.timeout(this.o.turnTimeoutMs());
     const through =
       typeof task.payload.through === 'number' ? task.payload.through : Number.MAX_SAFE_INTEGER;
-    const history = store.history(peer.id, 500, through);
     const query = history
       .filter((m) => m.role === 'user')
-      .slice(-3)
+      .slice(-RECALL_QUERY_MESSAGES)
       .map((m) => m.content)
       .join(' ')
-      .slice(-1000);
-    let recalled = store
-      .search(peer.id, query, 6)
-      .map((h) => ({ ...h, content: h.content.slice(0, 600) }));
-    let memories = store
-      .memories(peer.id)
-      .slice(0, 10)
-      .map((m) => ({ ...m, content: m.content.slice(0, 500), sources: m.sources.slice(0, 3) }));
-    const stickers = this.o.stickers().slice(0, 32);
+      .slice(-RECALL_QUERY_MAX_CHARS);
+    let queryVector: Float32Array | undefined;
+    try {
+      queryVector = query.trim() ? await this.o.embedQuery?.(query) : undefined;
+    } catch {
+      queryVector = undefined;
+    }
+    const recalled = store
+      .search(peer.id, query, RECALL_HITS, undefined, queryVector)
+      .map((h) => ({ ...h, content: h.content.slice(0, RECALL_CONTENT_MAX_CHARS) }));
+    const memories = store.rankedMemories(peer.id, PROMPT_MEMORIES).map((m) => ({
+      id: m.id,
+      content: m.content.slice(0, MEMORY_CONTENT_MAX_CHARS),
+      kind: m.kind,
+      sources: m.sources.slice(0, MEMORY_SOURCES_MAX),
+      created_at: m.created_at,
+      hits: m.hits,
+    }));
+    const stickers = this.o.stickers().slice(0, PROMPT_STICKERS);
+    const lastUser = [...history].reverse().find((m) => m.role === 'user');
+    const timeLine = lastUser
+      ? renderTimeGap(now, lastUser.created_at, this.o.timeZone())
+      : `现在是${new Intl.DateTimeFormat('zh-CN', { timeZone: this.o.timeZone(), dateStyle: 'full', timeStyle: 'long' }).format(new Date(now))}`;
+    const recentStickers = recentStickerUse(history);
+    const stickerLines = stickers.map(({ slug, description }) => `${slug}：${description}`);
     const base = [
       this.o.prompt('persona'),
       this.o.prompt('chat'),
-      `当前时间：${new Intl.DateTimeFormat('zh-CN', { timeZone: this.o.timeZone(), dateStyle: 'full', timeStyle: 'long' }).format(new Date())}`,
+      timeLine,
       `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
-      `可用表情目录：\n${JSON.stringify(stickers.map(({ slug, description, tags }) => ({ slug, description, tags })))}`,
-    ].join('\n\n');
+      `可用表情目录（slug：含义）：\n${stickerLines.join('\n')}`,
+      recentStickers.length
+        ? `最近已发送的表情（按时间先后）：${recentStickers.map((u) => u.slug).join('、')}。不要连续几轮使用同一张表情；如果情境相似，改用文字或换一张。`
+        : '',
+      '注意：历史消息里的 [表情：…] 只是过往发送的记录展示；本轮发送表情必须使用 JSON 的 {"type":"sticker","slug":"目录中的slug"} 对象，绝不能把 [表情：…] 写进文字。',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const budget = this.o.contextTokens();
-    const initialBudget = budget - Math.min(6000, Math.floor(budget * 0.25));
+    const initialBudget = budget - Math.min(TOOL_RESERVE_MAX_TOKENS, Math.floor(budget * CONTEXT_FLEX_FRACTION));
     const reserve = Math.max(
       Math.floor(initialBudget * 0.6),
       history.at(-1) ? estimateTextTokens(renderMessage(history.at(-1)!)) + 32 : 0,
@@ -130,29 +209,35 @@ export class Agent {
       initialBudget -
         estimateRequestTokens([{ role: 'system', content: base }], INFO_TOOLS) -
         reserve -
-        256,
+        PROMPT_HEADROOM_TOKENS,
     );
     const notes = trimToTokens(peer.notes, Math.min(1500, optional));
     optional -= estimateTextTokens(notes);
+    const memoryBudget = Math.min(3000, optional);
+    const pickedMemories = [...memories];
     while (
-      memories.length &&
-      estimateTextTokens(JSON.stringify(memories)) > Math.min(3000, optional)
+      pickedMemories.length &&
+      estimateTextTokens(JSON.stringify(pickedMemories)) > memoryBudget
     )
-      memories.pop();
-    optional -= estimateTextTokens(JSON.stringify(memories));
-    while (recalled.length && estimateTextTokens(JSON.stringify(recalled)) > Math.max(0, optional))
-      recalled.pop();
+      pickedMemories.pop();
+    optional -= estimateTextTokens(JSON.stringify(pickedMemories));
+    const pickedRecalled = [...recalled];
+    while (
+      pickedRecalled.length &&
+      estimateTextTokens(JSON.stringify(pickedRecalled)) > Math.max(0, optional)
+    )
+      pickedRecalled.pop();
     const system = [
       base,
       `当前话题笔记（资料）：\n${notes || '暂无'}`,
-      `必要认识（资料，stated 是对话依据，interpretation 是主观理解）：\n${JSON.stringify(memories)}`,
-      `相关旧事（资料）：\n${JSON.stringify(recalled)}`,
+      `必要认识（资料，stated 是对话依据，interpretation 是主观理解）：\n${JSON.stringify(pickedMemories)}`,
+      `相关旧事（资料）：\n${JSON.stringify(pickedRecalled)}`,
     ].join('\n\n');
     let remaining = Math.max(
       0,
       initialBudget -
         estimateRequestTokens([{ role: 'system', content: system }], INFO_TOOLS) -
-        256,
+        PROMPT_HEADROOM_TOKENS,
     );
     const recent: Message[] = [];
     for (const m of [...history].reverse()) {
@@ -161,11 +246,29 @@ export class Agent {
       recent.unshift(m);
       remaining -= length;
     }
-    const messages: ModelMessage[] = [{ role: 'system', content: system }];
-    const imageMessages = recent
+    const available = new Set([
+      ...recent.map((m) => m.id),
+      ...pickedMemories.map((m) => m.id),
+      ...pickedRecalled.map((m) => m.id),
+    ]);
+    return { base, system, recent, pickedRecalled, pickedMemories, available, budget };
+  }
+  async reply(task: Task, parentSignal?: AbortSignal): Promise<ParsedReply> {
+    const { store } = this.o;
+    const peer = store.peer(task.peer_id)!;
+    const signal = parentSignal
+      ? AbortSignal.any([parentSignal, AbortSignal.timeout(this.o.turnTimeoutMs())])
+      : AbortSignal.timeout(this.o.turnTimeoutMs());
+    const now = Date.now();
+    const through =
+      typeof task.payload.through === 'number' ? task.payload.through : Number.MAX_SAFE_INTEGER;
+    const history = store.history(peer.id, 500, through);
+    const plan = await this.planReply(task, peer, history, now);
+    const messages: ModelMessage[] = [{ role: 'system', content: plan.system }];
+    const imageMessages = plan.recent
       .filter((m) => m.role === 'user' && m.media.some((a) => a.kind === 'image'))
       .slice(-2);
-    for (const m of recent) {
+    for (const m of plan.recent) {
       let images: string[] = [];
       if (this.o.images && imageMessages.some((i) => i.id === m.id))
         images = await this.o.images(m);
@@ -183,22 +286,31 @@ export class Agent {
       });
     if (messages.length === 1) messages.push({ role: 'user', content: '请自然开始对话。' });
     // Retain the latest input and whole provider messages when images add input cost.
-    while (messages.length > 2 && estimateRequestTokens(messages, INFO_TOOLS) > budget) {
+    while (messages.length > 2 && estimateRequestTokens(messages, INFO_TOOLS) > plan.budget) {
       messages.splice(1, 1);
-      recent.shift();
+      plan.recent.shift();
     }
-    const available = new Set([
-      ...recent.map((m) => m.id),
-      ...memories.map((m) => m.id),
-      ...recalled.map((m) => m.id),
-    ]);
+    const result = await this.runToolLoop(task, messages, plan.available, signal);
+    result.memories = this.filteredUpdates(result.memories, plan.available);
+    result.descriptions = result.descriptions.filter(
+      (d) => plan.available.has(d.messageId) && imageMessages.some((m) => m.id === d.messageId),
+    );
+    return result;
+  }
+  /** The bounded model/tool loop: at most N rounds of lookup, then final JSON. */
+  private async runToolLoop(
+    task: Task,
+    messages: ModelMessage[],
+    available: Set<string>,
+    signal: AbortSignal,
+  ): Promise<ParsedReply> {
     let toolRounds = 0,
       toolCalls = 0,
       repaired = false,
       toolTokens = 0;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < MAX_REPLY_ATTEMPTS; attempt++) {
       signal.throwIfAborted();
-      const tools = toolRounds < 2 && toolCalls < 4 ? INFO_TOOLS : [];
+      const tools = toolRounds < MAX_TOOL_ROUNDS && toolCalls < MAX_TOOL_CALLS ? INFO_TOOLS : [];
       const completion = await this.complete(task, messages, tools, signal);
       if (completion.calls.length) {
         if (!tools.length) throw new Error('模型在工具预算耗尽后仍要求调用工具');
@@ -206,7 +318,8 @@ export class Agent {
         toolRounds++;
         for (const call of completion.calls) {
           let result: unknown;
-          if (toolCalls++ >= 4) result = { error: '本轮工具调用次数已达上限，请使用已有信息回应' };
+          if (toolCalls++ >= MAX_TOOL_CALLS)
+            result = { error: '本轮工具调用次数已达上限，请使用已有信息回应' };
           else
             try {
               result = await this.tool(task, call.name, call.arguments, available, signal);
@@ -217,8 +330,8 @@ export class Agent {
             remainingTools = Math.max(
               64,
               Math.min(
-                6000 - toolTokens,
-                budget - estimateRequestTokens(messages, INFO_TOOLS) - 1024,
+                TOOL_RESULT_BUDGET_TOKENS - toolTokens,
+                this.o.contextTokens() - estimateRequestTokens(messages, INFO_TOOLS) - 1024,
               ),
             );
           const content =
@@ -234,7 +347,7 @@ export class Agent {
           toolTokens += estimateTextTokens(content);
           messages.push({ role: 'tool', callId: call.id, name: call.name, content });
         }
-        if (toolRounds >= 2 || toolCalls >= 4)
+        if (toolRounds >= MAX_TOOL_ROUNDS || toolCalls >= MAX_TOOL_CALLS)
           messages.push({
             role: 'user',
             content:
@@ -242,15 +355,11 @@ export class Agent {
           });
         continue;
       }
+      const stickers = this.o.stickers().slice(0, PROMPT_STICKERS);
       try {
-        const result = parseReply(completion.text, stickers, task.kind === 'proactive');
-        result.memories = this.filteredUpdates(result.memories, available);
-        result.descriptions = result.descriptions.filter(
-          (d) => available.has(d.messageId) && imageMessages.some((m) => m.id === d.messageId),
-        );
-        return result;
+        return parseReply(completion.text, stickers, task.kind === 'proactive');
       } catch (error) {
-        if (repaired || attempt === 3) throw error;
+        if (repaired || attempt === MAX_REPLY_ATTEMPTS - 1) throw error;
         repaired = true;
         messages.push({ role: 'assistant', content: completion.text.slice(0, 8000) });
         messages.push({
@@ -258,7 +367,7 @@ export class Agent {
           content:
             '请仅修复最终输出格式为包含 messages 数组和 memoryUpdates 数组的 JSON，保留已有回应，不再调用工具。',
         });
-        toolRounds = 2;
+        toolRounds = MAX_TOOL_ROUNDS;
       }
     }
     throw new Error('本轮模型调用已达上限');
@@ -279,7 +388,14 @@ export class Agent {
       const kind = ['message', 'memory', 'diary'].includes(String(args.kind))
         ? (args.kind as 'message' | 'memory' | 'diary')
         : undefined;
-      hits = store.search(peer, query, 8, kind);
+      let queryVector: Float32Array | undefined;
+      try {
+        queryVector = await this.o.embedQuery?.(query);
+      } catch {
+        queryVector = undefined;
+      }
+      hits = store.search(peer, query, 8, kind, queryVector);
+      if (kind === 'memory' && hits.length) store.markMemoriesUsed(peer, hits.map((h) => h.id));
     } else if (name === 'read_history') {
       if (!Array.isArray(args.ids)) throw new Error('请提供来源 ID 数组');
       hits = store.sources(
@@ -328,7 +444,7 @@ export class Agent {
       (kind === 'diary' ? this.o.prompt('persona') + '\n\n' : '') + this.o.prompt(kind);
     const budget = this.o.contextTokens();
     const notes = trimToTokens(peer.notes, Math.min(1500, budget * 0.08));
-    const memories = store.memories(peer.id).slice(0, 12);
+    const memories = store.rankedMemories(peer.id, 12);
     while (
       memories.length &&
       estimateTextTokens(JSON.stringify(memories)) > Math.min(3000, budget * 0.15)

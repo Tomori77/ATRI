@@ -460,6 +460,24 @@
                           >启用图片理解<small>需要所选模型本身支持视觉输入。</small></span
                         ></label
                       >
+                      <label class="check full-width"
+                        ><input id="embeddingEnabled" type="checkbox" /><span
+                          >启用向量检索<small
+                            >用向量模型补充语义召回，换一种说法也能找回旧事；需填写下方模型名。</small
+                          ></span
+                        ></label
+                      >
+                      <label
+                        >向量模型名称<input
+                          id="embeddingModel"
+                          placeholder="例如 text-embedding-3-small"
+                      /></label>
+                      <label class="full-width"
+                        >向量模型地址<input
+                          id="embeddingBaseUrl"
+                          type="url"
+                          placeholder="留空则使用上方 API 地址"
+                      /></label>
                     </div>
                   </article>
                   <article class="card">
@@ -583,6 +601,26 @@
                           max="23"
                           required
                       /></label>
+                      <label
+                        >同时处理的联系人<input
+                          id="maxConcurrentPeers"
+                          type="number"
+                          min="1"
+                          max="12"
+                          required
+                        /><small>每个联系人依次回复，互不穿插。</small></label
+                      >
+                      <label
+                        >连发合并窗口 <span class="unit">毫秒</span
+                        ><input
+                          id="debounceMs"
+                          type="number"
+                          min="0"
+                          max="10000"
+                          step="100"
+                          required
+                        /><small>这段时间里的连发会合并成一轮回复。</small></label
+                      >
                     </div>
                   </article>
                 </div>

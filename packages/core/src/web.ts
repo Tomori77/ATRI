@@ -2,6 +2,7 @@ import { lookup } from 'node:dns/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
+import { isPrivateAddress } from '@atri/net';
 
 export interface WebResult {
   title: string;
@@ -18,25 +19,7 @@ export interface WebTools {
   ): Promise<{ url: string; content: string; fetchedAt: string }>;
 }
 export function isPublicAddress(address: string): boolean {
-  if (isIP(address) === 4) {
-    const [a, b] = address.split('.').map(Number);
-    return !(
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      a >= 224 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 198 && (b === 18 || b === 19))
-    );
-  }
-  return (
-    isIP(address) === 6 &&
-    /^[23][0-9a-f]{0,3}:/i.test(address) &&
-    !address.toLowerCase().startsWith('2001:db8:')
-  );
+  return !isPrivateAddress(address);
 }
 export async function fetchPublicPage(
   rawUrl: string,

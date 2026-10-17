@@ -24,6 +24,11 @@ export interface SavedConfig {
   requestTimeoutSeconds: number;
   turnTimeoutSeconds: number;
   temperature: number | null;
+  embeddingEnabled: boolean;
+  embeddingBaseUrl: string;
+  embeddingModel: string;
+  maxConcurrentPeers: number;
+  debounceMs: number;
 }
 export class Settings {
   readonly dataDir: string;
@@ -72,18 +77,27 @@ export class Settings {
       requestTimeoutSeconds: 45,
       turnTimeoutSeconds: 90,
       temperature: null,
+      embeddingEnabled: false,
+      embeddingBaseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
+      embeddingModel: '',
+      maxConcurrentPeers: 3,
+      debounceMs: 800,
     };
     return { ...defaults, ...this.store.getSetting<Partial<SavedConfig>>('config', {}) };
   }
   publicConfig() {
     const { apiKey, tavilyKey, ...rest } = this.config();
-    return { ...rest, hasApiKey: !!apiKey, hasTavilyKey: !!tavilyKey };
+    return {
+      ...rest,
+      hasApiKey: !!apiKey,
+      hasTavilyKey: !!tavilyKey,
+    };
   }
   update(input: Record<string, unknown>) {
     const next = { ...this.config() };
     if (!input || typeof input !== 'object' || Array.isArray(input))
       throw new Error('设置格式无效');
-    for (const field of ['baseUrl', 'model', 'timeZone'] as const)
+    for (const field of ['baseUrl', 'model', 'timeZone', 'embeddingBaseUrl', 'embeddingModel'] as const)
       if (typeof input[field] === 'string') next[field] = input[field].trim();
     if (typeof input.apiKey === 'string' && input.apiKey.trim()) next.apiKey = input.apiKey.trim();
     if (typeof input.tavilyKey === 'string' && input.tavilyKey.trim())
@@ -95,7 +109,7 @@ export class Settings {
         throw new Error('模型接口格式无效');
       next.format = input.format as ApiFormat;
     }
-    for (const key of ['vision', 'proactiveEnabled'] as const)
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled'] as const)
       if (input[key] !== undefined) {
         if (typeof input[key] !== 'boolean') throw new Error('开关格式无效');
         next[key] = input[key];
@@ -149,6 +163,31 @@ export class Settings {
       throw new Error('输入预算 + 输出上限 + 1024 token 余量不能超过模型上下文窗口');
     if (next.turnTimeoutSeconds < next.requestTimeoutSeconds)
       throw new Error('整轮处理超时不能短于单次请求超时');
+    if (next.embeddingEnabled && !next.embeddingModel)
+      throw new Error('启用向量检索需要先填写向量模型名称');
+    if (next.embeddingModel) {
+      const embedUrl = new URL(next.embeddingBaseUrl);
+      if (
+        !['http:', 'https:'].includes(embedUrl.protocol) ||
+        embedUrl.username ||
+        embedUrl.password ||
+        embedUrl.search ||
+        embedUrl.hash
+      )
+        throw new Error('向量模型地址需要是没有凭据和查询参数的 HTTP/HTTPS URL');
+    }
+    if (input.maxConcurrentPeers !== undefined) {
+      const n = Number(input.maxConcurrentPeers);
+      if (!Number.isInteger(n) || n < 1 || n > 12)
+        throw new Error('同时处理的联系人数量需要 1–12 之间的整数');
+      next.maxConcurrentPeers = n;
+    }
+    if (input.debounceMs !== undefined) {
+      const n = Number(input.debounceMs);
+      if (!Number.isInteger(n) || n < 0 || n > 10000)
+        throw new Error('连发合并窗口需要 0–10000 毫秒');
+      next.debounceMs = n;
+    }
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timeZone }).format();
     this.store.setSetting('config', next);
     return this.publicConfig();
@@ -168,14 +207,23 @@ export class Settings {
       ...(c.temperature !== null ? { temperature: c.temperature } : {}),
     };
   }
+  embedding(): { baseUrl: string; apiKey: string; model: string; timeoutMs: number } {
+    const c = this.config();
+    return {
+      baseUrl: c.embeddingBaseUrl || c.baseUrl,
+      apiKey: c.apiKey,
+      model: c.embeddingModel,
+      timeoutMs: Math.min(c.requestTimeoutSeconds, 60) * 1000,
+    };
+  }
   runtime(): RuntimeConfig {
     const c = this.config();
     return {
       ...c,
       contextTokens: c.inputBudgetTokens,
       turnTimeoutMs: c.turnTimeoutSeconds * 1000,
-      debounceMs: 800,
-      maxConcurrentPeers: 3,
+      debounceMs: c.debounceMs,
+      maxConcurrentPeers: c.maxConcurrentPeers,
     };
   }
   prompt(name: PromptName): string {

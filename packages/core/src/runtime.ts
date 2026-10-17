@@ -1,6 +1,22 @@
 import type { Store, Peer, ReplyPart, Task, Media } from '@atri/db';
 import { Agent, renderMessage, type AgentOptions } from './agent.js';
 import { estimateTextTokens } from '@atri/llm';
+import {
+  NOTES_MIN_MESSAGES,
+  NOTES_WINDOW,
+  NOTES_BUDGET_SHARE,
+  NOTES_TAIL_EXEMPT,
+  DIARY_MAX_CHARS,
+  PROACTIVE_JITTER_MINUTES,
+  EMBED_BACKFILL_BATCH,
+} from './constants.js';
+
+/** Minimal embedding surface the runtime needs; implemented by apps/api. */
+export interface Embedder {
+  configured: boolean;
+  model: string;
+  embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>;
+}
 
 export interface RuntimeConfig {
   timeZone: string;
@@ -30,6 +46,7 @@ export interface RuntimeOptions extends AgentOptions {
   config: () => RuntimeConfig;
   transport: Transport;
   log?: (message: string, details?: unknown) => void;
+  embedder?: Embedder;
 }
 export function dayAt(at: number, timeZone: string): string {
   const p = new Intl.DateTimeFormat('en-CA', {
@@ -62,6 +79,8 @@ export class Runtime {
   >();
   private timer?: ReturnType<typeof setInterval>;
   private scheduleTimer?: ReturnType<typeof setInterval>;
+  private embedTimer?: ReturnType<typeof setInterval>;
+  private embedding = false;
   private stopped = false;
   constructor(readonly options: RuntimeOptions) {
     this.agent = new Agent(options);
@@ -74,15 +93,50 @@ export class Runtime {
     this.stopped = false;
     this.timer = setInterval(() => this.pump(), 300);
     this.scheduleTimer = setInterval(() => this.schedule(), 60000);
+    // Vector backfill runs rarely; 5 minutes keeps new content searchable
+    // semantically without competing with chat traffic.
+    if (this.options.embedder)
+      this.embedTimer = setInterval(() => void this.backfillEmbeddings(), 300000);
     this.schedule();
     this.pump();
+    void this.backfillEmbeddings();
   }
   async stop() {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     if (this.scheduleTimer) clearInterval(this.scheduleTimer);
+    if (this.embedTimer) clearInterval(this.embedTimer);
     for (const a of this.active.values()) a.controller.abort();
     await Promise.allSettled([...this.active.values()].map((a) => a.promise));
+  }
+  /** Index content that lacks vectors; best-effort, never blocks chat. */
+  private async backfillEmbeddings() {
+    const embedder = this.options.embedder;
+    if (!embedder || this.embedding || this.stopped || !embedder.configured) return;
+    this.embedding = true;
+    try {
+      for (const peer of this.store.peers()) {
+        if (this.stopped) return;
+        const pending = this.store.pendingEmbeddings(peer.id, EMBED_BACKFILL_BATCH);
+        if (!pending.length) continue;
+        const vectors = await embedder.embed(pending.map((p) => p.content));
+        this.store.setEmbeddings(
+          vectors.map((vector, i) => ({
+            id: pending[i]!.id,
+            peer: peer.id,
+            kind: pending[i]!.kind,
+            vector,
+            model: embedder.model,
+          })),
+        );
+      }
+    } catch (error) {
+      this.options.log?.('向量索引更新失败，将在下个周期重试', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.embedding = false;
+    }
   }
   accept(
     peer: string,
@@ -215,13 +269,13 @@ export class Runtime {
     const peer = this.store.peer(peerId)!;
     const recent = this.store.historyAfter(peerId, peer.notes_until, Number.MAX_SAFE_INTEGER, 200);
     if (
-      recent.length < 20 ||
-      (recent.length < 200 &&
+      recent.length < NOTES_MIN_MESSAGES ||
+      (recent.length < NOTES_WINDOW &&
         recent.reduce((n, m) => n + estimateTextTokens(renderMessage(m)), 0) <
-          this.options.config().contextTokens * 0.65)
+          this.options.config().contextTokens * NOTES_BUDGET_SHARE)
     )
       return;
-    const through = recent[Math.max(0, recent.length - 13)].seq;
+    const through = recent[Math.max(0, recent.length - NOTES_TAIL_EXEMPT)].seq;
     if (through > peer.notes_until)
       this.store.enqueue(peerId, 'notes', String(through), { through });
   }
@@ -238,7 +292,7 @@ export class Runtime {
     for (const m of records) {
       if (dayAt(m.created_at, this.options.config().timeZone) !== day) break;
       const size = renderMessage(m).length;
-      if (picked.length && chars + size > 22000) break;
+      if (picked.length && chars + size > DIARY_MAX_CHARS) break;
       picked.push(m);
       chars += size;
     }
@@ -274,8 +328,18 @@ export class Runtime {
       hour = hourAt(now, c.timeZone);
     for (const peer of this.store.peers().filter((p) => p.approved)) {
       if (hour >= c.diaryHour) this.queueDiary(peer.id, false, now);
-      if (this.proactiveAllowed(peer, now))
-        this.store.enqueue(peer.id, 'proactive', dayAt(now, c.timeZone), {});
+      if (this.proactiveAllowed(peer, now)) {
+        // Randomized delay so proactive pings do not land at the same minute
+        // every day — a small step toward a human-like rhythm.
+        const jitter = Math.floor(Math.random() * PROACTIVE_JITTER_MINUTES) * 60000;
+        this.store.enqueue(
+          peer.id,
+          'proactive',
+          dayAt(now, c.timeZone),
+          {},
+          now + jitter,
+        );
+      }
     }
     this.pump();
   }
