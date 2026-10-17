@@ -214,7 +214,17 @@ export class Runtime {
             );
             return;
           }
-          if (delivery !== deliveries.at(-1)) await new Promise((r) => setTimeout(r, 120));
+          if (delivery !== deliveries.at(-1)) {
+            // Human-like pacing: longer bubbles get longer pauses, never a
+            // machine-gun burst. Capped so a batch still sends promptly.
+            const next = deliveries.filter((d) => d.task_id === task.id)[
+              deliveries.filter((d) => d.task_id === task.id).indexOf(delivery) + 1
+            ];
+            const chars = next?.part.type === 'text' ? (next.part.text?.length ?? 0) : 6;
+            await new Promise((r) =>
+              setTimeout(r, Math.min(2500, 400 + Math.min(80, chars) * 25)),
+            );
+          }
         }
         this.maybeMood(peerId);
         this.maybeNotes(peerId);
@@ -230,7 +240,7 @@ export class Runtime {
       ]);
       try {
         if (task.kind === 'chat' || task.kind === 'proactive') {
-          if (task.kind === 'proactive' && !this.proactiveAllowed(peer, Date.now())) {
+          if (task.kind === 'proactive' && !this.proactiveGate(task, peer, Date.now())) {
             this.store.finish(task.id);
             continue;
           }
@@ -240,6 +250,12 @@ export class Runtime {
             const saved = this.store.saveReply(task, reply.parts, reply.memories);
             if (saved) {
               this.applyOpenLoops(task, reply);
+              // Every prompt inclusion is a memory "use", not only tool hits —
+              // otherwise the hits-based ranking sees a fraction of reality.
+              if (reply.pickedMemoryIds?.length)
+                this.store.markMemoriesUsed(peerId, reply.pickedMemoryIds);
+              if (reply.moodPulse)
+                this.store.pulseMood(peerId, { ...reply.moodPulse }, Date.now());
               for (const description of reply.descriptions) {
                 const msg = this.store.getMessage(peerId, description.messageId);
                 if (msg) {
@@ -345,7 +361,7 @@ export class Runtime {
     this.pump();
     return id;
   }
-  proactiveAllowed(peer: Peer, now: number): boolean {
+  proactiveAllowed(peer: Peer, now: number, dueLoops = 0): boolean {
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
     if (
@@ -369,21 +385,56 @@ export class Runtime {
       return now - peer.last_proactive_at >= PROACTIVE_IGNORE_COOLDOWN_DAYS * 86400000;
     return true;
   }
+  /** Which gate a claimed proactive task must pass: loop pings (payload.loop)
+   *  use the dedicated due-loop quota, casual pings the daily one. */
+  private proactiveGate(task: Task, peer: Peer, now: number): boolean {
+    if (typeof task.payload?.loop === 'string')
+      return this.loopPingAllowed(peer, now);
+    return this.proactiveAllowed(peer, now);
+  }
+  /** A due open loop may ping even when the daily casual quota is spent —
+   *  remembering beats small talk — but quiet hours and the brake still hold. */
+  loopPingAllowed(peer: Peer, now: number): boolean {
+    const c = this.options.config(),
+      hour = hourAt(now, c.timeZone);
+    if (
+      !(
+        c.proactiveEnabled &&
+        !!peer.approved &&
+        !!peer.context_token &&
+        peer.channel === 'wechat' &&
+        peer.last_user_at > 0 &&
+        !inQuietHours(hour, c.quietStart, c.quietEnd)
+      )
+    )
+      return false;
+    const streak = this.store.unansweredProactiveStreak(peer.id);
+    if (streak >= PROACTIVE_IGNORE_LIMIT)
+      return now - peer.last_proactive_at >= PROACTIVE_IGNORE_COOLDOWN_DAYS * 86400000;
+    // Independent of the casual daily quota, but never right after a ping —
+    // the due-loop dedupe key makes this a one-shot per loop per day anyway.
+    return now - peer.last_proactive_at >= 12 * 3600000;
+  }
   schedule(now = Date.now()) {
     if (this.stopped) return;
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
     for (const peer of this.store.peers().filter((p) => p.approved)) {
       if (hour >= c.diaryHour) this.queueDiary(peer.id, false, now);
-      if (this.proactiveAllowed(peer, now)) {
+      const casualAllowed = this.proactiveAllowed(peer, now);
+      const dueLoops = casualAllowed
+        ? []
+        : this.store.dueOpenLoops(peer.id, now).filter((l) => !l.asked);
+      const loopPing = !casualAllowed && dueLoops.length && this.loopPingAllowed(peer, now);
+      if (casualAllowed || loopPing) {
         // Randomized delay so proactive pings do not land at the same minute
         // every day — a small step toward a human-like rhythm.
         const jitter = Math.floor(Math.random() * PROACTIVE_JITTER_MINUTES) * 60000;
         this.store.enqueue(
           peer.id,
           'proactive',
-          dayAt(now, c.timeZone),
-          {},
+          loopPing ? `loop:${dueLoops[0]!.id}` : dayAt(now, c.timeZone),
+          loopPing ? { loop: dueLoops[0]!.id } : {},
           now + jitter,
         );
       }

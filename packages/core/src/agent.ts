@@ -91,11 +91,20 @@ export const INFO_TOOLS: ToolDefinition[] = [
     parameters: object({ url: string }, ['url']),
   },
 ];
-export function renderMessage(m: Message): string {
+/** Timezone is provided by the host config; tests use Asia/Shanghai by default. */
+export function renderMessage(m: Message, timeZone = 'Asia/Shanghai'): string {
   const media = m.media
     .map((a) => (a.description ? `[${a.kind}，模型观察：${a.description}]` : `[收到${a.kind}附件]`))
     .join('\n');
-  return `[来源 ${m.id} | ${new Date(m.created_at).toISOString()}]\n${m.content}${media ? '\n' + media : ''}`;
+  const at = new Intl.DateTimeFormat('zh-CN', {
+    timeZone,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date(m.created_at));
+  return `[来源 ${m.id} | ${at}]\n${m.content}${media ? '\n' + media : ''}`;
 }
 /** Time-awareness: how the current moment relates to the last message. */
 export function renderTimeGap(now: number, lastAt: number, timeZone: string): string {
@@ -122,8 +131,7 @@ export function renderTimeGap(now: number, lastAt: number, timeZone: string): st
 export interface RecentStickerUse {
   slug: string;
   at: number;
-}
-/** Extract recently sent stickers from assistant history for anti-repetition. */
+}/** Extract recently sent stickers from assistant history for anti-repetition. */
 export function recentStickerUse(history: Message[]): RecentStickerUse[] {
   const uses: RecentStickerUse[] = [];
   for (const m of history) {
@@ -184,7 +192,8 @@ export function renderRhythm(buckets: number[], hour: number): string {
       : `现在（${hour} 点）不是对方常聊的时间，主动联系时可以提一句“这个点还没休息？”之类。`
   }`;
 }
-/** Open loops the model should consider asking about, due or overdue. */
+/** Open loops the model should consider asking about, due or overdue. IDs are
+ *  included so the model can resolve them once the user reports an outcome. */
 export function renderOpenLoops(
   loops: OpenLoop[],
   now: number,
@@ -201,9 +210,38 @@ export function renderOpenLoops(
   return `未完的约定（对方提到过的安排，适合主动关心结果；每件只问一次，问过就放下）：\n${loops
     .map((l) => {
       const due = formatter.format(new Date(l.due_at));
-      return `- ${l.content}（约定时间：${l.due_text || due}）`;
+      return `- [id:${l.id}] ${l.content}（约定时间：${l.due_text || due}${l.recurring === 'yearly' ? '，每年循环' : ''}）`;
     })
-    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 ID 了结；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(时间戳毫秒), dueText, sources}。当前时间戳：${now}。`;
+    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 id（如 "resolveLoops":["id"]）了结；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(毫秒时间戳) 或 due("明天 08:00" 这类本地时间), dueText, sources, recurring:"yearly"(生日纪念日等每年循环时填)}。当前时间戳：${now}。`;
+}
+/** Rotate the sticker window so the tail of the catalog is reachable: the
+ *  window steps by day, minus stickers used in the last few turns. */
+export function rotateStickers(
+  all: Sticker[],
+  recentUse: { slug: string }[],
+  now: number,
+  window = PROMPT_STICKERS,
+): Sticker[] {
+  if (all.length <= window) return all;
+  const day = Math.floor(now / 86400000);
+  const order = [...all.slice(day % all.length), ...all.slice(0, day % all.length)];
+  const used = new Set(recentUse.map((u) => u.slug));
+  const fresh = order.filter((s) => !used.has(s.slug));
+  const picked = [...fresh, ...order.filter((s) => used.has(s.slug))].slice(0, window);
+  return all.filter((s) => picked.includes(s));
+}
+/** Memories as compact prose lines instead of full JSON — the model needs the
+ *  fact and its citation IDs, not hits counters or timestamps. */
+export function renderMemories(
+  memories: { id: string; content: string; kind: string; pinned?: number | boolean }[],
+): string {
+  if (!memories.length) return '暂无';
+  return memories
+    .map(
+      (m) =>
+        `- ${m.content}（id:${m.id}，${m.kind === 'stated' ? '对话确认' : '主观理解'}${m.pinned ? '，置顶' : ''}）`,
+    )
+    .join('\n');
 }
 export class Agent {
   constructor(private readonly o: AgentOptions) {}
@@ -257,20 +295,28 @@ export class Agent {
     const recalled = store
       .search(peer.id, query, RECALL_HITS, undefined, queryVector)
       .map((h) => ({ ...h, content: h.content.slice(0, RECALL_CONTENT_MAX_CHARS) }));
-    const memories = store.rankedMemories(peer.id, PROMPT_MEMORIES).map((m) => ({
-      id: m.id,
-      content: m.content.slice(0, MEMORY_CONTENT_MAX_CHARS),
-      kind: m.kind,
-      sources: m.sources.slice(0, MEMORY_SOURCES_MAX),
-      created_at: m.created_at,
-      hits: m.hits,
-    }));
-    const stickers = this.o.stickers().slice(0, PROMPT_STICKERS);
+    const rawMemories = store.rankedMemories(peer.id, PROMPT_MEMORIES);
+    // Memories whose content already surfaced via recall would appear twice in
+    // the prompt; the recalled copy carries the fact, but the memory still
+    // counts as "used" so the hits-based ranking stays truthful.
+    const seen = new Set(recalled.map((h) => h.id));
+    const memories = rawMemories
+      .filter((m) => !seen.has(m.id) || m.pinned)
+      .map((m) => ({
+        id: m.id,
+        content: m.content.slice(0, MEMORY_CONTENT_MAX_CHARS),
+        kind: m.kind,
+        pinned: m.pinned,
+      }));
+    const dedupedMemoryIds = rawMemories
+      .filter((m) => seen.has(m.id) && !m.pinned)
+      .map((m) => m.id);
+    const recentStickers = recentStickerUse(history);
+    const stickers = rotateStickers(this.o.stickers(), recentStickers, now);
     const lastUser = [...history].reverse().find((m) => m.role === 'user');
     const timeLine = lastUser
       ? renderTimeGap(now, lastUser.created_at, this.o.timeZone())
       : `现在是${new Intl.DateTimeFormat('zh-CN', { timeZone: this.o.timeZone(), dateStyle: 'full', timeStyle: 'long' }).format(new Date(now))}`;
-    const recentStickers = recentStickerUse(history);
     const stickerLines = stickers.map(({ slug, description }) => `${slug}：${description}`);
     const mood = store.mood(peer.id);
     const rhythm = store.activityRhythm(peer.id, this.o.timeZone());
@@ -318,22 +364,28 @@ export class Agent {
     const pickedMemories = [...memories];
     while (
       pickedMemories.length &&
-      estimateTextTokens(JSON.stringify(pickedMemories)) > memoryBudget
+      estimateTextTokens(renderMemories(pickedMemories)) > memoryBudget
     )
       pickedMemories.pop();
-    optional -= estimateTextTokens(JSON.stringify(pickedMemories));
+    optional -= estimateTextTokens(renderMemories(pickedMemories));
     const pickedRecalled = [...recalled];
     while (
       pickedRecalled.length &&
       estimateTextTokens(JSON.stringify(pickedRecalled)) > Math.max(0, optional)
     )
       pickedRecalled.pop();
+    // 聊天内读空气: terse user replies mean pull back, not pile on questions.
+    const lastThree = history.filter((m) => m.role === 'user').slice(-3);
+    const terse = lastThree.length === 3 && lastThree.every((m) => m.content.length <= 4);
     const system = [
       base,
       `当前话题笔记（资料）：\n${notes || '暂无'}`,
-      `必要认识（资料，stated 是对话依据，interpretation 是主观理解）：\n${JSON.stringify(pickedMemories)}`,
+      `必要认识（资料，括号内是对话确认/主观理解与引用 id）：\n${renderMemories(pickedMemories)}`,
       `相关旧事（资料）：\n${JSON.stringify(pickedRecalled)}`,
-    ].join('\n\n');
+      terse ? '对方最近几条回复都很短，此刻收着点说：不要连环提问，不要长篇大论，给对方留出空间。' : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     let remaining = Math.max(
       0,
       initialBudget -
@@ -352,7 +404,19 @@ export class Agent {
       ...pickedMemories.map((m) => m.id),
       ...pickedRecalled.map((m) => m.id),
     ]);
-    return { base, system, recent, pickedRecalled, pickedMemories, available, budget };
+    return {
+      base,
+      system,
+      recent,
+      pickedRecalled,
+      pickedMemories,
+      pickedMemoryIds: [
+        ...pickedMemories.map((m) => m.id),
+        ...dedupedMemoryIds,
+      ],
+      available,
+      budget,
+    };
   }
   async reply(task: Task, parentSignal?: AbortSignal): Promise<ParsedReply> {
     const { store } = this.o;
@@ -376,15 +440,33 @@ export class Agent {
       const updated = store.getMessage(peer.id, m.id) ?? m;
       messages.push({
         role: m.role,
-        content: renderMessage(updated),
+        content: renderMessage(updated, this.o.timeZone()),
         ...(images.length ? { images } : {}),
       });
     }
-    if (task.kind === 'proactive')
+    if (task.kind === 'proactive') {
+      // Ground the ping in real material: her own recent diary voice and the
+      // openings of past pings, so she neither skips nor repeats herself.
+      const lastDiary = store
+        .diaries(peer.id)
+        .slice(0, 2)
+        .map((d) => d.content.slice(0, 300));
+      const pastPings = store
+        .history(peer.id, 200)
+        .filter((m) => m.role === 'assistant' && m.created_at < now - 6 * 3600000)
+        .slice(-6);
+      const openers = pastPings.slice(-3).map((m) => m.content.slice(0, 60));
       messages.push({
         role: 'user',
-        content: '现在是一次主动联系机会。依据已有真实话题决定是否开场，没有合适理由就跳过。',
+        content: [
+          '现在是一次主动联系机会。依据已有真实话题决定是否开场，没有合适理由就跳过。',
+          lastDiary.length ? `你最近日记里的真实感受（引用要自然，别朗读）：\n${lastDiary.join('\n---\n')}` : '',
+          openers.length ? `最近几次主动开场说过：${openers.join(' / ')}。换一种开场方式。` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
       });
+    }
     if (messages.length === 1) messages.push({ role: 'user', content: '请自然开始对话。' });
     // Retain the latest input and whole provider messages when images add input cost.
     while (messages.length > 2 && estimateRequestTokens(messages, INFO_TOOLS) > plan.budget) {
@@ -393,10 +475,17 @@ export class Agent {
     }
     const result = await this.runToolLoop(task, messages, plan.available, signal);
     result.memories = this.filteredUpdates(result.memories, plan.available);
-    result.openLoops = parseOpenLoops(result.openLoops, plan.available);
-    result.resolveLoops = result.resolveLoops.filter((id) =>
-      store.dueOpenLoops(peer.id, Date.now()).some((l) => l.id === id),
+    result.pickedMemoryIds = plan.pickedMemoryIds;
+    result.openLoops = parseOpenLoops(
+      result.openLoops,
+      plan.available,
+      now,
+      this.o.timeZone(),
     );
+    // A resolve may arrive before the loop is due ("面试搞定了"): match any
+    // still-open loop, not only due ones.
+    const openIds = new Set(store.openLoops(peer.id, true).map((l) => l.id));
+    result.resolveLoops = result.resolveLoops.filter((id) => openIds.has(id));
     result.descriptions = result.descriptions.filter(
       (d) => plan.available.has(d.messageId) && imageMessages.some((m) => m.id === d.messageId),
     );

@@ -27,6 +27,8 @@ test('记忆按使用次数、重要性和新近度混合排序，不再单纯�
     .run(Date.now() - MEMORY_HALFLIFE_DAYS * 86400000 * 10);
   f.store.markMemoriesUsed('p1', [f.store.memories('p1').find((m) => m.content === '不吃香菜')!.id]);
   f.store.markMemoriesUsed('p1', [f.store.memories('p1').find((m) => m.content === '不吃香菜')!.id]);
+  // Raw-SQL backdating bypasses the store's cache invalidation; drop it.
+  (f.store as unknown as { memoryCache: Map<string, unknown> }).memoryCache.clear();
   const ranked = f.store.rankedMemories('p1', 2);
   assert.equal(ranked.length, 2);
   assert.equal(ranked[0]!.content, '不吃香菜');

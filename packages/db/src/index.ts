@@ -62,7 +62,8 @@ export interface Memory {
   created_at: number;
 }
 /** An unfinished arrangement the user mentioned ("明天面试"): created from a
- *  turn, proactively asked about once due, closed when resolved or expired. */
+ *  turn, proactively asked about once due, closed when resolved or expired.
+ *  Recurring loops (birthdays, anniversaries) re-open one year later. */
 export interface OpenLoop {
   id: string;
   peer_id: string;
@@ -70,6 +71,7 @@ export interface OpenLoop {
   due_at: number;
   due_text: string;
   sources: string[];
+  recurring: string;
   asked: number;
   status: string;
   created_at: number;
@@ -80,6 +82,7 @@ export interface OpenLoopInput {
   dueAt: number;
   dueText?: string;
   sources: string[];
+  recurring?: string;
 }
 /** Lightweight cross-conversation mood, injected as prose rather than numbers. */
 export interface MoodState {
@@ -163,10 +166,14 @@ export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
 /** Mood pulses decay toward neutral with these half-lives (hours). */
 export const MOOD_VALENCE_HALFLIFE_HOURS = 20;
 export const MOOD_ENERGY_HALFLIFE_HOURS = 8;
+/** Usage rollup: keep this many days of per-call rows, older ones aggregate. */
+export const USAGE_RETENTION_DAYS = 30;
 
 export class Store {
   readonly sql: DatabaseSync;
   private transactionDepth = 0;
+  /** Small per-peer caches keyed by the peers.version change counter. */
+  private memoryCache = new Map<string, { version: number; memories: Memory[] }>();
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
@@ -220,11 +227,12 @@ export class Store {
         status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, UNIQUE(task_id,ordinal)
       );
       CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, peer_id TEXT, task_id TEXT, purpose TEXT, input_tokens INTEGER, output_tokens INTEGER, duration_ms INTEGER, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS usage_daily (purpose TEXT NOT NULL, day INTEGER NOT NULL, calls INTEGER NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, average_ms INTEGER NOT NULL, PRIMARY KEY(purpose,day));
       CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(id UNINDEXED, peer_id UNINDEXED, kind UNINDEXED, content, created_at UNINDEXED, tokenize='trigram');
       CREATE TABLE IF NOT EXISTS open_loops (
         id TEXT PRIMARY KEY, peer_id TEXT NOT NULL REFERENCES peers(id), content TEXT NOT NULL,
         due_at INTEGER NOT NULL, due_text TEXT NOT NULL DEFAULT '', sources TEXT NOT NULL,
-        asked INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+        recurring TEXT NOT NULL DEFAULT '', asked INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
         created_at INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS open_loops_peer ON open_loops(peer_id,status);
@@ -614,18 +622,27 @@ export class Store {
     return rows;
   }
   memories(peer: string): Memory[] {
-    return this.sql
+    const version = Number(this.sql.prepare('SELECT version FROM peers WHERE id=?').get(peer)?.version ?? -1);
+    const cached = this.memoryCache.get(peer);
+    if (cached && cached.version === version) return cached.memories;
+    const rows = this.sql
       .prepare(
         "SELECT * FROM memories WHERE peer_id=? AND status='active' ORDER BY created_at DESC LIMIT 500",
       )
       .all(peer)
       .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as Memory);
+    // Bounded cache; setMemoryPinned/correctMemory invalidate explicitly and a
+    // version bump covers every write path, so staleness is impossible.
+    if (this.memoryCache.size > 64) this.memoryCache.clear();
+    this.memoryCache.set(peer, { version, memories: rows });
+    return rows;
   }
   setMemoryPinned(peer: string, id: string, pinned: boolean) {
     const result = this.sql
       .prepare("UPDATE memories SET pinned=? WHERE peer_id=? AND id=? AND status='active'")
       .run(pinned ? 1 : 0, peer, id);
     if (!result.changes) throw new Error('记忆不存在');
+    this.memoryCache.delete(peer);
   }
   /** Memories ranked by usage, importance and recency for prompt inclusion.
    *  Pinned memories always come first and never participate in the budget
@@ -666,8 +683,12 @@ export class Store {
       for (const id of unique)
         update.run(now, peer, id, 'active');
     });
+    this.memoryCache.delete(peer);
   }
   private writeMemory(peer: string, update: MemoryUpdate, now: number) {
+    // Every write path bumps peers.version, but the bump lands before or after
+    // this within the same transaction; drop the cache defensively per write.
+    this.memoryCache.delete(peer);
     const ids = [...new Set(update.sources)];
     const sources = this.sources(peer, ids);
     if (
@@ -804,6 +825,7 @@ export class Store {
   }
   forget(peer: string, id: string) {
     this.transaction(() => {
+      this.memoryCache.delete(peer);
       const source = this.sources(peer, [id])[0];
       if (!source) throw new Error('记录不存在');
       if (source.kind === 'message')
@@ -896,22 +918,28 @@ export class Store {
           .all(peer, match, ...kindParameters),
       );
     }
-    const likeTerms = terms.slice(0, 32).map((t) => '%' + t.replace(/[\\%_]/g, '\\$&') + '%');
-    rows.push(
-      ...this.sql
-        .prepare(
-          `SELECT id,kind,content,created_at FROM search_index WHERE peer_id=? AND (${likeTerms.map(() => "content LIKE ? ESCAPE '\\'").join(' OR ')})${kindClause} ORDER BY CAST(created_at AS INTEGER) DESC LIMIT 300`,
-        )
-        .all(peer, ...likeTerms, ...kindParameters),
-    );
+    // LIKE scan only when FTS came up short — it is the fallback for short
+    // Chinese bigrams, not a duplicate pass over the same hits.
+    if (rows.length < 20) {
+      const likeTerms = terms.slice(0, 32).map((t) => '%' + t.replace(/[\\%_]/g, '\\$&') + '%');
+      rows.push(
+        ...this.sql
+          .prepare(
+            `SELECT id,kind,content,created_at FROM search_index WHERE peer_id=? AND (${likeTerms.map(() => "content LIKE ? ESCAPE '\\'").join(' OR ')})${kindClause} ORDER BY CAST(created_at AS INTEGER) DESC LIMIT 300`,
+          )
+          .all(peer, ...likeTerms, ...kindParameters),
+      );
+    }
     // Semantic candidates: rows that share no surface form with the query but
-    // are stored vectors — the whole point of hybrid retrieval.
+    // are stored vectors — the whole point of hybrid retrieval. Vector scan is
+    // capped: recency-weighted slice keeps the cost bounded on long histories.
     if (queryVector) {
       rows.push(
         ...this.sql
           .prepare(
             `SELECT s.id,s.kind,s.content,s.created_at FROM memory_embeddings e JOIN search_index s ON s.id=e.id
-           WHERE e.peer_id=? ${kind ? 'AND s.kind=?' : ''}`,
+           WHERE e.peer_id=? ${kind ? 'AND s.kind=?' : ''}
+           ORDER BY s.created_at DESC LIMIT 2000`,
           )
           .all(peer, ...(kind ? [kind] : []))
           .map((r) => r as Row),
@@ -977,13 +1005,34 @@ export class Store {
     const id = randomUUID();
     this.sql
       .prepare(
-        'INSERT INTO open_loops(id,peer_id,content,due_at,due_text,sources,created_at) VALUES(?,?,?,?,?,?,?)',
+        'INSERT INTO open_loops(id,peer_id,content,due_at,due_text,sources,recurring,created_at) VALUES(?,?,?,?,?,?,?,?)',
       )
-      .run(id, peer, input.content.slice(0, 300), input.dueAt, input.dueText ?? '', JSON.stringify([...new Set(input.sources)].slice(0, 10)), now);
+      .run(
+        id,
+        peer,
+        input.content.slice(0, 300),
+        input.dueAt,
+        input.dueText ?? '',
+        JSON.stringify([...new Set(input.sources)].slice(0, 10)),
+        input.recurring === 'yearly' ? 'yearly' : '',
+        now,
+      );
     return this.openLoops(peer).find((l) => l.id === id)!;
   }
-  /** The user answered about this arrangement: close it quietly. */
+  /** The user answered about this arrangement: close it quietly. Recurring
+   *  loops instead move to next year — a birthday never "resolves". */
   resolveOpenLoop(peer: string, id: string, now = Date.now()) {
+    const loop = this.sql
+      .prepare("SELECT recurring,due_at FROM open_loops WHERE peer_id=? AND id=? AND status='open'")
+      .get(peer, id) as Row | undefined;
+    if (!loop) return;
+    if (String(loop.recurring) === 'yearly') {
+      const next = Number(loop.due_at) + 365 * 86400000;
+      this.sql
+        .prepare("UPDATE open_loops SET due_at=?,asked=0 WHERE peer_id=? AND id=?")
+        .run(next, peer, id);
+      return;
+    }
     this.sql
       .prepare(
         "UPDATE open_loops SET status='resolved',resolved_at=? WHERE peer_id=? AND id=? AND status='open'",
@@ -1108,18 +1157,64 @@ export class Store {
     output: number,
     duration: number,
   ) {
-    this.sql
-      .prepare(
-        'INSERT INTO usage(peer_id,task_id,purpose,input_tokens,output_tokens,duration_ms,created_at) VALUES(?,?,?,?,?,?,?)',
-      )
-      .run(peer, task, purpose, input, output, duration, Date.now());
+    this.transaction(() => {
+      this.sql
+        .prepare(
+          'INSERT INTO usage(peer_id,task_id,purpose,input_tokens,output_tokens,duration_ms,created_at) VALUES(?,?,?,?,?,?,?)',
+        )
+        .run(peer, task, purpose, input, output, duration, Date.now());
+      // Roll up rows older than the retention window into per-day summaries so
+      // the status endpoint never aggregates an ever-growing table.
+      const cutoff = Date.now() - USAGE_RETENTION_DAYS * 86400000;
+      const stale = this.sql
+        .prepare(
+          'SELECT purpose,created_at,count(*) AS n,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,round(avg(duration_ms)) AS average_ms FROM usage WHERE created_at<? GROUP BY purpose,created_at/86400000',
+        )
+        .all(cutoff) as Row[];
+      if (stale.length) {
+        const upsert = this.sql.prepare(
+          'INSERT INTO usage_daily(purpose,day,calls,input_tokens,output_tokens,average_ms) VALUES(?,?,?,?,?,?) ' +
+            'ON CONFLICT(purpose,day) DO UPDATE SET calls=calls+excluded.calls,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,average_ms=excluded.average_ms',
+        );
+        for (const row of stale) {
+          upsert.run(
+            String(row.purpose),
+            Math.floor(Number(row.created_at) / 86400000),
+            Number(row.n),
+            Number(row.input_tokens),
+            Number(row.output_tokens),
+            Number(row.average_ms),
+          );
+        }
+        this.sql.prepare('DELETE FROM usage WHERE created_at<?').run(cutoff);
+      }
+    });
   }
   usage() {
-    return this.sql
+    const recent = this.sql
       .prepare(
         'SELECT purpose,count(*) AS calls,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,round(avg(duration_ms)) AS average_ms FROM usage GROUP BY purpose',
       )
-      .all();
+      .all() as Row[];
+    const archived = this.sql
+      .prepare(
+        'SELECT purpose,sum(calls) AS calls,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,0 AS average_ms FROM usage_daily GROUP BY purpose',
+      )
+      .all() as Row[];
+    const merged = new Map<string, Row>();
+    for (const row of [...recent, ...archived]) {
+      const prior = merged.get(String(row.purpose));
+      merged.set(String(row.purpose), prior
+        ? {
+            purpose: row.purpose,
+            calls: Number(prior.calls) + Number(row.calls),
+            input_tokens: Number(prior.input_tokens) + Number(row.input_tokens),
+            output_tokens: Number(prior.output_tokens) + Number(row.output_tokens),
+            average_ms: Number(row.average_ms) || Number(prior.average_ms),
+          }
+        : row);
+    }
+    return [...merged.values()];
   }
   recentUsage() {
     return this.sql
