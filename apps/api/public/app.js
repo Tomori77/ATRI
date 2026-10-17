@@ -317,12 +317,13 @@ async function loadChat() {
 }
 async function loadJournal() {
   const peer = $('journal-peer').value || 'preview:default';
-  const [diaries, memories] = await Promise.all([
+  const [diaries, memories, loops] = await Promise.all([
     api('/api/peers/' + enc(peer) + '/diaries'),
     api('/api/peers/' + enc(peer) + '/memories'),
+    api('/api/peers/' + enc(peer) + '/loops'),
   ]);
   if (peer !== ($('journal-peer').value || 'preview:default')) return;
-  const snapshot = JSON.stringify([peer, diaries, memories]);
+  const snapshot = JSON.stringify([peer, diaries, memories, loops]);
   if (snapshot === journalSnapshot) return;
   journalSnapshot = snapshot;
   const journal = $('diaries');
@@ -358,11 +359,18 @@ async function loadJournal() {
     const row = el('div', undefined, 'row');
     row.append(
       el('span', item.kind === 'stated' ? '对话中确认' : '主观理解', 'badge'),
+      item.pinned ? el('span', '已置顶', 'badge') : null,
       el('p', item.content),
     );
     const actions = el('div', undefined, 'actions');
     actions.append(
       button('查看依据', () => showSources(peer, item.sources)),
+      button(item.pinned ? '取消置顶' : '置顶', async () => {
+        await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id) + '/pinned', 'PUT', {
+          pinned: !item.pinned,
+        });
+        await loadJournal();
+      }),
       button('更正', async () => {
         const content = prompt('把正确的信息写在这里：', item.content);
         if (!content?.trim()) return;
@@ -383,6 +391,32 @@ async function loadJournal() {
     memory.append(row);
   }
   if (!memories.length) empty(memory, '重要的偏好、约定和认识会留在这里。');
+  const loopBox = $('loops');
+  loopBox.replaceChildren();
+  for (const loop of loops) {
+    const row = el('div', undefined, 'row');
+    const badge =
+      loop.status === 'open'
+        ? loop.due_at <= Date.now()
+          ? '已到期'
+          : '等待中'
+        : loop.status === 'resolved'
+          ? '已了结'
+          : '已过期';
+    row.append(el('span', badge, 'badge'), el('p', loop.content));
+    const actions = el('div', undefined, 'actions');
+    actions.append(
+      loop.status === 'open'
+        ? button('了结', async () => {
+            await api('/api/peers/' + enc(peer) + '/loops/' + enc(loop.id) + '/resolve', 'POST');
+            await loadJournal();
+          })
+        : el('span', new Date(loop.resolved_at || loop.created_at).toLocaleString(), 'hint'),
+    );
+    row.append(actions);
+    loopBox.append(row);
+  }
+  if (!loops.length) empty(loopBox, '对方提到的具体安排（如“明天面试”）会出现在这里，到点她会主动问起。');
 }
 async function showSources(peer, ids) {
   const records = await api('/api/peers/' + enc(peer) + '/sources?ids=' + enc(ids.join(',')));

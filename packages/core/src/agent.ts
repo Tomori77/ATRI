@@ -1,7 +1,21 @@
-import type { Message, Store, Task, SearchHit, MemoryUpdate } from '@atri/db';
+import type {
+  Message,
+  Store,
+  Task,
+  SearchHit,
+  MemoryUpdate,
+  OpenLoop,
+} from '@atri/db';
 import type { Model, ModelMessage, ToolDefinition } from '@atri/llm';
 import { estimateRequestTokens, estimateTextTokens, trimToTokens } from '@atri/llm';
-import { parseJson, parseMemories, parseReply, type Sticker, type ParsedReply } from './reply.js';
+import {
+  parseJson,
+  parseMemories,
+  parseOpenLoops,
+  parseReply,
+  type Sticker,
+  type ParsedReply,
+} from './reply.js';
 import type { WebTools } from './web.js';
 import {
   RECALL_QUERY_MESSAGES,
@@ -23,6 +37,9 @@ import {
   STICKER_RECENT_SHOWN,
   SILENCE_NOTIFY_MINUTES,
   SILENCE_HOURS_THRESHOLD,
+  OPEN_LOOP_PROMPT_MAX,
+  RHYTHM_MIN_BUCKET,
+  DIARY_MAX_SECTIONS,
 } from './constants.js';
 
 export type PromptName = 'persona' | 'chat' | 'diary' | 'context_notes';
@@ -118,6 +135,76 @@ export function recentStickerUse(history: Message[]): RecentStickerUse[] {
   }
   return uses.slice(-STICKER_RECENT_SHOWN);
 }
+/** Mood as felt prose, never numbers — the model reads a state, not a gauge. */
+export function renderMood(
+  mood: { valence: number; energy: number; reason?: string; at: number },
+  now: number,
+  timeZone: string,
+): string {
+  if (!mood.at) return '';
+  const hours = (now - mood.at) / 3600000;
+  if (Math.abs(mood.valence) < 0.05 && mood.energy < 0.05) return '';
+  const since =
+    hours >= 1
+      ? `，那是 ${Math.floor(hours)} 小时前留下的`
+      : '';
+  const parts: string[] = [];
+  if (mood.valence >= 0.3) parts.push('心情还不错，会更想分享');
+  else if (mood.valence <= -0.3)
+    parts.push(`心情还有些低落${mood.reason ? `（因为${mood.reason}）` : ''}${since}`);
+  else if (mood.valence <= -0.12) parts.push('情绪平平，略有点提不起劲');
+  if (mood.energy <= -0.3) parts.push('有点累了，语气可以短一些');
+  else if (mood.energy >= 0.3) parts.push('精力挺足');
+  return parts.length ? `你当前的状态：${parts.join('；')}。这影响语气，但不要主动报数值。` : '';
+}
+/** Habitual active hours of the user, as a short prose hint. */
+export function renderRhythm(buckets: number[], hour: number): string {
+  const habitual = buckets
+    .map((n, h) => ({ n, h }))
+    .filter((b) => b.n >= RHYTHM_MIN_BUCKET)
+    .map((b) => b.h);
+  if (!habitual.length) return '';
+  const bands: string[] = [];
+  let start = habitual[0]!,
+    prev = habitual[0]!;
+  for (const h of habitual.slice(1)) {
+    if (h === prev + 1) {
+      prev = h;
+      continue;
+    }
+    bands.push(start === prev ? `${start} 点` : `${start}–${prev} 点`);
+    start = h;
+    prev = h;
+  }
+  bands.push(start === prev ? `${start} 点` : `${start}–${prev} 点`);
+  const activeNow = buckets[hour]! >= RHYTHM_MIN_BUCKET;
+  return `对方通常活跃时段：${bands.join('、')}。${
+    activeNow
+      ? '现在正处于活跃时段。'
+      : `现在（${hour} 点）不是对方常聊的时间，主动联系时可以提一句“这个点还没休息？”之类。`
+  }`;
+}
+/** Open loops the model should consider asking about, due or overdue. */
+export function renderOpenLoops(
+  loops: OpenLoop[],
+  now: number,
+  timeZone: string,
+): string {
+  if (!loops.length) return '';
+  const formatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone,
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  return `未完的约定（对方提到过的安排，适合主动关心结果；每件只问一次，问过就放下）：\n${loops
+    .map((l) => {
+      const due = formatter.format(new Date(l.due_at));
+      return `- ${l.content}（约定时间：${l.due_text || due}）`;
+    })
+    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 ID 了结；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(时间戳毫秒), dueText, sources}。当前时间戳：${now}。`;
+}
 export class Agent {
   constructor(private readonly o: AgentOptions) {}
   private async complete(
@@ -185,16 +272,30 @@ export class Agent {
       : `现在是${new Intl.DateTimeFormat('zh-CN', { timeZone: this.o.timeZone(), dateStyle: 'full', timeStyle: 'long' }).format(new Date(now))}`;
     const recentStickers = recentStickerUse(history);
     const stickerLines = stickers.map(({ slug, description }) => `${slug}：${description}`);
+    const mood = store.mood(peer.id);
+    const rhythm = store.activityRhythm(peer.id, this.o.timeZone());
+    const currentHour = Number(
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: this.o.timeZone(),
+        hour: '2-digit',
+        hourCycle: 'h23',
+      }).format(new Date(now)),
+    );
+    const openLoops = store.dueOpenLoops(peer.id, now);
     const base = [
       this.o.prompt('persona'),
       this.o.prompt('chat'),
       timeLine,
       `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
+      renderMood(mood, now, this.o.timeZone()),
+      renderRhythm(rhythm, currentHour),
+      renderOpenLoops(openLoops, now, this.o.timeZone()),
       `可用表情目录（slug：含义）：\n${stickerLines.join('\n')}`,
       recentStickers.length
         ? `最近已发送的表情（按时间先后）：${recentStickers.map((u) => u.slug).join('、')}。不要连续几轮使用同一张表情；如果情境相似，改用文字或换一张。`
         : '',
       '注意：历史消息里的 [表情：…] 只是过往发送的记录展示；本轮发送表情必须使用 JSON 的 {"type":"sticker","slug":"目录中的slug"} 对象，绝不能把 [表情：…] 写进文字。',
+      '回复长度参照对方：对方一句话，就别回一大段；对方认真长谈，才展开讲。',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -292,6 +393,10 @@ export class Agent {
     }
     const result = await this.runToolLoop(task, messages, plan.available, signal);
     result.memories = this.filteredUpdates(result.memories, plan.available);
+    result.openLoops = parseOpenLoops(result.openLoops, plan.available);
+    result.resolveLoops = result.resolveLoops.filter((id) =>
+      store.dueOpenLoops(peer.id, Date.now()).some((l) => l.id === id),
+    );
     result.descriptions = result.descriptions.filter(
       (d) => plan.available.has(d.messageId) && imageMessages.some((m) => m.id === d.messageId),
     );
@@ -490,7 +595,7 @@ export class Agent {
     if (!Array.isArray(raw.sections)) throw new Error('日记格式无效');
     const available = new Set(input.map((m) => m.id));
     const sections = raw.sections
-      .slice(0, 6)
+      .slice(0, DIARY_MAX_SECTIONS)
       .filter(
         (s: any) =>
           typeof s?.content === 'string' &&

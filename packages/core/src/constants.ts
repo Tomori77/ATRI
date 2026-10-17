@@ -50,5 +50,16 @@ export const SILENCE_HOURS_THRESHOLD = 4;
 
 /** Proactive contact jitter: attempts get a random delay inside this window. */
 export const PROACTIVE_JITTER_MINUTES = 20;
-/** Embedding refresh: rebuild index when this fraction of messages lack vectors. */
+/** Proactive brake: after this many unanswered pings, pause for days. */
+export const PROACTIVE_IGNORE_LIMIT = 2;
+export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
+/** Open loops: ask once after due, expire silently after days. */
+export const OPEN_LOOP_ASK_AFTER_MS = 30 * 60000;
+export const OPEN_LOOP_EXPIRE_DAYS = 7;
+export const OPEN_LOOP_PROMPT_MAX = 5;
+/** Mood state: pulse clamp per turn and prompt prose thresholds. */
+export const MOOD_PULSE_CLAMP = 0.35;
+/** Rhythm hint: minimum hourly messages before a bucket counts as habitual. */
+export const RHYTHM_MIN_BUCKET = 3;
+/** Embedding refresh: batch size per backfill pass. */
 export const EMBED_BACKFILL_BATCH = 64;

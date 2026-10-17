@@ -9,6 +9,8 @@ import {
   DIARY_MAX_CHARS,
   PROACTIVE_JITTER_MINUTES,
   EMBED_BACKFILL_BATCH,
+  PROACTIVE_IGNORE_LIMIT,
+  PROACTIVE_IGNORE_COOLDOWN_DAYS,
 } from './constants.js';
 
 /** Minimal embedding surface the runtime needs; implemented by apps/api. */
@@ -214,6 +216,7 @@ export class Runtime {
           }
           if (delivery !== deliveries.at(-1)) await new Promise((r) => setTimeout(r, 120));
         }
+        this.maybeMood(peerId);
         this.maybeNotes(peerId);
         continue;
       }
@@ -235,7 +238,8 @@ export class Runtime {
           try {
             const reply = await this.agent.reply(task, signal);
             const saved = this.store.saveReply(task, reply.parts, reply.memories);
-            if (saved)
+            if (saved) {
+              this.applyOpenLoops(task, reply);
               for (const description of reply.descriptions) {
                 const msg = this.store.getMessage(peerId, description.messageId);
                 if (msg) {
@@ -248,6 +252,7 @@ export class Runtime {
                   );
                 }
               }
+            }
           } finally {
             void Promise.resolve(typing)
               .then(() => this.options.transport.typing?.(peer, false))
@@ -264,6 +269,40 @@ export class Runtime {
         }
       }
     }
+  }
+  /** Open loops: resolve loops the user just answered, record new ones,
+   *  mark due loops as asked once a proactive ping mentions them, expire old. */
+  private applyOpenLoops(
+    task: Task,
+    reply: { openLoops?: { content: string; dueAt: number; dueText?: string; sources: string[] }[]; resolveLoops?: string[] },
+  ) {
+    const store = this.store,
+      peer = task.peer_id,
+      now = Date.now();
+    store.expireOpenLoops(peer, now);
+    for (const id of reply.resolveLoops ?? []) store.resolveOpenLoop(peer, id, now);
+    for (const loop of reply.openLoops ?? []) {
+      if (!Number.isFinite(loop.dueAt) || loop.dueAt < now - 86400000) continue;
+      if (!loop.sources.length) continue;
+      store.addOpenLoop(peer, loop, now);
+    }
+    if (task.kind === 'proactive')
+      for (const loop of store.dueOpenLoops(peer, now)) store.markLoopAsked(peer, loop.id, now);
+  }
+  /** After a delivered exchange, pulse the light mood state from the last
+   *  user/assistant pair; runs at most once per finished task batch. */
+  private maybeMood(peerId: string) {
+    const peer = this.store.peer(peerId);
+    if (!peer) return;
+    const recent = this.store.history(peerId, 2);
+    const user = [...recent].reverse().find((m) => m.role === 'user');
+    const assistant = [...recent].reverse().find((m) => m.role === 'assistant');
+    if (user && assistant && user.created_at <= assistant.created_at)
+      this.store.pulseMoodFromExchange(
+        peerId,
+        { user: user.content, assistant: assistant.content, userAt: user.created_at },
+        Date.now(),
+      );
   }
   private maybeNotes(peerId: string) {
     const peer = this.store.peer(peerId)!;
@@ -309,18 +348,26 @@ export class Runtime {
   proactiveAllowed(peer: Peer, now: number): boolean {
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
-    return (
-      c.proactiveEnabled &&
-      !!peer.approved &&
-      !!peer.context_token &&
-      peer.channel === 'wechat' &&
-      peer.last_user_at > 0 &&
-      now - peer.last_user_at >= c.proactiveAfterHours * 3600000 &&
-      now - peer.last_proactive_at >= 12 * 3600000 &&
-      !inQuietHours(hour, c.quietStart, c.quietEnd) &&
-      (!peer.last_proactive_at ||
-        dayAt(peer.last_proactive_at, c.timeZone) !== dayAt(now, c.timeZone))
-    );
+    if (
+      !(
+        c.proactiveEnabled &&
+        !!peer.approved &&
+        !!peer.context_token &&
+        peer.channel === 'wechat' &&
+        peer.last_user_at > 0 &&
+        now - peer.last_user_at >= c.proactiveAfterHours * 3600000 &&
+        now - peer.last_proactive_at >= 12 * 3600000 &&
+        !inQuietHours(hour, c.quietStart, c.quietEnd) &&
+        (!peer.last_proactive_at ||
+          dayAt(peer.last_proactive_at, c.timeZone) !== dayAt(now, c.timeZone))
+      )
+    )
+      return false;
+    // 读空气 brake: unanswered pings stretch the cooldown from hours to days.
+    const streak = this.store.unansweredProactiveStreak(peer.id);
+    if (streak >= PROACTIVE_IGNORE_LIMIT)
+      return now - peer.last_proactive_at >= PROACTIVE_IGNORE_COOLDOWN_DAYS * 86400000;
+    return true;
   }
   schedule(now = Date.now()) {
     if (this.stopped) return;

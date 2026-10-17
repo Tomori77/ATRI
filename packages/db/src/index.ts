@@ -58,7 +58,35 @@ export interface Memory {
   status: string;
   hits: number;
   last_hit_at: number;
+  pinned: number;
   created_at: number;
+}
+/** An unfinished arrangement the user mentioned ("明天面试"): created from a
+ *  turn, proactively asked about once due, closed when resolved or expired. */
+export interface OpenLoop {
+  id: string;
+  peer_id: string;
+  content: string;
+  due_at: number;
+  due_text: string;
+  sources: string[];
+  asked: number;
+  status: string;
+  created_at: number;
+  resolved_at: number;
+}
+export interface OpenLoopInput {
+  content: string;
+  dueAt: number;
+  dueText?: string;
+  sources: string[];
+}
+/** Lightweight cross-conversation mood, injected as prose rather than numbers. */
+export interface MoodState {
+  valence: number;
+  energy: number;
+  reason?: string;
+  at: number;
 }
 export interface DiarySection {
   id: string;
@@ -126,6 +154,15 @@ export const MEMORY_HALFLIFE_DAYS = 14;
 export const MEMORY_RECENCY_FLOOR = 0.35;
 export const MEMORY_STATED_WEIGHT = 2.2;
 export const MEMORY_INTERPRETATION_WEIGHT = 0.6;
+/** Open loops: ask about an arrangement once after it falls due, then retire. */
+export const OPEN_LOOP_ASK_AFTER_MS = 30 * 60000;
+export const OPEN_LOOP_EXPIRE_DAYS = 7;
+/** Proactive brake: unanswered pings before the cooldown stretches to days. */
+export const PROACTIVE_IGNORE_LIMIT = 2;
+export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
+/** Mood pulses decay toward neutral with these half-lives (hours). */
+export const MOOD_VALENCE_HALFLIFE_HOURS = 20;
+export const MOOD_ENERGY_HALFLIFE_HOURS = 8;
 
 export class Store {
   readonly sql: DatabaseSync;
@@ -133,10 +170,13 @@ export class Store {
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
-    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 1) {
+    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 2) {
       this.sql.close();
       throw new Error('数据库来自更新版本，不能用当前程序打开');
     }
+    const openedAt = Number(
+      this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0,
+    );
     this.sql.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS peers (
@@ -181,8 +221,21 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, peer_id TEXT, task_id TEXT, purpose TEXT, input_tokens INTEGER, output_tokens INTEGER, duration_ms INTEGER, created_at INTEGER);
       CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(id UNINDEXED, peer_id UNINDEXED, kind UNINDEXED, content, created_at UNINDEXED, tokenize='trigram');
-      PRAGMA user_version=1;
+      CREATE TABLE IF NOT EXISTS open_loops (
+        id TEXT PRIMARY KEY, peer_id TEXT NOT NULL REFERENCES peers(id), content TEXT NOT NULL,
+        due_at INTEGER NOT NULL, due_text TEXT NOT NULL DEFAULT '', sources TEXT NOT NULL,
+        asked INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+        created_at INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS open_loops_peer ON open_loops(peer_id,status);
     `);
+    if (openedAt < 2) {
+      // Pinned memories opt out of decay-based ranking. The big DDL block keeps
+      // user_version untouched; only the version that needs the column sets it,
+      // so reopening a v2 database (e.g. restored backup) never re-runs this.
+      this.sql.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;');
+      this.sql.exec('PRAGMA user_version=2;');
+    }
   }
   close() {
     this.sql.close();
@@ -568,11 +621,21 @@ export class Store {
       .all(peer)
       .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as Memory);
   }
-  /** Memories ranked by usage, importance and recency for prompt inclusion. */
+  setMemoryPinned(peer: string, id: string, pinned: boolean) {
+    const result = this.sql
+      .prepare("UPDATE memories SET pinned=? WHERE peer_id=? AND id=? AND status='active'")
+      .run(pinned ? 1 : 0, peer, id);
+    if (!result.changes) throw new Error('记忆不存在');
+  }
+  /** Memories ranked by usage, importance and recency for prompt inclusion.
+   *  Pinned memories always come first and never participate in the budget
+   *  trim that pops from the tail. */
   rankedMemories(peer: string, limit = 10): Memory[] {
     const now = Date.now(),
       halflifeMs = MEMORY_HALFLIFE_DAYS * 86400000;
     const scored = this.memories(peer).map((m) => {
+      if (m.pinned)
+        return { memory: m, score: Number.MAX_SAFE_INTEGER, pinned: true };
       const age = Math.max(0, now - m.created_at);
       const recency = Math.max(
         MEMORY_RECENCY_FLOOR,
@@ -584,6 +647,7 @@ export class Store {
       return {
         memory: m,
         score: (1 + Math.sqrt(hits)) * recency * kindWeight,
+        pinned: false,
       };
     });
     return scored
@@ -652,29 +716,31 @@ export class Store {
   correctMemory(peer: string, id: string, content: string) {
     this.transaction(() => {
       const original = this.sql
-        .prepare("SELECT id,hits,last_hit_at FROM memories WHERE peer_id=? AND id=? AND status='active'")
+        .prepare(
+          "SELECT id,hits,last_hit_at,pinned FROM memories WHERE peer_id=? AND id=? AND status='active'",
+        )
         .get(peer, id) as Row | undefined;
       if (!original) throw new Error('记忆不存在');
       const msg = this.ingest(peer, randomUUID(), `[管理页更正] ${content}`).message;
-      const carried = { hits: Number(original.hits ?? 0), at: Number(original.last_hit_at ?? 0) };
+      const carried = {
+        hits: Number(original.hits ?? 0),
+        at: Number(original.last_hit_at ?? 0),
+        pinned: Number(original.pinned ?? 0),
+      };
       this.writeMemory(
         peer,
         { content, kind: 'stated', sources: [msg.id], supersedes: [id] },
         Date.now(),
       );
-      if (carried.hits || carried.at) {
-        // A correction continues the same fact: carry over its usage history
-        // onto the newest row this correction just produced.
-        const newest = this.sql
-          .prepare(
-            "SELECT id FROM memories WHERE peer_id=? AND content=? AND status='active' ORDER BY created_at DESC LIMIT 1",
-          )
-          .get(peer, content.slice(0, 800)) as Row | undefined;
-        if (newest)
-          this.sql
-            .prepare('UPDATE memories SET hits=?,last_hit_at=? WHERE id=?')
-            .run(carried.hits, carried.at, String(newest.id));
-      }
+      const newest = this.sql
+        .prepare(
+          "SELECT id FROM memories WHERE peer_id=? AND content=? AND status='active' ORDER BY created_at DESC LIMIT 1",
+        )
+        .get(peer, content.slice(0, 800)) as Row | undefined;
+      if (newest)
+        this.sql
+          .prepare('UPDATE memories SET hits=?,last_hit_at=?,pinned=? WHERE id=?')
+          .run(carried.hits, carried.at, carried.pinned, String(newest.id));
       this.sql.prepare("UPDATE peers SET notes='',notes_until=0 WHERE id=?").run(peer);
     });
   }
@@ -888,6 +954,151 @@ export class Store {
     return new Float32Array(
       buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
     );
+  }
+  openLoops(peer: string, onlyOpen = false): OpenLoop[] {
+    return this.sql
+      .prepare(
+        `SELECT * FROM open_loops WHERE peer_id=? ${onlyOpen ? "AND status='open'" : ''} ORDER BY due_at LIMIT 100`,
+      )
+      .all(peer)
+      .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as OpenLoop);
+  }
+  /** Due loops: fallen due, not yet asked about, still inside the ask window. */
+  dueOpenLoops(peer: string, now = Date.now()): OpenLoop[] {
+    return this.sql
+      .prepare(
+        `SELECT * FROM open_loops WHERE peer_id=? AND status='open' AND asked=0
+         AND due_at<=? AND due_at>? ORDER BY due_at`,
+      )
+      .all(peer, now, now - OPEN_LOOP_EXPIRE_DAYS * 86400000)
+      .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as OpenLoop);
+  }
+  addOpenLoop(peer: string, input: OpenLoopInput, now = Date.now()): OpenLoop {
+    const id = randomUUID();
+    this.sql
+      .prepare(
+        'INSERT INTO open_loops(id,peer_id,content,due_at,due_text,sources,created_at) VALUES(?,?,?,?,?,?,?)',
+      )
+      .run(id, peer, input.content.slice(0, 300), input.dueAt, input.dueText ?? '', JSON.stringify([...new Set(input.sources)].slice(0, 10)), now);
+    return this.openLoops(peer).find((l) => l.id === id)!;
+  }
+  /** The user answered about this arrangement: close it quietly. */
+  resolveOpenLoop(peer: string, id: string, now = Date.now()) {
+    this.sql
+      .prepare(
+        "UPDATE open_loops SET status='resolved',resolved_at=? WHERE peer_id=? AND id=? AND status='open'",
+      )
+      .run(now, peer, id);
+  }
+  markLoopAsked(peer: string, id: string, now = Date.now()) {
+    this.sql
+      .prepare("UPDATE open_loops SET asked=1 WHERE peer_id=? AND id=? AND status='open'")
+      .run(peer, id);
+  }
+  /** Old loops nobody resolved: drop silently rather than nag about them. */
+  expireOpenLoops(peer: string, now = Date.now()) {
+    this.sql
+      .prepare(
+        "UPDATE open_loops SET status='expired' WHERE peer_id=? AND status='open' AND due_at<=?",
+      )
+      .run(peer, now - OPEN_LOOP_EXPIRE_DAYS * 86400000);
+  }
+  mood(peer: string): MoodState {
+    const raw = this.getSetting<Partial<MoodState> | undefined>(`mood:${peer}`, undefined);
+    if (!raw || typeof raw.valence !== 'number' || typeof raw.energy !== 'number') {
+      return { valence: 0, energy: 0, at: 0 };
+    }
+    const at = Number(raw.at ?? 0);
+    // Decay toward neutral while offline; both axes never cross zero.
+    const decay = (v: number, halflifeHours: number) =>
+      Math.abs(v) * Math.pow(0.5, Math.max(0, Date.now() - at) / (halflifeHours * 3600000));
+    return {
+      valence: decay(raw.valence, MOOD_VALENCE_HALFLIFE_HOURS) * Math.sign(raw.valence),
+      energy: decay(raw.energy, MOOD_ENERGY_HALFLIFE_HOURS),
+      reason: typeof raw.reason === 'string' ? raw.reason : undefined,
+      at,
+    };
+  }
+  pulseMood(peer: string, delta: Partial<Omit<MoodState, 'at'>>, now = Date.now()) {
+    const current = this.mood(peer);
+    const clamp = (v: number) => Math.max(-1, Math.min(1, v));
+    this.setSetting(`mood:${peer}`, {
+      valence: clamp((delta.valence ?? 0) + current.valence),
+      energy: clamp((delta.energy ?? 0) + current.energy),
+      reason: delta.reason ?? current.reason,
+      at: now,
+    });
+  }
+  /** Rule-based mood pulse from one exchange. Deliberately coarse: this feeds
+   *  prose tone hints, not a numeric persona. Night and long silences lower
+   *  energy; gratitude, laughter and long engaged talks lift valence. */
+  pulseMoodFromExchange(
+    peer: string,
+    exchange: { user: string; assistant: string; userAt: number },
+    now = Date.now(),
+  ) {
+    const hour = Number(
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Shanghai',
+        hour: '2-digit',
+        hourCycle: 'h23',
+      }).format(new Date(exchange.userAt)),
+    );
+    const clamp = (v: number) => Math.max(-1, Math.min(1, v));
+    let valence = 0,
+      energy = 0,
+      reason: string | undefined;
+    if (/(谢谢|感谢|辛苦|有你真好|开心|哈哈哈|笑死)/.test(exchange.user)) {
+      valence = 0.2;
+      reason = /(谢谢|感谢|辛苦)/.test(exchange.user) ? '对方表达了感谢' : '聊得挺开心';
+    } else if (/(烦|难过|累|生气|委屈|难受|不开心|压力)/.test(exchange.user)) {
+      valence = -0.3;
+      reason = '对方提到了不开心的事';
+      energy = -0.2;
+    } else if (/(晚安|睡了)/.test(exchange.user) || hour >= 1 || hour < 7) {
+      energy = -0.15;
+    } else if (exchange.user.length > 80 && exchange.assistant.length > 80) {
+      energy = 0.1;
+    }
+    if (valence === 0 && energy === 0) return;
+    this.pulseMood(peer, { valence, energy, reason }, now);
+  }
+  /** Per-hour message frequency over the trailing two weeks, for rhythm hints. */
+  activityRhythm(peer: string, timeZone: string): number[] {
+    const buckets = new Array(24).fill(0) as number[];
+    const since = Date.now() - 14 * 86400000;
+    const rows = this.sql
+      .prepare(
+        "SELECT created_at FROM messages WHERE peer_id=? AND role='user' AND status='received' AND created_at>=?",
+      )
+      .all(peer, since);
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      hourCycle: 'h23',
+    });
+    for (const row of rows) buckets[Number(formatter.format(new Date(Number(row.created_at))))]++;
+    return buckets;
+  }
+  /** Proactive brake: pings sent after the last user message got no reply. */
+  unansweredProactiveStreak(peer: string): number {
+    const lastUser = this.sql
+      .prepare("SELECT created_at FROM messages WHERE peer_id=? AND role='user' AND status='received' ORDER BY seq DESC LIMIT 1")
+      .get(peer) as Row | undefined;
+    const lastUserAt = lastUser ? Number(lastUser.created_at) : 0;
+    const rows = this.sql
+      .prepare(
+        `SELECT m.created_at FROM outbox o JOIN messages m ON m.id=o.id
+         WHERE o.peer_id=? AND o.status='sent' AND o.task_id IN (SELECT id FROM tasks WHERE kind='proactive')
+         ORDER BY m.created_at DESC LIMIT ?`,
+      )
+      .all(peer, PROACTIVE_IGNORE_LIMIT) as Row[];
+    let streak = 0;
+    for (const row of rows) {
+      if (Number(row.created_at) < lastUserAt) break;
+      streak++;
+    }
+    return streak;
   }
   recordUsage(
     peer: string,

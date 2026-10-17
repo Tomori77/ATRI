@@ -1,5 +1,10 @@
-import type { MemoryUpdate, ReplyPart } from '@atri/db';
-import { MAX_REPLY_PARTS, MAX_MEMORY_UPDATES, MAX_IMAGE_DESCRIPTIONS } from './constants.js';
+import type { MemoryUpdate, OpenLoopInput, ReplyPart } from '@atri/db';
+import {
+  MAX_REPLY_PARTS,
+  MAX_MEMORY_UPDATES,
+  MAX_IMAGE_DESCRIPTIONS,
+  OPEN_LOOP_PROMPT_MAX,
+} from './constants.js';
 export interface Sticker {
   slug: string;
   description: string;
@@ -10,6 +15,10 @@ export interface ParsedReply {
   parts: ReplyPart[];
   memories: MemoryUpdate[];
   descriptions: { messageId: string; description: string }[];
+  /** Arrangements to remember and ask about later ("明天面试"). */
+  openLoops: OpenLoopInput[];
+  /** Loop IDs the user just answered, closing them. */
+  resolveLoops: string[];
 }
 export function parseJson(text: string): any {
   const cleaned = text
@@ -102,7 +111,37 @@ function normalizeTextParts(
     return [];
   });
 }
-export function parseReply(text: string, stickers: Sticker[], allowSkip = false): ParsedReply {
+/** Open-loop entries from the model: content plus a due time. When `available`
+ *  is given, every source ID must be visible this turn; without it (final JSON
+ *  parsing inside the tool loop) only the shape is validated. */
+export function parseOpenLoops(
+  value: unknown,
+  available?: Set<string>,
+): OpenLoopInput[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, OPEN_LOOP_PROMPT_MAX).flatMap((v) => {
+    if (!v || typeof v.content !== 'string' || !v.content.trim()) return [];
+    const due = typeof v.dueAt === 'number' && Number.isFinite(v.dueAt) ? v.dueAt : undefined;
+    const sources = Array.isArray(v.sources)
+      ? v.sources.filter((s: unknown): s is string => typeof s === 'string')
+      : [];
+    if (!due || !sources.length) return [];
+    if (available && !sources.every((id: string) => available.has(id))) return [];
+    return [
+      {
+        content: v.content.slice(0, 300),
+        dueAt: due,
+        dueText: typeof v.dueText === 'string' ? v.dueText.slice(0, 60) : '',
+        sources: sources.slice(0, 10),
+      },
+    ];
+  });
+}
+export function parseReply(
+  text: string,
+  stickers: Sticker[],
+  allowSkip = false,
+): ParsedReply {
   let raw: any;
   try {
     raw = parseJson(text);
@@ -114,8 +153,16 @@ export function parseReply(text: string, stickers: Sticker[], allowSkip = false)
           parts: [...parts, ...(cleaned ? [{ type: 'text' as const, text: cleaned }] : [])],
           memories: [],
           descriptions: [],
+          openLoops: [],
+          resolveLoops: [],
         };
-      return { parts: [{ type: 'text', text: cleaned }], memories: [], descriptions: [] };
+      return {
+        parts: [{ type: 'text', text: cleaned }],
+        memories: [],
+        descriptions: [],
+        openLoops: [],
+        resolveLoops: [],
+      };
     }
     throw new Error('回复格式无效');
   }
@@ -129,5 +176,16 @@ export function parseReply(text: string, stickers: Sticker[], allowSkip = false)
         .slice(0, MAX_IMAGE_DESCRIPTIONS)
         .map((d: any) => ({ messageId: d.messageId, description: d.description.slice(0, 800) }))
     : [];
-  return { parts, memories: parseMemories(raw.memoryUpdates), descriptions };
+  const resolveLoops = Array.isArray(raw.resolveLoops)
+    ? raw.resolveLoops
+        .filter((s: unknown): s is string => typeof s === 'string')
+        .slice(0, OPEN_LOOP_PROMPT_MAX)
+    : [];
+  return {
+    parts,
+    memories: parseMemories(raw.memoryUpdates),
+    descriptions,
+    openLoops: parseOpenLoops(raw.openLoops),
+    resolveLoops,
+  };
 }

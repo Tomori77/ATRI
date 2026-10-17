@@ -200,6 +200,25 @@ export function createServer(o: ServerOptions) {
       return { ok: true };
     },
   );
+  app.put<{ Params: { peer: string; id: string }; Body: { pinned: boolean } }>(
+    '/api/peers/:peer/memories/:id/pinned',
+    (request) => {
+      if (typeof request.body.pinned !== 'boolean') throw new Error('置顶状态无效');
+      o.store.setMemoryPinned(request.params.peer, request.params.id, request.body.pinned);
+      return { ok: true };
+    },
+  );
+  app.get<{ Params: { id: string } }>('/api/peers/:id/loops', (request) =>
+    o.store.openLoops(request.params.id),
+  );
+  app.post<{ Params: { peer: string; id: string } }>(
+    '/api/peers/:peer/loops/:id/resolve',
+    (request) => {
+      if (!o.store.peer(request.params.peer)) throw new Error('联系人不存在');
+      o.store.resolveOpenLoop(request.params.peer, request.params.id);
+      return { ok: true };
+    },
+  );
   app.delete<{ Params: { peer: string; id: string } }>(
     '/api/peers/:peer/records/:id',
     (request) => {
