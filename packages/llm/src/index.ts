@@ -53,12 +53,35 @@ export class ModelError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    readonly headers?: Record<string, string>,
   ) {
     super(message);
     this.name = 'ModelError';
   }
+  /** Transient upstream trouble (throttle, gateway hiccup, bad server state):
+   *  worth retrying with backoff. 4xx except 408/429 are permanent config or
+   *  request mistakes — retrying would burn tokens for the same failure. */
+  static transient(status?: number): boolean {
+    if (status === undefined) return false;
+    return status === 408 || status === 429 || (status >= 500 && status <= 599);
+  }
 }
 type Json = Record<string, any>;
+/** Sleep for `ms`, aborting early when the caller cancels (signal optional). */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new ModelError('模型请求超时或已取消'));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new ModelError('模型请求超时或已取消'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 function argumentsOf(value: unknown): Record<string, unknown> {
   if (typeof value === 'object' && value !== null && !Array.isArray(value))
     return value as Record<string, unknown>;
@@ -214,8 +237,41 @@ export class HttpModel implements Model {
         }));
     }
     if (c.format !== 'gemini' && c.temperature !== undefined) body.temperature = c.temperature;
-    const signal = options.signal
-      ? AbortSignal.any([options.signal, AbortSignal.timeout(c.timeoutMs)])
+    // Two retries with exponential backoff for transient upstream trouble
+    // (throttles, gateway hiccups). Abort and permanent 4xx failures throw at
+    // once; Retry-After overrides the backoff when the server sends one. The
+    // per-request timeout lives inside attempt(), so every try gets its full
+    // budget; the caller's signal (turn timeout, cancel) cuts across all of it.
+    const outer = options.signal;
+    let lastError: ModelError;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.attempt(url, headers, body, outer, c);
+      } catch (error) {
+        lastError =
+          error instanceof ModelError
+            ? error
+            : new ModelError(error instanceof Error ? error.message : '未知错误');
+        if (outer?.aborted)
+          throw new ModelError('模型请求超时或已取消');
+        if (attempt >= 2 || !ModelError.transient(lastError.status)) throw lastError;
+      }
+      const retryAfter = Number(lastError.headers?.['retry-after']);
+      const delay = Number.isFinite(retryAfter) && retryAfter >= 0
+        ? Math.min(retryAfter, 30) * 1000
+        : Math.min(1000 * 2 ** attempt, 8000);
+      await pause(delay, outer);
+    }
+  }
+  private async attempt(
+    url: string,
+    headers: Record<string, string>,
+    body: Json,
+    outer: AbortSignal | undefined,
+    c: ModelConfig,
+  ): Promise<Completion> {
+    const signal = outer
+      ? AbortSignal.any([outer, AbortSignal.timeout(c.timeoutMs)])
       : AbortSignal.timeout(c.timeoutMs);
     let response: Response;
     try {
@@ -243,6 +299,9 @@ export class HttpModel implements Model {
           .replaceAll(c.apiKey, '[已隐藏]')
           .slice(0, 200)}`,
         response.status,
+        response.headers.get('retry-after') === null
+          ? undefined
+          : { 'retry-after': response.headers.get('retry-after')! },
       );
     let text = '',
       calls: ToolCall[] = [],

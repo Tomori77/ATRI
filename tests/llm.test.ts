@@ -252,3 +252,46 @@ test('中文、英文和表情裁剪遵守估算预算，不产生半个 Unicode
   assert.equal(trimToTokens('🌊', 1), '');
   assert.equal(trimToTokens('🌊', 2), '🌊');
 });
+
+test('瞬时错误自动重试：503 两次后重试成功，共 3 次请求', async () => {
+  let requests = 0;
+  const flaky = new HttpModel(config, (async () => {
+    requests++;
+    if (requests <= 2) return Response.json({ error: 'upstream busy' }, { status: 503 });
+    return Response.json({ choices: [{ message: { role: 'assistant', content: '恢复' } }] });
+  }) as typeof fetch);
+  const ok = await flaky.complete([{ role: 'user', content: '你好' }]);
+  assert.equal(ok.text, '恢复');
+  assert.equal(requests, 3, '原始请求 + 2 次重试');
+});
+
+test('永久 4xx 不重试，瞬时错误重试耗尽抛最后错误，取消立即退出', async () => {
+  let unauthorized = 0;
+  const badKey = new HttpModel(config, (async () => {
+    unauthorized++;
+    return Response.json({ error: { message: 'bad key' } }, { status: 401 });
+  }) as typeof fetch);
+  await assert.rejects(badKey.complete([{ role: 'user', content: 'hi' }]), /401/);
+  assert.equal(unauthorized, 1, '401 不重试');
+
+  let down = 0;
+  const dead = new HttpModel(config, (async () => {
+    down++;
+    return Response.json({ error: 'gateway down' }, { status: 502 });
+  }) as typeof fetch);
+  await assert.rejects(dead.complete([{ role: 'user', content: 'hi' }]), /502/);
+  assert.equal(down, 3, '重试耗尽共 3 次请求');
+
+  const controller = new AbortController();
+  let cancelled = 0;
+  const aborting = new HttpModel(config, (async () => {
+    cancelled++;
+    controller.abort();
+    return Response.json({ error: 'busy' }, { status: 500 });
+  }) as typeof fetch);
+  await assert.rejects(
+    aborting.complete([{ role: 'user', content: 'hi' }], [], { signal: controller.signal }),
+    /超时或已取消/,
+  );
+  assert.equal(cancelled, 1, '取消后不再重试');
+});
