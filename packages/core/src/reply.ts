@@ -97,15 +97,46 @@ export function extractInlineStickers(
     .trim();
   return { parts, text: cleaned };
 }
+/**
+ * Models sometimes copy the "[来源 id | time]" annotation from rendered history
+ * into their output. Strip leading annotation lines, and when one text blob
+ * carries several of them, split it back into separate bubbles the way the
+ * model was supposed to emit them via the messages array.
+ */
+export function stripSourceAnnotations(
+  text: string,
+): { parts: ReplyPart[]; text: string } {
+  const withoutPrefix = text.replace(/^\s*\[来源[^\]]*\]\s*\n?/g, '');
+  if (withoutPrefix === text) return { parts: [], text };
+  const chunks = withoutPrefix
+    .split(/\s*\[来源[^\]]*\]\s*/g)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  if (chunks.length <= 1) return { parts: [], text: withoutPrefix.trim() };
+  return {
+    parts: chunks.slice(0, MAX_REPLY_PARTS).map((c) => ({ type: 'text' as const, text: c })),
+    text: '',
+  };
+}
 function normalizeTextParts(
   raw: unknown[],
   stickers: Sticker[],
 ): ReplyPart[] {
   return raw.slice(0, MAX_REPLY_PARTS).flatMap((m: unknown) => {
     if (typeof m === 'string' && m.trim()) {
-      const { parts, text } = extractInlineStickers(m, stickers);
-      if (parts.length) return [...parts, ...(text ? [{ type: 'text' as const, text }] : [])];
-      return [{ type: 'text', text: text.slice(0, 6000) }];
+      const head = stripSourceAnnotations(m);
+      const segments = head.parts.length
+        ? head.parts.flatMap((p) => (p.type === 'text' && p.text ? [p.text] : []))
+        : [head.text];
+      return segments.flatMap((segment) => {
+        const { parts, text } = extractInlineStickers(segment, stickers);
+        const body = text.trim();
+        const stripped = stripSourceAnnotations(body);
+        const combined = [...parts, ...stripped.parts];
+        if (combined.length) return [...combined, ...(stripped.text ? [{ type: 'text' as const, text: stripped.text.slice(0, 6000) }] : [])];
+        if (stripped.text) return [{ type: 'text', text: stripped.text.slice(0, 6000) }];
+        return [];
+      });
     }
     if (m && typeof m === 'object' && 'type' in m && m.type === 'sticker' && 'slug' in m) {
       const sticker = stickers.find((s) => s.slug === m.slug);
@@ -258,17 +289,15 @@ export function parseReply(
     raw = parseJson(text);
   } catch {
     if (!/[{}]|```|"messages"/.test(text) && text.trim()) {
-      const { parts, text: cleaned } = extractInlineStickers(text.trim().slice(0, 6000), stickers);
-      if (parts.length)
-        return {
-          parts: [...parts, ...(cleaned ? [{ type: 'text' as const, text: cleaned }] : [])],
-          memories: [],
-          descriptions: [],
-          openLoops: [],
-          resolveLoops: [],
-        };
+      const blob = text.trim().slice(0, 6000);
+      const annotated = stripSourceAnnotations(blob);
+      const { parts: stickerParts, text: stickerText } = annotated.parts.length
+        ? { parts: annotated.parts, text: '' }
+        : extractInlineStickers(blob, stickers);
+      const { parts: splitParts, text: rest } = stripSourceAnnotations(stickerText);
+      const all = [...stickerParts, ...splitParts, ...(rest ? [{ type: 'text' as const, text: rest.slice(0, 6000) }] : [])];
       return {
-        parts: [{ type: 'text', text: cleaned }],
+        parts: all.length ? all : [{ type: 'text' as const, text: blob }],
         memories: [],
         descriptions: [],
         openLoops: [],

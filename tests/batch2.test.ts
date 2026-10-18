@@ -6,6 +6,7 @@ import {
   resolveDue,
   parseMoodPulse,
   parseOpenLoops,
+  parseReply,
   type Sticker,
 } from '@atri/core';
 import { fixture, FakeModel, completion } from './helpers.js';
@@ -234,4 +235,45 @@ test('moodPulse 从模型输出解析并入状态', async (t) => {
   assert.equal(parseMoodPulse(null), undefined);
   assert.equal(parseMoodPulse({ valence: 0, energy: 0 }), undefined);
   assert.equal(parseMoodPulse({ valence: 5, energy: 0 })!.valence, 1, '限幅');
+});
+
+test('来源标注泄漏：剥除前缀，多来源块拆成独立气泡', () => {
+  // 纯文本兜底路径：一段文本混了三个来源块
+  const leaked = [
+    '[来源 e0d0a9be-2f70:0 | 10/18 00:24]',
+    '第一段话',
+    '',
+    '[来源 e0d0a9be-2f70:1 | 10/18 00:24]',
+    '第二段话',
+    '',
+    '[来源 e0d0a9be-2f70:2 | 10/18 00:24]',
+    '第三段话',
+  ].join('\n');
+  const plain = parseReply(leaked, stickers);
+  assert.deepEqual(
+    plain.parts,
+    [
+      { type: 'text', text: '第一段话' },
+      { type: 'text', text: '第二段话' },
+      { type: 'text', text: '第三段话' },
+    ],
+    '兜底路径按来源块拆分',
+  );
+  // JSON 路径：单个字符串里带前缀
+  const json = parseReply(
+    JSON.stringify({ messages: ['[来源 abc:0 | 10/18 00:24]开场的回应'] }),
+    stickers,
+  );
+  assert.deepEqual(json.parts, [{ type: 'text', text: '开场的回应' }]);
+  // 与表情混排：剥掉来源前缀，表情照常转换
+  const mixed = parseReply('[来源 a:0 | 10/18 00:24]好耶[表情：开心]！', stickers);
+  assert.ok(mixed.parts.some((p) => p.type === 'sticker'), '表情被转换');
+  assert.deepEqual(
+    mixed.parts.filter((p) => p.type === 'text').map((p) => p.text),
+    ['好耶！'],
+    '正文剥掉来源前缀',
+  );
+  // 正常输出不受影响：没有标注时保持原样
+  const clean = parseReply('普通的一句回复', stickers);
+  assert.deepEqual(clean.parts, [{ type: 'text', text: '普通的一句回复' }]);
 });
