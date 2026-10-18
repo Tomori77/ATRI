@@ -98,7 +98,19 @@ async function loadPeers() {
         await loadPeers();
       }),
     );
-    row.append(heading);
+    const personaSelect = document.createElement('select');
+    personaSelect.dataset.personaFor = peer.id;
+    personaSelect.setAttribute('aria-label', '人格选择：' + peer.address);
+    personaSelect.onchange = () =>
+      perform(async () => {
+        await api('/api/peers/' + enc(peer.id) + '/persona', 'PUT', {
+          personaId: personaSelect.value,
+        });
+        personaState.bindings[peer.id] = personaSelect.value;
+        show('该联系人的人格已更新。');
+      }, personaSelect);
+    if (personaState.list.length) fillPersonaSelect(personaSelect, peer.persona_id ?? '');
+    row.append(heading, personaSelect);
     target.append(row);
   }
   for (const id of ['chat-peer', 'journal-peer']) {
@@ -273,6 +285,92 @@ function countPersona() {
   $('persona-count').textContent =
     `${formatNumber($('persona-content').value.length)} / 12,000 字符 · 保存后下次生成生效`;
 }
+let personaState = { list: [], defaultId: '', bindings: {} },
+  personaSelected = '';
+async function loadPersonas(selectId) {
+  personaState = await api('/api/personas');
+  const target = $('persona-list');
+  target.replaceChildren();
+  if (!personaState.list.length) empty(target, '还没有人格。');
+  for (const persona of personaState.list) {
+    const row = el('div', undefined, 'row'),
+      heading = el('div', undefined, 'row-title'),
+      actions = el('div', undefined, 'actions');
+    const label = el('span', persona.name + (persona.id === personaState.defaultId ? ' · 默认' : ''));
+    if (persona.id === personaSelected) label.style.fontWeight = '600';
+    heading.append(label);
+    if (persona.id !== personaState.defaultId)
+      actions.append(
+        button('设为默认', async () => {
+          await api('/api/personas/' + enc(persona.id) + '/default', 'PUT');
+          await loadPersonas(persona.id);
+          show('默认人格已更新。');
+        }),
+      );
+    actions.append(
+      button('编辑', () => selectPersona(persona.id)),
+      button(
+        '删除',
+        async () => {
+          if (!confirm(`删除人格「${persona.name}」？绑定了它的联系人将改用默认人格。`)) return;
+          await api('/api/personas/' + enc(persona.id), 'DELETE');
+          if (personaSelected === persona.id) personaSelected = '';
+          await loadPersonas();
+          show('人格已删除。');
+        },
+        'ghost small danger',
+      ),
+    );
+    row.append(heading, actions);
+    target.append(row);
+  }
+  if (selectId) selectPersona(selectId);
+  else if (!personaSelected && personaState.list.length)
+    selectPersona(personaState.defaultId || personaState.list[0].id);
+}
+function selectPersona(id) {
+  const persona = personaState.list.find((p) => p.id === id);
+  if (!persona) return;
+  personaSelected = id;
+  $('persona-edit-title').textContent = '编辑：' + persona.name;
+  $('persona-name').value = persona.name;
+  $('persona-content').value = persona.content;
+  countPersona();
+  loadPersonasBound();
+}
+function loadPersonasBound() {
+  document
+    .querySelectorAll('select[data-persona-for]')
+    .forEach((select) => fillPersonaSelect(select, personaState.bindings[select.dataset.personaFor] || ''));
+}
+function fillPersonaSelect(select, boundId) {
+  const current = select.value;
+  select.replaceChildren();
+  const auto = el('option', '默认人格（' + (personaState.list.find((p) => p.id === personaState.defaultId)?.name ?? '') + '）');
+  auto.value = '';
+  select.append(auto);
+  for (const persona of personaState.list) {
+    const option = el('option', persona.name);
+    option.value = persona.id;
+    select.append(option);
+  }
+  select.value = personaState.list.some((p) => p.id === boundId) ? boundId : '';
+  if (![...select.options].some((o) => o.value === select.value)) select.value = '';
+  if (current && [...select.options].some((o) => o.value === current) && boundId === undefined)
+    select.value = current;
+}
+$('persona-new').onclick = () =>
+  perform(async () => {
+    const name = prompt('新人格的名称：');
+    if (name === null) return;
+    const entry = await api('/api/personas', 'POST', {
+      name,
+      content: (personaState.list.find((p) => p.id === personaSelected)?.content) || '（在这里写下她是谁）',
+    });
+    await loadPersonas(entry.id);
+    show('已创建，编辑内容后保存。');
+  }, $('persona-new'));
+$('persona-name').oninput = countPersona;
 async function loadChat() {
   const peer = $('chat-peer').value || 'preview:default';
   const history = await api('/api/peers/' + enc(peer) + '/history'),
@@ -474,9 +572,7 @@ async function enter() {
   $('dashboard').hidden = false;
   $('logout').hidden = false;
   $('notice').hidden = true;
-  await Promise.all([status(), loadPeers(), loadSettings()]);
-  $('persona-content').value = (await api('/api/persona')).content;
-  countPersona();
+  await Promise.all([status(), loadPeers(), loadSettings(), loadPersonas()]);
   await selectTab(currentTab);
 }
 async function selectTab(tab) {
@@ -491,6 +587,7 @@ async function selectTab(tab) {
   if (tab === 'chat') await loadChat();
   if (tab === 'journal') await loadJournal();
   if (tab === 'stickers') await loadStickers();
+  if (tab === 'persona') await loadPersonas(personaSelected);
 }
 document
   .querySelectorAll('[data-tab]')
@@ -584,7 +681,12 @@ $('write-diary').onclick = () =>
 $('persona-form').onsubmit = (e) => {
   e.preventDefault();
   perform(async () => {
-    await api('/api/persona', 'PUT', { content: $('persona-content').value });
+    if (!personaSelected) throw new Error('请先选择要编辑的人格');
+    await api('/api/personas/' + enc(personaSelected), 'PUT', {
+      name: $('persona-name').value,
+      content: $('persona-content').value,
+    });
+    await loadPersonas(personaSelected);
     show('人物设定已保存，下次生成时使用。');
   }, e.submitter);
 };

@@ -161,6 +161,41 @@ export function createServer(o: ServerOptions) {
     o.settings.savePersona(text(request.body.content));
     return { ok: true };
   });
+  app.get('/api/personas', () => {
+    const { list, defaultId } = o.settings.personaList();
+    const bindings = Object.fromEntries(
+      o.store.peers().map((p) => [p.id, p.persona_id ?? '']),
+    );
+    return { list, defaultId, bindings };
+  });
+  app.post<{ Body: { name: string; content: string } }>('/api/personas', (request) =>
+    o.settings.personaCreate(text(request.body.name, 40), text(request.body.content)),
+  );
+  app.put<{ Params: { id: string }; Body: { name?: string; content?: string } }>(
+    '/api/personas/:id',
+    (request) => {
+      const input = request.body ?? {};
+      if (input.name === undefined && input.content === undefined)
+        throw new Error('没有需要保存的修改');
+      return o.settings.personaUpdate(request.params.id, {
+        ...(input.name !== undefined ? { name: text(input.name, 40) } : {}),
+        ...(input.content !== undefined ? { content: text(input.content) } : {}),
+      });
+    },
+  );
+  app.delete<{ Params: { id: string } }>('/api/personas/:id', (request) =>
+    o.settings.personaDelete(request.params.id),
+  );
+  app.put<{ Params: { id: string } }>('/api/personas/:id/default', (request) =>
+    o.settings.personaSetDefault(request.params.id),
+  );
+  app.put<{ Params: { id: string }; Body: { personaId: string } }>(
+    '/api/peers/:id/persona',
+    (request) => {
+      if (typeof request.body.personaId !== 'string') throw new Error('人格选择无效');
+      return o.settings.setPeerPersona(request.params.id, request.body.personaId);
+    },
+  );
   app.get('/api/models', async () => {
     const c = o.settings.config();
     if (c.format !== 'openai') throw new Error('模型列表拉取仅支持 OpenAI 兼容接口');

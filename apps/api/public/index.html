@@ -328,17 +328,29 @@
               <div>
                 <span class="eyebrow">A PERSONALITY OF HER OWN</span>
                 <h1>人物设定</h1>
-                <p>用你自己的话，写下她是谁，以及如何相处。</p>
+                <p>用你自己的话，写下她是谁，以及如何相处。可为不同联系人使用不同人格。</p>
               </div>
+              <button id="persona-new" class="ghost">新建人格</button>
             </div>
+            <article class="card">
+              <div class="card-heading">
+                <div>
+                  <h2>人格列表</h2>
+                  <p class="hint">“默认”人格用于未单独设置人格的联系人。</p>
+                </div>
+              </div>
+              <div id="persona-list"></div>
+            </article>
             <form id="persona-form" class="card persona-card">
               <div class="persona-intro">
                 <img src="/avatar.webp" alt="" width="64" height="64" />
                 <div>
-                  <h2>从文字开始认识她</h2>
+                  <h2 id="persona-edit-title">从文字开始认识她</h2>
                   <p class="hint">普通文字即可，无需固定模板。情绪和语气会结合真实上下文生成。</p>
                 </div>
               </div>
+              <label for="persona-name">人格名称</label
+              ><input id="persona-name" maxlength="40" required placeholder="例如：安静的学生" />
               <label for="persona-content">人物提示词</label
               ><textarea
                 id="persona-content"

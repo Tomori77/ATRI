@@ -702,6 +702,10 @@ label small {
   margin-top: 12px;
   gap: 7px;
 }
+.row select {
+  margin-top: 10px;
+  max-width: 100%;
+}
 .badge {
   display: inline-block;
   font-size: 10px;
