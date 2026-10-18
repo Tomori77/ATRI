@@ -5,8 +5,7 @@ import type { Store } from '@atri/db';
 import type { ModelConfig, ApiFormat } from '@atri/llm';
 import type { RuntimeConfig, PromptName } from '@atri/core';
 
-export interface SavedConfig {
-  baseUrl: string;
+export interface SavedConfig {  baseUrl: string;
   apiKey: string;
   model: string;
   format: ApiFormat;
@@ -31,6 +30,11 @@ export interface SavedConfig {
   maxConcurrentPeers: number;
   debounceMs: number;
 }
+const text12k = (value: unknown) => {
+  if (typeof value !== 'string' || !value.trim() || value.length > 12000)
+    throw new Error('人设需要 1–12000 个字符');
+  return value;
+};
 export class Settings {
   readonly dataDir: string;
   readonly adminPassword: string;
@@ -217,7 +221,7 @@ export class Settings {
     const c = this.config();
     return {
       baseUrl: c.embeddingBaseUrl || c.baseUrl,
-      apiKey: c.embeddingApiKey || c.apiKey,
+      apiKey: c.embeddingApiKey,
       model: c.embeddingModel,
       timeoutMs: Math.min(c.requestTimeoutSeconds, 60) * 1000,
     };
@@ -241,6 +245,91 @@ export class Settings {
   savePersona(text: string) {
     if (!text.trim() || text.length > 12000) throw new Error('人设需要 1–12000 个字符');
     this.store.setSetting('prompt:persona', text);
+  }
+  personaList() {
+    let list = this.store.getSetting<
+      { id: string; name: string; content: string; createdAt: number }[] | undefined
+    >('personas', undefined);
+    if (!list) {
+      // First run on a database created before multi-persona support: import
+      // the single persona as the default entry so nothing is lost.
+      const imported: { id: string; name: string; content: string; createdAt: number }[] = [
+        {
+          id: 'default',
+          name: '默认人格',
+          content: this.store.getSetting<string>('prompt:persona', this.prompt('persona')),
+          createdAt: Date.now(),
+        },
+      ];
+      this.store.setSetting('personas', imported);
+      this.store.setSetting('persona:default', 'default');
+      list = imported;
+    }
+    return { list: [...list], defaultId: this.store.getSetting<string>('persona:default', 'default') };
+  }
+  personaContentFor(peerId: string): string {
+    const { list, defaultId } = this.personaList();
+    const binding = peerId ? (this.store.peer(peerId)?.persona_id ?? '') : '';
+    const id = binding || defaultId;
+    return list.find((p) => p.id === id)?.content ?? this.prompt('persona');
+  }
+  private validatePersonaName(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed.length > 40) throw new Error('人格名称需要 1–40 个字符');
+    return trimmed;
+  }
+  personaCreate(name: string, content: string) {
+    const { list } = this.personaList();
+    const entry = {
+      id: randomBytes(6).toString('base64url'),
+      name: this.validatePersonaName(name),
+      content: text12k(content),
+      createdAt: Date.now(),
+    };
+    this.store.setSetting('personas', [...list, entry]);
+    return entry;
+  }
+  personaUpdate(id: string, input: { name?: string; content?: string }) {
+    const { list } = this.personaList();
+    const entry = list.find((p) => p.id === id);
+    if (!entry) throw new Error('人格不存在');
+    const next = { ...entry };
+    if (input.name !== undefined) next.name = this.validatePersonaName(input.name);
+    if (input.content !== undefined) next.content = text12k(input.content);
+    this.store.setSetting(
+      'personas',
+      list.map((p) => (p.id === id ? next : p)),
+    );
+    return next;
+  }
+  personaDelete(id: string) {
+    const { list, defaultId } = this.personaList();
+    if (list.length <= 1) throw new Error('至少保留一个人格');
+    if (id === defaultId) throw new Error('默认人格不能删除，请先设置其他人格为默认');
+    this.store.setSetting(
+      'personas',
+      list.filter((p) => p.id !== id),
+    );
+    // Peers bound to the removed persona fall back to the default automatically
+    // (binding points at a missing id); clear the dangling bindings anyway.
+    for (const peer of this.store.peers())
+      if (peer.persona_id === id) this.store.setPeerPersona(peer.id, '');
+    return { ok: true };
+  }
+  personaSetDefault(id: string) {
+    const { list } = this.personaList();
+    if (!list.some((p) => p.id === id)) throw new Error('人格不存在');
+    this.store.setSetting('persona:default', id);
+    return { ok: true };
+  }
+  setPeerPersona(peerId: string, personaId: string) {
+    if (!this.store.peer(peerId)) throw new Error('联系人不存在');
+    if (personaId) {
+      const { list } = this.personaList();
+      if (!list.some((p) => p.id === personaId)) throw new Error('人格不存在');
+    }
+    this.store.setPeerPersona(peerId, personaId);
+    return { ok: true };
   }
   allowedPeers() {
     return new Set(

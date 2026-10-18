@@ -113,9 +113,9 @@ test('模型配置校验是原子的，空密钥保持原值', async (t) => {
   assert.equal(f.settings.config().model, 'new-model');
 });
 
-test('向量密钥独立于主密钥，留空回退主密钥，可单独清除', async (t) => {
+test('向量密钥独立于主密钥，留空不回退主密钥，可单独清除', async (t) => {
   const f = server(t);
-  assert.equal(f.settings.embedding().apiKey, 'hidden-test-model-key');
+  assert.equal(f.settings.embedding().apiKey, '', '未填写向量密钥时不回退主密钥');
   const saved = await f.app.inject({
     method: 'PUT',
     url: '/api/config',
@@ -142,7 +142,7 @@ test('向量密钥独立于主密钥，留空回退主密钥，可单独清除',
   });
   assert.equal(cleared.statusCode, 200);
   assert.equal(cleared.json().hasEmbeddingApiKey, false);
-  assert.equal(f.settings.embedding().apiKey, 'hidden-test-model-key', '清除后回退主密钥');
+  assert.equal(f.settings.embedding().apiKey, '', '清除后为空，不回退主密钥');
 });
 
 test('网页调试参数写入配置，并传递给模型请求与对话运行时', async (t) => {

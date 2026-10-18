@@ -19,6 +19,7 @@ export interface Peer {
   last_user_at: number;
   last_proactive_at: number;
   created_at: number;
+  persona_id: string;
 }
 export interface Media {
   path?: string;
@@ -178,7 +179,7 @@ export class Store {
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
-    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 2) {
+    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 3) {
       this.sql.close();
       throw new Error('数据库来自更新版本，不能用当前程序打开');
     }
@@ -245,6 +246,11 @@ export class Store {
       this.sql.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;');
       this.sql.exec('PRAGMA user_version=2;');
     }
+    if (openedAt < 3) {
+      // Per-peer persona binding; empty string means "use the default persona".
+      this.sql.exec('ALTER TABLE peers ADD COLUMN persona_id TEXT NOT NULL DEFAULT "";');
+      this.sql.exec('PRAGMA user_version=3;');
+    }
   }
   close() {
     this.sql.close();
@@ -307,6 +313,11 @@ export class Store {
   }
   approve(id: string, approved: boolean) {
     this.sql.prepare('UPDATE peers SET approved=? WHERE id=?').run(approved ? 1 : 0, id);
+  }
+  setPeerPersona(id: string, personaId: string) {
+    this.sql
+      .prepare('UPDATE peers SET persona_id=? WHERE id=?')
+      .run(personaId, id);
   }
   private message(row: Row): Message {
     return { ...row, media: parse(row.media, []) } as unknown as Message;

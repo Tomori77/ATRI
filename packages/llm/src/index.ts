@@ -407,11 +407,12 @@ export class EmbeddingClient {
     const c = this.getConfig();
     if (!c.model || !c.apiKey || !c.baseUrl) throw new Error('向量模型尚未配置');
     const usable = texts.map((t) => t.slice(0, 6000)).map((t) => (t.trim() ? t : '(空)'));
-    const url = `${c.baseUrl.replace(/\/+$/, '')}/embeddings`;
+    const base = c.baseUrl.replace(/\/+$/, '').replace(/\/embeddings$/, '');
+    const endpoint = `${/\/v\d+$/.test(base) ? base : `${base}/v1`}/embeddings`;
     const timeout = AbortSignal.timeout(c.timeoutMs ?? 30000);
     let response: Response;
     try {
-      response = await this.fetcher(url, {
+      response = await this.fetcher(endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${c.apiKey}` },
         body: JSON.stringify({ model: c.model, input: usable, encoding_format: 'float' }),

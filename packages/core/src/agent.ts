@@ -47,6 +47,8 @@ export interface AgentOptions {
   store: Store;
   model: () => Model;
   prompt: (name: PromptName) => string;
+  /** Persona text for a given peer; falls back to prompt('persona') when absent. */
+  personaFor?: (peerId: string) => string;
   stickers: () => Sticker[];
   web: WebTools;
   timeZone: () => string;
@@ -329,7 +331,7 @@ export class Agent {
     );
     const openLoops = store.dueOpenLoops(peer.id, now);
     const base = [
-      this.o.prompt('persona'),
+      this.o.personaFor?.(peer.id) ?? this.o.prompt('persona'),
       this.o.prompt('chat'),
       timeLine,
       `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
@@ -635,7 +637,9 @@ export class Agent {
     }
     const kind = task.kind === 'notes' ? 'context_notes' : 'diary';
     const prompt =
-      (kind === 'diary' ? this.o.prompt('persona') + '\n\n' : '') + this.o.prompt(kind);
+      (kind === 'diary'
+        ? (this.o.personaFor?.(peer.id) ?? this.o.prompt('persona')) + '\n\n'
+        : '') + this.o.prompt(kind);
     const budget = this.o.contextTokens();
     const notes = trimToTokens(peer.notes, Math.min(NOTES_MAX_TOKENS, budget * 0.08));
     const memories = store.rankedMemories(peer.id, 12);

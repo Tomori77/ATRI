@@ -19,6 +19,7 @@ const runtime = new Runtime({
   config: () => settings.runtime(),
   model: () => new HttpModel(settings.model()),
   prompt: (name) => settings.prompt(name),
+  personaFor: (peerId) => settings.personaContentFor(peerId),
   stickers: () => stickers.list(),
   web: new TavilyWeb(() => settings.config().tavilyKey),
   timeZone: () => settings.config().timeZone,
