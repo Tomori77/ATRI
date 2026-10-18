@@ -214,30 +214,30 @@ async function status() {
   $('issues').classList.toggle('attention', stuckPeers.size > 0);
   const states = $('peer-states');
   states.replaceChildren();
-  for (const state of state.states ?? []) {
+  for (const peer of state.states ?? []) {
     const row = el('div', undefined, 'row'),
       title = el('div', undefined, 'row-title');
-    title.append(el('span', state.address));
-    if (stuckPeers.has(state.peerId))
+    title.append(el('span', peer.address));
+    if (stuckPeers.has(peer.peerId))
       title.append(el('span', '发送待确认，暂停回复', 'badge alert'));
     const badges = el('div', undefined, 'actions');
-    if (state.mood) {
+    if (peer.mood) {
       const parts = [];
-      if (state.mood.valence >= 0.3) parts.push('心情不错');
-      else if (state.mood.valence <= -0.3) parts.push('心情低落');
-      else if (state.mood.valence <= -0.12) parts.push('情绪平平');
-      if (state.mood.energy <= -0.3) parts.push('有点累');
-      else if (state.mood.energy >= 0.3) parts.push('精力足');
+      if (peer.mood.valence >= 0.3) parts.push('心情不错');
+      else if (peer.mood.valence <= -0.3) parts.push('心情低落');
+      else if (peer.mood.valence <= -0.12) parts.push('情绪平平');
+      if (peer.mood.energy <= -0.3) parts.push('有点累');
+      else if (peer.mood.energy >= 0.3) parts.push('精力足');
       if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
-      if (state.mood.reason) badges.append(el('span', state.mood.reason, 'badge'));
+      if (peer.mood.reason) badges.append(el('span', peer.mood.reason, 'badge'));
     }
-    if (state.dueLoops) badges.append(el('span', `惦记 ${state.dueLoops} 件事`, 'badge'));
-    if (state.lastProactiveAt)
+    if (peer.dueLoops) badges.append(el('span', `惦记 ${peer.dueLoops} 件事`, 'badge'));
+    if (peer.lastProactiveAt)
       badges.append(
         el(
           'span',
           '上次问候 ' +
-            new Date(state.lastProactiveAt).toLocaleString('zh-CN', {
+            new Date(peer.lastProactiveAt).toLocaleString('zh-CN', {
               month: 'numeric',
               day: 'numeric',
               hour: '2-digit',
@@ -246,7 +246,7 @@ async function status() {
           'badge',
         ),
       );
-    if (!state.approved) badges.append(el('span', '未允许', 'badge'));
+    if (!peer.approved) badges.append(el('span', '未允许', 'badge'));
     row.append(title, badges);
     if (!badges.childNodes.length) row.append(el('p', '状态平静，暂无惦记的事。', 'hint'));
     states.append(row);
