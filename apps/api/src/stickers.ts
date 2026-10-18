@@ -12,8 +12,13 @@ export class Stickers {
     private readonly store: Store,
   ) {}
   list(includeDisabled = false): (Sticker & { disabled: boolean })[] {
+    // Strip a UTF-8 BOM if present: catalogs edited on Windows may carry one,
+    // and JSON.parse rejects it with a confusing "Unexpected token '﻿'".
     const builtins = JSON.parse(
-      readFileSync(join(this.root, 'assets', 'stickers', 'catalog.json'), 'utf8'),
+      readFileSync(join(this.root, 'assets', 'stickers', 'catalog.json'), 'utf8').replace(
+        /^\uFEFF/,
+        '',
+      ),
     ) as Sticker[];
     const disabled = new Set(this.store.getSetting<string[]>('stickers:disabled', []));
     return [...builtins, ...this.store.getSetting<Sticker[]>('stickers:custom', [])]
