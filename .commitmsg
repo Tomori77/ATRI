@@ -1,0 +1,27 @@
+refactor: admin UI overhaul before launch
+
+Layout fixes
+- settings page: below 960px the aside (budget meter + recent usage) is
+  now a full-width block rendered AFTER the form instead of a 252px side
+  column that starves the form, and no longer sits above it on phones
+- recent-usage log collapsed into a <details>; long WeChat addresses get
+  ellipsis with the full value on title hover; all usage/list text breaks
+  anywhere so peer IDs can never stretch the page
+- row titles word-break long addresses; small buttons reach 36px (44px on
+  phones); overview issues card shows an alert pill when deliveries stall
+
+Interaction fixes
+- replaced every native confirm() with an inline two-tap confirm button
+  (arm "确认删除?" for 3s, tap again to fire) - six destructive actions
+- fixed a real rendering bug: unpinned memories appended a literal "null"
+  text node (DOM append(null) coerces); now spread-conditional
+- chat page shows a pulsing "正在输入……" line from send until an
+  assistant bubble lands; cleared when history updates
+- personas load before peer rows so binding selects are filled on first
+  paint instead of only after the personas request happened to win the race
+
+Verification
+- scripts/check-api-pairs.mjs cross-checks every frontend call against
+  server routes: all 37 calls matched; unused legacy endpoints listed
+- 174 tests pass; scripts/push-upload2.mjs (argv-safe upload with stdin
+  bodies and file-based commit messages) kept for future pushes

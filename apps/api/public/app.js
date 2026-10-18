@@ -24,7 +24,8 @@ let authenticated = false,
   settingsVersion = 0,
   polling = false,
   chatSnapshot = '',
-  journalSnapshot = '';
+  journalSnapshot = '',
+  waitingReply = false;
 function show(message, error = false) {
   clearTimeout(noticeTimer);
   $('notice').textContent = message;
@@ -81,6 +82,31 @@ function empty(node, message) {
   node.replaceChildren(el('p', message, 'empty'));
 }
 const enc = encodeURIComponent;
+/** Inline confirmation for destructive actions: first tap arms the button
+ *  ("确认删除？"), second tap within 3s fires, then it resets. Replaces
+ *  native confirm() which is unstyleable and awkward on mobile. */
+function confirmButton(label, message, handler, classes = 'ghost small danger') {
+  const node = button(label, async () => {
+    if (node.dataset.armed !== '1') {
+      node.dataset.armed = '1';
+      node.textContent = message;
+      node.classList.add('armed');
+      setTimeout(() => {
+        if (node.isConnected) {
+          node.dataset.armed = '';
+          node.textContent = label;
+          node.classList.remove('armed');
+        }
+      }, 3000);
+      return;
+    }
+    node.dataset.armed = '';
+    node.textContent = label;
+    node.classList.remove('armed');
+    await handler();
+  }, classes);
+  return node;
+}
 async function loadPeers() {
   peers = await api('/api/peers');
   const wechatPeers = peers.filter((p) => p.channel === 'wechat');
@@ -198,8 +224,10 @@ async function status() {
     ])
       actions.append(
         button(label, async () => {
-          if (action === 'retry' && !confirm('请先确认微信中没有收到这条消息，再重新发送。'))
+          if (action === 'retry') {
+            show('请先确认微信中没有收到这条消息，再选择重新发送。', true);
             return;
+          }
           await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
           await status();
         }),
@@ -282,14 +310,13 @@ async function status() {
       );
       time.dateTime = new Date(u.created_at).toISOString();
       heading.append(el('strong', purposeName(u.purpose)), time);
-      row.append(
-        heading,
-        el(
-          'p',
-          `输入 ${formatNumber(u.input_tokens)} · 输出 ${formatNumber(u.output_tokens)} token`,
-        ),
-        el('p', `${(u.duration_ms / 1000).toFixed(2)} 秒 · ${u.address || '已删除的对话'}`),
+      const detail = el(
+        'p',
+        `入 ${formatNumber(u.input_tokens)} · 出 ${formatNumber(u.output_tokens)} · ${(u.duration_ms / 1000).toFixed(1)} 秒`,
       );
+      const address = el('p', u.address || '已删除的对话', 'recent-address');
+      address.title = u.address || '';
+      row.append(heading, detail, address);
       return row;
     }),
   );
@@ -375,17 +402,12 @@ async function loadPersonas(selectId) {
       );
     actions.append(
       button('编辑', () => selectPersona(persona.id)),
-      button(
-        '删除',
-        async () => {
-          if (!confirm(`删除人格「${persona.name}」？绑定了它的联系人将改用默认人格。`)) return;
-          await api('/api/personas/' + enc(persona.id), 'DELETE');
-          if (personaSelected === persona.id) personaSelected = '';
-          await loadPersonas();
-          show('人格已删除。');
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除', '确认删除？', async () => {
+        await api('/api/personas/' + enc(persona.id), 'DELETE');
+        if (personaSelected === persona.id) personaSelected = '';
+        await loadPersonas();
+        show('人格已删除。');
+      }),
     );
     row.append(heading, actions);
     target.append(row);
@@ -474,19 +496,21 @@ async function loadChat() {
     for (const media of message.media)
       if (media.description) bubble.append(el('p', media.description, 'hint'));
     bubble.append(
-      button(
-        '删除',
-        async () => {
-          if (!confirm('删除这条原文及依赖它的日记和记忆？微信中已经发送的消息仍会保留。')) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
-          await loadChat();
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除', '确认删除？', async () => {
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
+        await loadChat();
+      }),
     );
     container.append(bubble);
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
+  // A reply arrived (assistant bubble added since the send) → clear waiting.
+  if (waitingReply && history.some((m) => m.role === 'assistant')) {
+    waitingReply = false;
+  } else if (waitingReply) {
+    container.append(el('div', '亚托莉正在输入……', 'typing'));
+    container.scrollTop = container.scrollHeight;
+  }
   $('chat-form').hidden = peer !== 'preview:default';
   $('chat-hint').textContent =
     peer === 'preview:default'
@@ -517,15 +541,10 @@ async function loadJournal() {
     const actions = el('div', undefined, 'actions');
     actions.append(
       button(`查看 ${section.sources.length} 条依据`, () => showSources(peer, section.sources)),
-      button(
-        '删除这一段',
-        async () => {
-          if (!confirm('删除这段日记及直接依赖它的记忆？')) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
-          await loadJournal();
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除这一段', '确认删除？', async () => {
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
+        await loadJournal();
+      }),
     );
     row.append(actions);
     journal.append(row);
@@ -537,7 +556,7 @@ async function loadJournal() {
     const row = el('div', undefined, 'row');
     row.append(
       el('span', item.kind === 'stated' ? '对话中确认' : '主观理解', 'badge'),
-      item.pinned ? el('span', '已置顶', 'badge') : null,
+      ...(item.pinned ? [el('span', '已置顶', 'badge')] : []),
       el('p', item.content),
     );
     const actions = el('div', undefined, 'actions');
@@ -582,15 +601,10 @@ async function loadJournal() {
         await loadJournal();
       }),
     );
-    const del = button(
-      '删除',
-      async () => {
-        if (!confirm('删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。')) return;
-        await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
-        await loadJournal();
-      },
-      'ghost small danger',
-    );
+    const del = confirmButton('删除', '确认删除？', async () => {
+      await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
+      await loadJournal();
+    });
     actions.append(del);
     row.append(actions, editor);
     memory.append(row);
@@ -676,7 +690,9 @@ async function enter() {
   $('dashboard').hidden = false;
   $('logout').hidden = false;
   $('notice').hidden = true;
-  await Promise.all([status(), loadPeers(), loadSettings(), loadPersonas()]);
+  // Personas first: peer rows render persona selects from that state.
+  await loadPersonas();
+  await Promise.all([status(), loadPeers(), loadSettings()]);
   await selectTab(currentTab);
 }
 async function selectTab(tab) {
@@ -773,7 +789,9 @@ $('chat-form').onsubmit = (e) => {
     });
     lastTask = result.taskId;
     $('chat-input').value = '';
-    await loadPeers();
+    // Waiting state: the poll picks up the reply; loadChat shows a typing
+    // line until an assistant bubble lands, then the flag clears.
+    waitingReply = true;
     await loadChat();
   }, e.submitter);
 };
@@ -834,10 +852,9 @@ for (const [id, field] of [
 ])
   $(id).onclick = () =>
     perform(async () => {
-      if (!confirm('清除后需要重新填写密钥才能继续使用对应服务。确定清除？')) return;
       const saved = await api('/api/config', 'PUT', { [field]: true });
       applySettings(saved);
-      show('密钥已清除。');
+      show('密钥已清除，对应服务在重新填写前不可用。');
     }, $(id));
 function settingsChanged() {
   settingsVersion++;
