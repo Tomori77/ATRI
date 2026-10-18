@@ -176,7 +176,7 @@ async function status() {
     ])
       actions.append(
         button(label, async () => {
-          if (action === 'retry' && !confirm('请先确认微信中没有收到这条消息，再重新发送。'))
+          if (action === 'retry' && !(await confirmDialog({ title: '重新发送', message: '请先确认微信中没有收到这条消息，再重新发送。' })))
             return;
           await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
           await status();
@@ -312,7 +312,7 @@ async function loadPersonas(selectId) {
       button(
         '删除',
         async () => {
-          if (!confirm(`删除人格「${persona.name}」？绑定了它的联系人将改用默认人格。`)) return;
+          if (!(await confirmDialog({ title: '删除人格', message: `删除人格「${persona.name}」？绑定了它的联系人将改用默认人格。`, confirmLabel: '删除' }))) return;
           await api('/api/personas/' + enc(persona.id), 'DELETE');
           if (personaSelected === persona.id) personaSelected = '';
           await loadPersonas();
@@ -363,7 +363,7 @@ function fillPersonaSelect(select, boundId) {
 }
 $('persona-new').onclick = () =>
   perform(async () => {
-    const name = prompt('新人格的名称：');
+    const name = await confirmDialog({ title: '新建人格', message: '给新人格起个名字：', input: '', maxLength: 40, placeholder: '例如：安静的学生', confirmLabel: '创建' });
     if (name === null) return;
     const entry = await api('/api/personas', 'POST', {
       name,
@@ -402,7 +402,7 @@ async function loadChat() {
       button(
         '删除',
         async () => {
-          if (!confirm('删除这条原文及依赖它的日记和记忆？微信中已经发送的消息仍会保留。')) return;
+          if (!(await confirmDialog({ title: '删除原文', message: '删除这条原文及依赖它的日记和记忆？微信中已经发送的消息仍会保留。', confirmLabel: '删除' }))) return;
           await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
           await loadChat();
         },
@@ -445,7 +445,7 @@ async function loadJournal() {
       button(
         '删除这一段',
         async () => {
-          if (!confirm('删除这段日记及直接依赖它的记忆？')) return;
+          if (!(await confirmDialog({ title: '删除日记', message: '删除这段日记及直接依赖它的记忆？', confirmLabel: '删除' }))) return;
           await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
           await loadJournal();
         },
@@ -475,7 +475,7 @@ async function loadJournal() {
         await loadJournal();
       }),
       button('更正', async () => {
-        const content = prompt('把正确的信息写在这里：', item.content);
+        const content = await confirmDialog({ title: '更正记忆', message: '把正确的信息写在这里：', input: item.content, maxLength: 800, confirmLabel: '保存' });
         if (!content?.trim()) return;
         await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id), 'PUT', { content });
         await loadJournal();
@@ -483,7 +483,7 @@ async function loadJournal() {
       button(
         '删除',
         async () => {
-          if (!confirm('删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。')) return;
+          if (!(await confirmDialog({ title: '删除记忆', message: '删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。', confirmLabel: '删除' }))) return;
           await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
           await loadJournal();
         },
@@ -602,6 +602,37 @@ document.querySelectorAll('[data-open]').forEach((b) => {
       window.scrollTo({ top: 0, behavior: 'instant' });
     });
 });
+function confirmDialog(options) {
+  return new Promise((resolve) => {
+    const dialog = el('dialog', undefined, 'confirm-dialog');
+    dialog.setAttribute('aria-label', options.title);
+    dialog.append(el('h2', options.title));
+    if (options.message) dialog.append(el('p', options.message));
+    let input;
+    if (options.input !== undefined) {
+      input = document.createElement('input');
+      input.value = options.input;
+      input.maxLength = options.maxLength ?? 40;
+      input.placeholder = options.placeholder ?? '';
+      input.className = 'confirm-input';
+      dialog.append(input);
+    }
+    const footer = el('div', undefined, 'confirm-actions');
+    footer.append(
+      button('取消', () => dialog.close('cancel'), 'ghost'),
+      button(options.confirmLabel ?? '确定', () => dialog.close('ok')),
+    );
+    dialog.append(footer);
+    dialog.addEventListener('close', () => {
+      const ok = dialog.returnValue === 'ok';
+      resolve(ok ? (input ? input.value : true) : input ? null : false);
+      dialog.remove();
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+    if (input) input.focus(), input.select();
+  });
+}
 const tablist = document.querySelector('[role="tablist"]');
 const mobileNav = window.matchMedia('(max-width: 960px)');
 function orientTabs() {
