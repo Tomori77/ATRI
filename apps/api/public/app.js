@@ -434,10 +434,12 @@ function loadPersonasBound() {
 function fillPersonaSelect(select, boundId) {
   const current = select.value;
   select.replaceChildren();
-  const auto = el('option', '默认人格（' + (personaState.list.find((p) => p.id === personaState.defaultId)?.name ?? '') + '）');
+  const defaultPersona = personaState.list.find((p) => p.id === personaState.defaultId);
+  const auto = el('option', '默认（' + (defaultPersona?.name ?? '未设置') + '）');
   auto.value = '';
   select.append(auto);
   for (const persona of personaState.list) {
+    if (persona.id === personaState.defaultId) continue;
     const option = el('option', persona.name);
     option.value = persona.id;
     select.append(option);
