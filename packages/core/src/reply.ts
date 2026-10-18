@@ -19,6 +19,8 @@ export interface ParsedReply {
   openLoops: OpenLoopInput[];
   /** Loop IDs the user just answered, closing them. */
   resolveLoops: string[];
+  /** Loop IDs this reply actually brought up, so only those are marked asked. */
+  askedLoops: string[];
   /** Optional self-assessed mood pulse for this exchange. */
   moodPulse?: { valence: number; energy: number; reason?: string };
   /** Memory IDs included in this turn's prompt; the runtime marks them used. */
@@ -56,6 +58,9 @@ export function parseMemories(value: unknown): MemoryUpdate[] {
         supersedes: Array.isArray(v.supersedes)
           ? v.supersedes.filter((s: unknown) => typeof s === 'string').slice(0, 12)
           : [],
+        ...(typeof v.importance === 'number' && Number.isFinite(v.importance)
+          ? { importance: Math.max(0, Math.min(1, v.importance)) }
+          : {}),
       },
     ];
   });
@@ -178,18 +183,24 @@ export function parseOpenLoops(
   });
 }
 /** Resolve a loop's due time: numeric timestamps win; "明天 08:00", "MM-DD HH:mm",
- *  "HH:mm" or ISO strings are interpreted in the configured local timezone. */
+ *  "HH:mm" or ISO strings are interpreted in the configured local timezone.
+ *  Any resolved time outside [now − 1d, now + 5y] is rejected: schema-valid
+ *  timestamps like year-1970 or year-9999 pass JSON checks but are semantic
+ *  garbage the model invented. */
 export function resolveDue(
   dueAt: unknown,
   due: unknown,
   now: number,
   timeZone: string,
 ): number | undefined {
-  if (typeof dueAt === 'number' && Number.isFinite(dueAt) && dueAt > 0) return dueAt;
+  const sane = (t: number) => t > now - 86400000 && t < now + 5 * 365 * 86400000;
+  if (typeof dueAt === 'number' && Number.isFinite(dueAt) && dueAt > 0) {
+    return sane(dueAt) ? dueAt : undefined;
+  }
   if (typeof due !== 'string' || !due.trim()) return undefined;
   const text = due.trim().replace(/[：]/g, ':');
   const iso = Date.parse(text);
-  if (!Number.isNaN(iso) && /\d{4}-\d{2}-\d{2}/.test(text)) return iso;
+  if (!Number.isNaN(iso) && /\d{4}-\d{2}-\d{2}/.test(text)) return sane(iso) ? iso : undefined;
   // "明天 08:00" / "后天 14:30" / bare "08:00" — optional day word plus
   // local wall time; a bare time that already passed rolls to tomorrow.
   const dayWords: Record<string, number> = { 今天: 0, 明天: 1, 后天: 2, 大后天: 3 };
@@ -218,12 +229,19 @@ export function resolveDue(
     const year = Number(parts.year);
     const hour = Number(md[3] ?? 9),
       minute = Number(md[4] ?? 0);
-    const candidate = Date.parse(
-      `${year}-${md[1]!.padStart(2, '0')}-${md[2]!.padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`,
+    if (hour > 23 || minute > 59) return undefined;
+    const thisYear = localWallTimeFromYMD(year, Number(md[1]), Number(md[2]), hour, minute, timeZone);
+    // A date already behind us is the next occurrence, not an expired plan.
+    if (!Number.isNaN(thisYear) && thisYear > now) return thisYear;
+    const nextYear = localWallTimeFromYMD(
+      year + 1,
+      Number(md[1]),
+      Number(md[2]),
+      hour,
+      minute,
+      timeZone,
     );
-    if (Number.isNaN(candidate)) return undefined;
-    // Timezone-safe wall-clock resolution via offset correction.
-    return localWallTimeFromYMD(year, Number(md[1]), Number(md[2]), hour, minute, timeZone);
+    return Number.isNaN(nextYear) ? undefined : nextYear;
   }
   return undefined;
 }
@@ -283,6 +301,7 @@ export function parseReply(
   text: string,
   stickers: Sticker[],
   allowSkip = false,
+  timeZone = 'Asia/Shanghai',
 ): ParsedReply {
   let raw: any;
   try {
@@ -302,6 +321,7 @@ export function parseReply(
         descriptions: [],
         openLoops: [],
         resolveLoops: [],
+        askedLoops: [],
       };
     }
     throw new Error('回复格式无效');
@@ -321,13 +341,19 @@ export function parseReply(
         .filter((s: unknown): s is string => typeof s === 'string')
         .slice(0, OPEN_LOOP_PROMPT_MAX)
     : [];
+  const askedLoops = Array.isArray(raw.askedLoops)
+    ? raw.askedLoops
+        .filter((s: unknown): s is string => typeof s === 'string')
+        .slice(0, OPEN_LOOP_PROMPT_MAX)
+    : [];
   const moodPulse = parseMoodPulse(raw.moodPulse);
   return {
     parts,
     memories: parseMemories(raw.memoryUpdates),
     descriptions,
-    openLoops: parseOpenLoops(raw.openLoops),
+    openLoops: parseOpenLoops(raw.openLoops, undefined, Date.now(), timeZone),
     resolveLoops,
+    askedLoops,
     ...(moodPulse ? { moodPulse } : {}),
   };
 }

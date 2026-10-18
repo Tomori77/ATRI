@@ -113,6 +113,28 @@ async function loadPeers() {
     row.append(heading, personaSelect);
     target.append(row);
   }
+  // The preview peer drives 试聊, so it needs persona binding too — the old UI
+  // could only ever test the default persona.
+  const previewPeer = peers.find((p) => p.id === 'preview:default');
+  if (previewPeer) {
+    const row = el('div', undefined, 'row'),
+      heading = el('div', undefined, 'row-title');
+    heading.append(el('span', '本地试聊'));
+    const personaSelect = document.createElement('select');
+    personaSelect.dataset.personaFor = previewPeer.id;
+    personaSelect.setAttribute('aria-label', '人格选择：本地试聊');
+    personaSelect.onchange = () =>
+      perform(async () => {
+        await api('/api/peers/' + enc(previewPeer.id) + '/persona', 'PUT', {
+          personaId: personaSelect.value,
+        });
+        personaState.bindings[previewPeer.id] = personaSelect.value;
+        show('试聊人格已更新，下一次对话生效。');
+      }, personaSelect);
+    if (personaState.list.length) fillPersonaSelect(personaSelect, previewPeer.persona_id ?? '');
+    row.append(heading, personaSelect);
+    target.append(row);
+  }
   for (const id of ['chat-peer', 'journal-peer']) {
     const select = $(id),
       selected = select.value;
@@ -186,6 +208,50 @@ async function status() {
     issues.append(row);
   }
   if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。');
+  // A restart mid-send leaves deliveries "uncertain" and the peer silently
+  // stops replying until an admin resolves it — surface that loudly.
+  const stuckPeers = new Set(state.issues.deliveries.map((d) => d.peer_id));
+  $('issues').classList.toggle('attention', stuckPeers.size > 0);
+  const states = $('peer-states');
+  states.replaceChildren();
+  for (const state of state.states ?? []) {
+    const row = el('div', undefined, 'row'),
+      title = el('div', undefined, 'row-title');
+    title.append(el('span', state.address));
+    if (stuckPeers.has(state.peerId))
+      title.append(el('span', '发送待确认，暂停回复', 'badge alert'));
+    const badges = el('div', undefined, 'actions');
+    if (state.mood) {
+      const parts = [];
+      if (state.mood.valence >= 0.3) parts.push('心情不错');
+      else if (state.mood.valence <= -0.3) parts.push('心情低落');
+      else if (state.mood.valence <= -0.12) parts.push('情绪平平');
+      if (state.mood.energy <= -0.3) parts.push('有点累');
+      else if (state.mood.energy >= 0.3) parts.push('精力足');
+      if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
+      if (state.mood.reason) badges.append(el('span', state.mood.reason, 'badge'));
+    }
+    if (state.dueLoops) badges.append(el('span', `惦记 ${state.dueLoops} 件事`, 'badge'));
+    if (state.lastProactiveAt)
+      badges.append(
+        el(
+          'span',
+          '上次问候 ' +
+            new Date(state.lastProactiveAt).toLocaleString('zh-CN', {
+              month: 'numeric',
+              day: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+          'badge',
+        ),
+      );
+    if (!state.approved) badges.append(el('span', '未允许', 'badge'));
+    row.append(title, badges);
+    if (!badges.childNodes.length) row.append(el('p', '状态平静，暂无惦记的事。', 'hint'));
+    states.append(row);
+  }
+  if (!states.childNodes.length) empty(states, '还没有联系人的状态可以显示。');
   $('usage').replaceChildren(
     ...state.usage.map((u) => {
       const card = el('div', undefined, 'usage-card');
@@ -240,7 +306,7 @@ function applySettings(c) {
   $('tavilyKey').placeholder = c.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('embeddingApiKey').placeholder = c.hasEmbeddingApiKey
     ? '已配置，留空保持原值'
-    : '留空则使用上方模型密钥';
+    : '独立填写，不回退到上方模型密钥';
   $('apiKey').value = '';
   $('tavilyKey').value = '';
   $('embeddingApiKey').value = '';
@@ -359,17 +425,28 @@ function fillPersonaSelect(select, boundId) {
   if (current && [...select.options].some((o) => o.value === current) && boundId === undefined)
     select.value = current;
 }
-$('persona-new').onclick = () =>
+$('persona-new').onclick = () => {
+  const form = $('persona-create');
+  form.hidden = !form.hidden;
+  if (!form.hidden) $('persona-create-name').focus();
+};
+$('persona-create-cancel').onclick = () => {
+  $('persona-create').hidden = true;
+  $('persona-create-name').value = '';
+};
+$('persona-create').onsubmit = (e) => {
+  e.preventDefault();
   perform(async () => {
-    const name = prompt('新人格的名称：');
-    if (name === null) return;
     const entry = await api('/api/personas', 'POST', {
-      name,
+      name: $('persona-create-name').value,
       content: (personaState.list.find((p) => p.id === personaSelected)?.content) || '（在这里写下她是谁）',
     });
+    $('persona-create').hidden = true;
+    $('persona-create-name').value = '';
     await loadPersonas(entry.id);
     show('已创建，编辑内容后保存。');
-  }, $('persona-new'));
+  }, e.submitter);
+};
 $('persona-name').oninput = countPersona;
 async function loadChat() {
   const peer = $('chat-peer').value || 'preview:default';
@@ -472,23 +549,50 @@ async function loadJournal() {
         });
         await loadJournal();
       }),
-      button('更正', async () => {
-        const content = prompt('把正确的信息写在这里：', item.content);
-        if (!content?.trim()) return;
+    );
+    // Inline correction: the old prompt() dialog couldn't show the full text
+    // and fought the mobile keyboard.
+    const correct = button('更正', () => {
+      editor.hidden = !editor.hidden;
+      if (!editor.hidden) {
+        editor.querySelector('textarea').value = item.content;
+        editor.querySelector('textarea').focus();
+      }
+    });
+    actions.append(correct);
+    const editor = el('form', undefined, 'memory-correction');
+    editor.hidden = true;
+    editor.append(
+      el('label', '更正为正确信息', 'sr-only'),
+      Object.assign(document.createElement('textarea'), {
+        rows: 3,
+        maxLength: 3000,
+        required: true,
+        textContent: item.content,
+      }),
+      el('div', undefined, 'actions'),
+    );
+    const editorActions = editor.querySelector('.actions');
+    editorActions.append(
+      button('取消', () => (editor.hidden = true), 'ghost small'),
+      button('保存更正', async () => {
+        const content = editor.querySelector('textarea').value.trim();
+        if (!content) return;
         await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id), 'PUT', { content });
         await loadJournal();
       }),
-      button(
-        '删除',
-        async () => {
-          if (!confirm('删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。')) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
-          await loadJournal();
-        },
-        'ghost small danger',
-      ),
     );
-    row.append(actions);
+    const del = button(
+      '删除',
+      async () => {
+        if (!confirm('删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。')) return;
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
+        await loadJournal();
+      },
+      'ghost small danger',
+    );
+    actions.append(del);
+    row.append(actions, editor);
     memory.append(row);
   }
   if (!memories.length) empty(memory, '重要的偏好、约定和认识会留在这里。');
@@ -723,6 +827,18 @@ $('test-embedding').onclick = () =>
       `向量连通正常：${result.model} · 维度 ${result.dims} · 延迟 ${result.latencyMs} ms`,
     );
   }, $('test-embedding'));
+for (const [id, field] of [
+  ['clear-api-key', 'clearApiKey'],
+  ['clear-tavily-key', 'clearTavilyKey'],
+  ['clear-embedding-key', 'clearEmbeddingApiKey'],
+])
+  $(id).onclick = () =>
+    perform(async () => {
+      if (!confirm('清除后需要重新填写密钥才能继续使用对应服务。确定清除？')) return;
+      const saved = await api('/api/config', 'PUT', { [field]: true });
+      applySettings(saved);
+      show('密钥已清除。');
+    }, $(id));
 function settingsChanged() {
   settingsVersion++;
   $('settings-saved').textContent = '有尚未保存的修改。';
@@ -779,6 +895,7 @@ $('sticker-form').onsubmit = (e) => {
     show('表情已加入目录。');
   }, e.submitter);
 };
+let journalPoll = 0;
 setInterval(async () => {
   if (!authenticated || document.hidden || polling) return;
   polling = true;
@@ -796,7 +913,12 @@ setInterval(async () => {
           } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
         }
       }
-      if (currentTab === 'journal') await loadJournal();
+      // Journal content changes at diary-writing pace, not chat pace; polling
+      // three full listings every 2.5s wasted real CPU once histories grew.
+      if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
+        journalPoll = Date.now();
+        await loadJournal();
+      }
     });
   } finally {
     polling = false;

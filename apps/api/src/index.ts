@@ -14,6 +14,19 @@ const settings = new Settings(store, root);
 const stickers = new Stickers(root, dataDir, store);
 const bridge = new WeChatBridge(store, settings, stickers, (message) => console.warn(message));
 const embeddings = new EmbeddingClient(() => settings.embedding());
+/** The runtime treats `enabled` as a hard off switch, separate from creds. */
+const embedder = {
+  get configured() {
+    return embeddings.configured;
+  },
+  get model() {
+    return embeddings.model;
+  },
+  get enabled() {
+    return settings.embeddingEnabled();
+  },
+  embed: (texts: string[], signal?: AbortSignal) => embeddings.embed(texts, signal),
+};
 const runtime = new Runtime({
   store,
   config: () => settings.runtime(),
@@ -28,9 +41,9 @@ const runtime = new Runtime({
   images: (message) => bridge.images(message),
   transport: bridge,
   log: (message, details) => console.warn(message, details),
-  embedder: embeddings,
+  embedder,
   embedQuery: async (query) => {
-    if (!embeddings.configured) return undefined;
+    if (!settings.embeddingEnabled()) return undefined;
     const [vector] = await embeddings.embed([query]);
     return vector && vector.some((v) => v !== 0) ? vector : undefined;
   },

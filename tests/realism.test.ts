@@ -121,12 +121,14 @@ test('模型输出 openLoops/resolveLoops 经来源校验后落库', async (t) =
 });
 
 test('parseReply 对 openLoops/resolveLoops 的格式校验', () => {
+  const now = Date.now();
   const parsed = parseReply(
     JSON.stringify({
       messages: ['好'],
       memoryUpdates: [],
       openLoops: [
-        { content: '明天叫我', dueAt: 123, dueText: '明早', sources: ['a'] },
+        { content: '明天叫我', dueAt: now + 86400000, dueText: '明早', sources: ['a'] },
+        { content: '胡编的时间', dueAt: 123, dueText: '明早', sources: ['a'] },
         { content: '缺时间', sources: ['a'] },
         '垃圾',
       ],
@@ -138,6 +140,20 @@ test('parseReply 对 openLoops/resolveLoops 的格式校验', () => {
   assert.equal(parsed.openLoops[0]!.content, '明天叫我');
   assert.deepEqual(parsed.resolveLoops, ['loop-1']);
   assert.equal(parseOpenLoops('不是数组', new Set(['a'])).length, 0);
+});
+
+test('读空气：连发长笑不算长回复，折叠重复字符后触发收着说', async (t) => {
+  const model = new FakeModel(() => completion({ messages: ['嗯。'], memoryUpdates: [] }));
+  const f = fixture(t, model);
+  // 三条"哈哈哈哈哈哈"——原始长度 6，折叠后是 2 ≤ 4，应触发收着点说
+  f.runtime.accept('p1', 'h1', '哈哈哈哈哈哈');
+  await f.runtime.drain();
+  f.runtime.accept('p1', 'h2', '哈哈哈哈哈哈');
+  await f.runtime.drain();
+  f.runtime.accept('p1', 'h3', '哈哈哈哈哈哈');
+  await f.runtime.drain();
+  const last = model.calls.at(-1)!.messages[0]!.content;
+  assert.match(String(last), /收着点说/, '折叠重复字符后 terse 模式生效');
 });
 
 test('读空气：连续无回应的主动消息冷却拉长到几天', (t) => {

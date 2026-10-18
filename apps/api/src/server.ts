@@ -137,6 +137,22 @@ export function createServer(o: ServerOptions) {
       usage: o.store.usage(),
       recentUsage: o.store.recentUsage(),
       issues: o.store.issues(),
+      // Read-only view of "how is she doing": mood, next proactive window,
+      // loops waiting. Previously this data was invisible in the admin UI.
+      states: o.store.peers().map((peer) => {
+        const mood = o.store.mood(peer.id);
+        const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
+        return {
+          peerId: peer.id,
+          address: peer.address,
+          approved: !!peer.approved,
+          mood: mood.at ? mood : undefined,
+          dueLoops: dueLoops.length,
+          lastUserAt: peer.last_user_at,
+          lastProactiveAt: peer.last_proactive_at,
+          vectors: o.store.embeddingStatus().count,
+        };
+      }),
     };
   });
   app.post('/api/wechat/login', () => o.bridge.login());
@@ -156,7 +172,7 @@ export function createServer(o: ServerOptions) {
   app.put<{ Body: Record<string, unknown> }>('/api/config', (request) =>
     o.settings.update(request.body),
   );
-  app.get('/api/persona', () => ({ content: o.settings.prompt('persona') }));
+  app.get('/api/persona', () => ({ content: o.settings.personaPrompt() }));
   app.put<{ Body: { content: string } }>('/api/persona', (request) => {
     o.settings.savePersona(text(request.body.content));
     return { ok: true };
@@ -270,7 +286,12 @@ export function createServer(o: ServerOptions) {
       model: e.model,
     };
   });
-  app.get('/api/peers', () => o.store.peers().map(({ context_token, ...peer }) => peer));
+  app.get('/api/peers', () => {
+    // 试聊 uses the preview peer, so it must exist for persona binding even
+    // before the first message.
+    o.store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
+    return o.store.peers().map(({ context_token, ...peer }) => peer);
+  });
   app.put<{ Params: { id: string }; Body: { approved: boolean } }>('/api/peers/:id', (request) => {
     if (typeof request.body.approved !== 'boolean' || !o.store.peer(request.params.id))
       throw new Error('联系人或设置无效');

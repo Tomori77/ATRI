@@ -302,3 +302,83 @@ test('扫码登录保存账号会话，重复点击不会启动多次登录', as
   assert.equal(f.store.getSetting<any>('wechat:session', {}).accountId, 'fixture-account');
   assert.doesNotMatch(JSON.stringify(f.bridge.status()), /fixture-token/);
 });
+
+test('人格接口：CRUD、默认切换、绑定与删除回落', async (t) => {
+  const f = server(t);
+  const enc = encodeURIComponent;
+  const initial = (await f.app.inject({ url: '/api/personas', headers: f.headers })).json();
+  assert.ok(initial.list.length >= 1, '首次访问自动导入默认人格');
+  assert.ok(initial.defaultId);
+  const created = await f.app.inject({
+    method: 'POST',
+    url: '/api/personas',
+    headers: f.headers,
+    payload: { name: '安静的学生', content: '你是安静但毒舌的学生。' },
+  });
+  assert.equal(created.statusCode, 200);
+  const persona = created.json();
+  // 绑定到联系人后人格生效
+  const peer = f.store.ensurePeer('wechat:bot:alice', 'wechat', 'alice', 'tok', true);
+  const bind = await f.app.inject({
+    method: 'PUT',
+    url: '/api/peers/' + enc(peer.id) + '/persona',
+    headers: f.headers,
+    payload: { personaId: persona.id },
+  });
+  assert.equal(bind.statusCode, 200);
+  assert.equal(f.store.peer(peer.id)!.persona_id, persona.id);
+  assert.equal(f.settings.personaContentFor(peer.id), '你是安静但毒舌的学生。');
+  // 更新内容立即生效
+  const updated = await f.app.inject({
+    method: 'PUT',
+    url: '/api/personas/' + enc(persona.id),
+    headers: f.headers,
+    payload: { content: '你是安静但温柔的学生。' },
+  });
+  assert.equal(updated.statusCode, 200);
+  assert.equal(f.settings.personaContentFor(peer.id), '你是安静但温柔的学生。');
+  // 删除人格 → 悬空绑定被清理，回落默认人格
+  const removed = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/personas/' + enc(persona.id),
+    headers: f.headers,
+  });
+  assert.equal(removed.statusCode, 200);
+  assert.equal(f.store.peer(peer.id)!.persona_id, '');
+  assert.equal(
+    f.settings.personaContentFor(peer.id),
+    initial.list.find((p: { id: string }) => p.id === initial.defaultId).content,
+  );
+  // 默认人格不能删除
+  await f.app.inject({
+    method: 'POST',
+    url: '/api/personas',
+    headers: f.headers,
+    payload: { name: '第二人格', content: '备用人格内容。' },
+  });
+  const denyDefault = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/personas/' + enc(initial.defaultId),
+    headers: f.headers,
+  });
+  assert.equal(denyDefault.statusCode, 400);
+  // 切换默认后，新默认供旧接口 /api/persona 读取，旧默认可删
+  const list = (await f.app.inject({ url: '/api/personas', headers: f.headers })).json();
+  const other = list.list.find((p: { id: string }) => p.id !== initial.defaultId)!;
+  const switched = await f.app.inject({
+    method: 'PUT',
+    url: '/api/personas/' + enc(other.id) + '/default',
+    headers: f.headers,
+  });
+  assert.equal(switched.statusCode, 200);
+  assert.equal(
+    (await f.app.inject({ url: '/api/persona', headers: f.headers })).json().content,
+    other.content,
+  );
+  const removedOld = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/personas/' + enc(initial.defaultId),
+    headers: f.headers,
+  });
+  assert.equal(removedOld.statusCode, 200);
+});

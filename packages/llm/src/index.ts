@@ -54,14 +54,18 @@ export class ModelError extends Error {
     message: string,
     readonly status?: number,
     readonly headers?: Record<string, string>,
+    /** Transport-level trouble (DNS, reset, timeout) with no HTTP status. */
+    readonly network = false,
   ) {
     super(message);
     this.name = 'ModelError';
   }
   /** Transient upstream trouble (throttle, gateway hiccup, bad server state):
    *  worth retrying with backoff. 4xx except 408/429 are permanent config or
-   *  request mistakes — retrying would burn tokens for the same failure. */
-  static transient(status?: number): boolean {
+   *  request mistakes — retrying would burn tokens for the same failure.
+   *  Network failures carry no status and are exactly the ones a retry fixes. */
+  static transient(status?: number, network = false): boolean {
+    if (network) return true;
     if (status === undefined) return false;
     return status === 408 || status === 429 || (status >= 500 && status <= 599);
   }
@@ -254,12 +258,15 @@ export class HttpModel implements Model {
             : new ModelError(error instanceof Error ? error.message : '未知错误');
         if (outer?.aborted)
           throw new ModelError('模型请求超时或已取消');
-        if (attempt >= 2 || !ModelError.transient(lastError.status)) throw lastError;
+        if (attempt >= 2 || !ModelError.transient(lastError.status, lastError.network)) throw lastError;
       }
       const retryAfter = Number(lastError.headers?.['retry-after']);
-      const delay = Number.isFinite(retryAfter) && retryAfter >= 0
+      const base = Number.isFinite(retryAfter) && retryAfter >= 0
         ? Math.min(retryAfter, 30) * 1000
         : Math.min(1000 * 2 ** attempt, 8000);
+      // Full jitter: several peers failing at once must not retry in lockstep
+      // and rebuild the same spike that upset the upstream.
+      const delay = base * (0.8 + Math.random() * 0.4);
       await pause(delay, outer);
     }
   }
@@ -282,8 +289,18 @@ export class HttpModel implements Model {
         signal,
       });
     } catch (error) {
-      if (signal.aborted) throw new ModelError('模型请求超时或已取消');
-      throw new ModelError(`模型连接失败：${error instanceof Error ? error.message : '未知错误'}`);
+      // Caller cancellation (turn timeout / shutdown) must never retry.
+      if (outer?.aborted) throw new ModelError('模型请求超时或已取消');
+      // A per-attempt timeout is its own transient failure: the next try gets
+      // a fresh budget, so it belongs in the retryable bucket.
+      if (signal.aborted)
+        throw new ModelError('模型请求超时', undefined, undefined, true);
+      throw new ModelError(
+        `模型连接失败：${error instanceof Error ? error.message : '未知错误'}`,
+        undefined,
+        undefined,
+        true,
+      );
     }
     let data: Json;
     try {

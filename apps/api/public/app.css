@@ -77,6 +77,7 @@ button.ghost:hover {
 button.small {
   padding: 5px 10px;
   font-size: 12px;
+  min-height: 34px;
 }
 button.text-button {
   background: transparent;
@@ -94,6 +95,46 @@ button.wide {
 }
 .danger {
   color: #a55356 !important;
+}
+/* Loud signal: a peer with an unresolved uncertain/failed delivery is not
+ * replying at all until an admin acts. */
+.badge.alert,
+#issues.attention::before {
+  background: #a55356;
+  color: white;
+  border-color: #a55356;
+}
+#issues.attention::before {
+  content: '有发送异常待处理';
+  display: inline-block;
+  margin-bottom: 8px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+/* Row of compact actions placed inline with the field they operate on. */
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+/* Inline memory-correction form inside a journal row. */
+.memory-correction {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f7fafc;
+}
+.memory-correction[hidden] {
+  display: none;
+}
+.memory-correction textarea {
+  width: 100%;
+  resize: vertical;
 }
 .icon-defs {
   position: absolute;
@@ -1271,6 +1312,12 @@ dialog > button:last-child {
     display: flex;
     flex-direction: column-reverse;
     gap: 0;
+  }
+  /* Touch targets: the dense journal rows (查看依据/置顶/更正/删除) were
+   * ~26px tall and easy to mis-tap on phones. */
+  button.small {
+    min-height: 44px;
+    padding: 8px 14px;
   }
   .settings-layout > div,
   .settings-aside {
