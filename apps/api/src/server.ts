@@ -224,7 +224,8 @@ export function createServer(o: ServerOptions) {
   app.post('/api/test-embedding', async () => {
     const e = o.settings.embedding();
     if (!e.model) throw new Error('请先保存向量模型名称');
-    if (!e.apiKey) throw new Error('请先保存向量模型密钥（或上方模型密钥）');
+    if (!e.apiKey) throw new Error('请先填写并保存向量模型密钥');
+    if (!e.baseUrl) throw new Error('请先填写并保存向量模型地址（或上方 API 地址）');
     const started = Date.now();
     const vectors = await new EmbeddingClient(() => e).embed(['连通性测试']);
     return {

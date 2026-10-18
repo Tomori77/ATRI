@@ -217,7 +217,7 @@ export class Settings {
     const c = this.config();
     return {
       baseUrl: c.embeddingBaseUrl || c.baseUrl,
-      apiKey: c.embeddingApiKey || c.apiKey,
+      apiKey: c.embeddingApiKey,
       model: c.embeddingModel,
       timeoutMs: Math.min(c.requestTimeoutSeconds, 60) * 1000,
     };
