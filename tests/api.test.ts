@@ -255,9 +255,9 @@ test('微信重投忽略变化的 context_token，真正的新消息保留', asy
 });
 test('内置图片可获取，未经允许的联系人不会自动回复', async (t) => {
   const f = server(t);
-  const image = await f.app.inject({ url: '/api/stickers/happy/image', headers: f.headers });
+  const image = await f.app.inject({ url: '/api/stickers/cat002/image', headers: f.headers });
   assert.equal(image.statusCode, 200);
-  assert.match(String(image.headers['content-type']), /image\/png/);
+  assert.match(String(image.headers['content-type']), /image\/jpe?g/);
   f.bridge.start(f.runtime);
   f.bridge.receive(
     'bot',
