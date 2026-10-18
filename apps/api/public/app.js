@@ -346,10 +346,12 @@ function loadPersonasBound() {
 function fillPersonaSelect(select, boundId) {
   const current = select.value;
   select.replaceChildren();
-  const auto = el('option', '默认人格（' + (personaState.list.find((p) => p.id === personaState.defaultId)?.name ?? '') + '）');
+  const defaultPersona = personaState.list.find((p) => p.id === personaState.defaultId);
+  const auto = el('option', '默认（' + (defaultPersona?.name ?? '未设置') + '）');
   auto.value = '';
   select.append(auto);
   for (const persona of personaState.list) {
+    if (persona.id === personaState.defaultId) continue;
     const option = el('option', persona.name);
     option.value = persona.id;
     select.append(option);
@@ -365,7 +367,7 @@ $('persona-new').onclick = () =>
     if (name === null) return;
     const entry = await api('/api/personas', 'POST', {
       name,
-      content: (personaState.list.find((p) => p.id === personaSelected)?.content) || '（在这里写下她是谁）',
+      content: '（在这里写下她是谁）',
     });
     await loadPersonas(entry.id);
     show('已创建，编辑内容后保存。');
