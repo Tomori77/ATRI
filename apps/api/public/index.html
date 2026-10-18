@@ -440,6 +440,17 @@
                       <label
                         >模型名称<input id="model" required placeholder="deepseek-chat"
                       /></label>
+                      <button
+                        class="ghost small"
+                        type="button"
+                        id="fetch-models"
+                        title="仅 OpenAI 兼容接口支持自动拉取模型列表"
+                      >
+                        拉取模型列表（仅 OpenAI 兼容）
+                      </button>
+                      <button class="ghost small" type="button" id="test-llm">
+                        测试模型连通性
+                      </button>
                       <label class="full-width"
                         >API 地址<input
                           id="baseUrl"
@@ -478,6 +489,9 @@
                           id="embeddingModel"
                           placeholder="例如 text-embedding-3-small"
                       /></label>
+                      <button class="ghost small" type="button" id="test-embedding">
+                        测试向量连通性
+                      </button>
                       <label class="full-width"
                         >向量模型地址<input
                           id="embeddingBaseUrl"

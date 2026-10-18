@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Store } from '@atri/db';
 import { createBackup } from '@atri/db';
+import { EmbeddingClient } from '@atri/llm';
 import type { Runtime } from '@atri/core';
 import { sniffMediaMime } from '@atri/ilink';
 import type { Settings } from './config.js';
@@ -159,6 +160,79 @@ export function createServer(o: ServerOptions) {
   app.put<{ Body: { content: string } }>('/api/persona', (request) => {
     o.settings.savePersona(text(request.body.content));
     return { ok: true };
+  });
+  app.get('/api/models', async () => {
+    const c = o.settings.config();
+    if (c.format !== 'openai') throw new Error('模型列表拉取仅支持 OpenAI 兼容接口');
+    if (!c.apiKey) throw new Error('请先保存模型密钥');
+    const base = c.baseUrl.replace(/\/+$/, '');
+    const url = /\/v\d+$/.test(base) ? `${base}/models` : `${base}/v1/models`;
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${c.apiKey}` },
+      signal: AbortSignal.timeout(15000),
+    });
+    const body = (await response.json().catch(() => null)) as {
+      data?: { id?: unknown }[];
+      error?: { message?: unknown };
+    } | null;
+    if (!response.ok)
+      throw new Error(
+        `拉取模型列表失败（HTTP ${response.status}）：${
+          (body?.error?.message as string) || (await response.text().catch(() => '')).slice(0, 200)
+        }`,
+      );
+    const ids = [...new Set((body?.data ?? []).map((m) => String(m?.id ?? '')).filter(Boolean))];
+    return { models: ids.sort((a, b) => a.localeCompare(b)) };
+  });
+  app.post('/api/test-llm', async () => {
+    const c = o.settings.config();
+    if (!c.apiKey || !c.model) throw new Error('请先保存模型名称和 API 密钥');
+    const base = c.baseUrl.replace(/\/+$/, '');
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    let url: string, payload: Record<string, unknown>;
+    if (c.format === 'anthropic') {
+      url = `${/\/v\d+$/.test(base) ? base : base + '/v1'}/messages`;
+      headers['x-api-key'] = c.apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+      payload = { model: c.model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+    } else if (c.format === 'gemini') {
+      url = `${/\/v\d+(beta)?$/.test(base) ? base : base + '/v1beta'}/models/${encodeURIComponent(c.model)}:generateContent`;
+      headers['x-goog-api-key'] = c.apiKey;
+      payload = {
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        generationConfig: { maxOutputTokens: 1 },
+      };
+    } else {
+      url = `${/\/v\d+$/.test(base) ? base : base + '/v1'}/chat/completions`;
+      headers.authorization = `Bearer ${c.apiKey}`;
+      payload = { model: c.model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+    }
+    const started = Date.now();
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(Math.min(c.requestTimeoutSeconds, 60) * 1000),
+    });
+    const elapsed = Date.now() - started;
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => '')).slice(0, 200);
+      throw new Error(`连通失败（HTTP ${response.status}，${elapsed} ms）：${detail}`);
+    }
+    return { ok: true, latencyMs: elapsed, model: c.model, format: c.format };
+  });
+  app.post('/api/test-embedding', async () => {
+    const e = o.settings.embedding();
+    if (!e.model) throw new Error('请先保存向量模型名称');
+    if (!e.apiKey) throw new Error('请先保存向量模型密钥（或上方模型密钥）');
+    const started = Date.now();
+    const vectors = await new EmbeddingClient(() => e).embed(['连通性测试']);
+    return {
+      ok: true,
+      latencyMs: Date.now() - started,
+      dims: vectors[0]?.length ?? 0,
+      model: e.model,
+    };
   });
   app.get('/api/peers', () => o.store.peers().map(({ context_token, ...peer }) => peer));
   app.put<{ Params: { id: string }; Body: { approved: boolean } }>('/api/peers/:id', (request) => {

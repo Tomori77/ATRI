@@ -589,6 +589,38 @@ $('persona-form').onsubmit = (e) => {
   }, e.submitter);
 };
 $('persona-content').oninput = countPersona;
+$('fetch-models').onclick = () =>
+  perform(async () => {
+    const list = await api('/api/models');
+    const input = $('model');
+    let datalist = $('model-list');
+    if (!datalist) {
+      datalist = document.createElement('datalist');
+      datalist.id = 'model-list';
+      input.setAttribute('list', 'model-list');
+      input.after(datalist);
+    }
+    datalist.replaceChildren(
+      ...list.models.map((m) => {
+        const option = document.createElement('option');
+        option.value = m;
+        return option;
+      }),
+    );
+    show(`已拉取 ${list.models.length} 个模型，点击“模型名称”输入框可见下拉列表。`);
+  }, $('fetch-models'));
+$('test-llm').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/test-llm', 'POST');
+    show(`模型连通正常：${result.model}（${result.format}）· 延迟 ${result.latencyMs} ms`);
+  }, $('test-llm'));
+$('test-embedding').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/test-embedding', 'POST');
+    show(
+      `向量连通正常：${result.model} · 维度 ${result.dims} · 延迟 ${result.latencyMs} ms`,
+    );
+  }, $('test-embedding'));
 function settingsChanged() {
   settingsVersion++;
   $('settings-saved').textContent = '有尚未保存的修改。';
