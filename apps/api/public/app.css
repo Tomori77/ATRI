@@ -119,6 +119,58 @@ button.wide {
   gap: 8px;
   align-items: center;
 }
+/* Browsable model list shown after "拉取模型列表". A datalist would filter
+   options by the input's current value, hiding everything but the match. */
+.model-suggestions {
+  grid-column: 1 / -1;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.model-suggestions-head {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.model-suggestions-head input {
+  flex: 1;
+  min-height: 36px;
+}
+.model-suggestions-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+}
+.model-suggestion-item {
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  background: none;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font: inherit;
+  color: var(--ink);
+}
+.model-suggestion-item:hover {
+  background: var(--bg);
+}
+.model-suggestion-item.current {
+  background: var(--accent);
+  color: #fff;
+}
+.model-suggestion-empty {
+  padding: 10px;
+  color: var(--muted);
+  text-align: center;
+}
 /* Inline memory-correction form inside a journal row. */
 .memory-correction {
   display: grid;

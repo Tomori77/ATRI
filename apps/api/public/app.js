@@ -816,23 +816,57 @@ $('persona-content').oninput = countPersona;
 $('fetch-models').onclick = () =>
   perform(async () => {
     const list = await api('/api/models');
-    const input = $('model');
-    let datalist = $('model-list');
-    if (!datalist) {
-      datalist = document.createElement('datalist');
-      datalist.id = 'model-list';
-      input.setAttribute('list', 'model-list');
-      input.after(datalist);
+    let panel = $('model-suggestions');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'model-suggestions';
+      panel.className = 'model-suggestions';
+      panel.hidden = true;
+      panel.innerHTML =
+        '<div class="model-suggestions-head">' +
+        '<input id="model-filter" type="search" placeholder="筛选模型名…" />' +
+        '<button type="button" class="ghost small" id="model-filter-close">收起</button>' +
+        '</div>' +
+        '<div class="model-suggestions-list" id="model-suggestions-list"></div>';
+      $('model').closest('label').after(panel);
+      $('model-filter').oninput = () => renderModelSuggestions();
+      $('model-filter-close').onclick = () => {
+        panel.hidden = true;
+      };
     }
-    datalist.replaceChildren(
-      ...list.models.map((m) => {
-        const option = document.createElement('option');
-        option.value = m;
-        return option;
-      }),
-    );
-    show(`已拉取 ${list.models.length} 个模型，点击“模型名称”输入框可见下拉列表。`);
+    panel.dataset.models = JSON.stringify(list.models);
+    renderModelSuggestions();
+    panel.hidden = false;
+    show(`已拉取 ${list.models.length} 个模型，点击即可填入；也可在输入框直接手输。`);
   }, $('fetch-models'));
+function renderModelSuggestions() {
+  const panel = $('model-suggestions');
+  if (!panel) return;
+  const models = JSON.parse(panel.dataset.models || '[]');
+  const q = ($('model-filter').value || '').trim().toLowerCase();
+  const filtered = q ? models.filter((m) => m.toLowerCase().includes(q)) : models;
+  const listBox = $('model-suggestions-list');
+  listBox.replaceChildren(
+    ...filtered.map((m) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'model-suggestion-item' + (m === $('model').value ? ' current' : '');
+      item.textContent = m;
+      item.title = m;
+      item.onclick = () => {
+        $('model').value = m;
+        panel.hidden = true;
+      };
+      return item;
+    }),
+  );
+  if (!filtered.length) {
+    const empty = document.createElement('div');
+    empty.className = 'model-suggestion-empty';
+    empty.textContent = '没有匹配的模型';
+    listBox.append(empty);
+  }
+}
 $('test-llm').onclick = () =>
   perform(async () => {
     const result = await api('/api/test-llm', 'POST');

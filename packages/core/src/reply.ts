@@ -76,7 +76,7 @@ export function extractInlineStickers(
 ): { parts: ReplyPart[]; text: string } {
   const parts: ReplyPart[] = [];
   const cleaned = text
-    .replace(/(\s*)\[表情[：:]\s*([^\]】]+?)\s*[\]】](\s*)/g, (_all, before: string, name: string, after: string) => {
+    .replace(/(\s*)[(\[{【]\s*(?:表情|sticker)\s*[：:]\s*([^\]】)}】]+?)\s*[\]】)}】](\s*)/gi, (_all, before: string, name: string, after: string) => {
       const query = name.trim().toLowerCase();
       if (!query) return before;
       const bySlug = stickers.find((s) => s.slug.toLowerCase() === query);
