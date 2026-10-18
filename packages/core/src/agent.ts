@@ -32,13 +32,12 @@ import {
   MAX_TOOL_CALLS,
   MAX_REPLY_ATTEMPTS,
   TOOL_RESULT_BUDGET_TOKENS,
-  MAX_IMAGES_PER_TURN,
   STICKER_RECENT_SHOWN,
   SILENCE_NOTIFY_MINUTES,
   SILENCE_HOURS_THRESHOLD,
-  OPEN_LOOP_PROMPT_MAX,
   NOTES_MAX_TOKENS,
   RHYTHM_MIN_BUCKET,
+  RHYTHM_PEAK_BUCKETS,
   DIARY_MAX_SECTIONS,
 } from './constants.js';
 
@@ -152,8 +151,10 @@ export function renderMood(
   timeZone: string,
 ): string {
   if (!mood.at) return '';
+  // Neutral in either axis is fine; the guard used to require both, which
+  // hid a tired-but-cheerful state behind the energy sign fix.
+  if (Math.abs(mood.valence) < 0.05 && Math.abs(mood.energy) < 0.05) return '';
   const hours = (now - mood.at) / 3600000;
-  if (Math.abs(mood.valence) < 0.05 && mood.energy < 0.05) return '';
   const since =
     hours >= 1
       ? `，那是 ${Math.floor(hours)} 小时前留下的`
@@ -169,10 +170,19 @@ export function renderMood(
 }
 /** Habitual active hours of the user, as a short prose hint. */
 export function renderRhythm(buckets: number[], hour: number): string {
+  const total = buckets.reduce((n, v) => n + v, 0);
+  if (!total) return '';
+  // An absolute threshold of 3 messages/hour never fires for a light texter.
+  // Take the busiest hours instead, keeping only those that carry a real share
+  // of the activity so a single stray message at 4am is not called "habitual".
+  const peak = Math.max(RHYTHM_MIN_BUCKET, Math.ceil(total / 24 / 2));
   const habitual = buckets
     .map((n, h) => ({ n, h }))
-    .filter((b) => b.n >= RHYTHM_MIN_BUCKET)
-    .map((b) => b.h);
+    .filter((b) => b.n >= Math.min(peak, RHYTHM_MIN_BUCKET * 2))
+    .sort((a, b) => b.n - a.n)
+    .slice(0, RHYTHM_PEAK_BUCKETS)
+    .map((b) => b.h)
+    .sort((a, b) => a - b);
   if (!habitual.length) return '';
   const bands: string[] = [];
   let start = habitual[0]!,
@@ -187,7 +197,7 @@ export function renderRhythm(buckets: number[], hour: number): string {
     prev = h;
   }
   bands.push(start === prev ? `${start} 点` : `${start}–${prev} 点`);
-  const activeNow = buckets[hour]! >= RHYTHM_MIN_BUCKET;
+  const activeNow = buckets[hour]! >= Math.min(peak, RHYTHM_MIN_BUCKET * 2);
   return `对方通常活跃时段：${bands.join('、')}。${
     activeNow
       ? '现在正处于活跃时段。'
@@ -214,7 +224,7 @@ export function renderOpenLoops(
       const due = formatter.format(new Date(l.due_at));
       return `- [id:${l.id}] ${l.content}（约定时间：${l.due_text || due}${l.recurring === 'yearly' ? '，每年循环' : ''}）`;
     })
-    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 id（如 "resolveLoops":["id"]）了结；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(毫秒时间戳) 或 due("明天 08:00" 这类本地时间), dueText, sources, recurring:"yearly"(生日纪念日等每年循环时填)}。当前时间戳：${now}。`;
+    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 id（如 "resolveLoops":["id"]）了结；本轮你实际问到的那一件，用 askedLoops 数组带上其 id（如 "askedLoops":["id"]），没问就别填；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(毫秒时间戳) 或 due("明天 08:00" 这类本地时间), dueText, sources, recurring:"yearly"(生日纪念日等每年循环时填)}。当前时间戳：${now}。`;
 }
 /** Rotate the sticker window so the tail of the catalog is reachable: the
  *  window steps by day, minus stickers used in the last few turns. */
@@ -330,23 +340,33 @@ export class Agent {
       }).format(new Date(now)),
     );
     const openLoops = store.dueOpenLoops(peer.id, now);
-    const base = [
+    // Stable prefix first: persona, behaviour rules and the sticker catalogue
+    // change rarely (or only once a day), so providers with automatic prefix
+    // caching can reuse them across turns. Everything that varies per message
+    // — clock, mood, rhythm, due loops, recent sticker use — goes after the
+    // cacheable block.
+    const stable = [
       this.o.personaFor?.(peer.id) ?? this.o.prompt('persona'),
       this.o.prompt('chat'),
-      timeLine,
-      `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
-      renderMood(mood, now, this.o.timeZone()),
-      renderRhythm(rhythm, currentHour),
-      renderOpenLoops(openLoops, now, this.o.timeZone()),
       `可用表情目录（slug：含义）：\n${stickerLines.join('\n')}`,
-      recentStickers.length
-        ? `最近已发送的表情（按时间先后）：${recentStickers.map((u) => u.slug).join('、')}。不要连续几轮使用同一张表情；如果情境相似，改用文字或换一张。`
-        : '',
       '注意：历史消息里的 [表情：…] 只是过往发送的记录展示；本轮发送表情必须使用 JSON 的 {"type":"sticker","slug":"目录中的slug"} 对象，绝不能把 [表情：…] 写进文字。',
       '回复长度参照对方：对方一句话，就别回一大段；对方认真长谈，才展开讲。',
     ]
       .filter(Boolean)
       .join('\n\n');
+    const dynamic = [
+      timeLine,
+      `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
+      renderMood(mood, now, this.o.timeZone()),
+      renderRhythm(rhythm, currentHour),
+      renderOpenLoops(openLoops, now, this.o.timeZone()),
+      recentStickers.length
+        ? `最近已发送的表情（按时间先后）：${recentStickers.map((u) => u.slug).join('、')}。不要连续几轮使用同一张表情；如果情境相似，改用文字或换一张。`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const base = stable + (dynamic ? '\n\n' + dynamic : '');
     const budget = this.o.contextTokens();
     const initialBudget = budget - Math.min(TOOL_RESERVE_MAX_TOKENS, Math.floor(budget * CONTEXT_FLEX_FRACTION));
     const reserve = Math.max(
@@ -377,8 +397,16 @@ export class Agent {
     )
       pickedRecalled.pop();
     // 聊天内读空气: terse user replies mean pull back, not pile on questions.
+    // Count meaningful characters after collapsing runs: "哈哈哈哈哈哈" is
+    // long in raw length but is exactly as much content as "哈哈".
+    const meaningful = (text: string) =>
+      text
+        .replace(/[\s\p{P}\p{S}]/gu, '')
+        .replace(/(.)\1+/gu, '$1')
+        .length;
     const lastThree = history.filter((m) => m.role === 'user').slice(-3);
-    const terse = lastThree.length === 3 && lastThree.every((m) => m.content.length <= 4);
+    const terse =
+      lastThree.length === 3 && lastThree.every((m) => meaningful(m.content) <= 4);
     const system = [
       base,
       `当前话题笔记（资料）：\n${notes || '暂无'}`,
@@ -458,12 +486,22 @@ export class Agent {
         .filter((m) => m.role === 'assistant' && m.created_at < now - 6 * 3600000)
         .slice(-6);
       const openers = pastPings.slice(-3).map((m) => m.content.slice(0, 60));
+      // Fingerprints catch the same opening reworded slightly. A repeated hook
+      // within two days is the "老虎又来了" failure mode: technically fresh
+      // text, same topic, and it reads as a machine.
+      const recentHooks = store
+        .proactiveHooks(peer.id, now - 48 * 3600000)
+        .slice(0, 6)
+        .map((h) => h.slice(0, 40));
       messages.push({
         role: 'user',
         content: [
           '现在是一次主动联系机会。依据已有真实话题决定是否开场，没有合适理由就跳过。',
           lastDiary.length ? `你最近日记里的真实感受（引用要自然，别朗读）：\n${lastDiary.join('\n---\n')}` : '',
           openers.length ? `最近几次主动开场说过：${openers.join(' / ')}。换一种开场方式。` : '',
+          recentHooks.length
+            ? `最近两天已经提过的话题：${recentHooks.join(' / ')}。不要再用同样的话题或同样的句式。`
+            : '',
         ]
           .filter(Boolean)
           .join('\n'),
@@ -483,11 +521,11 @@ export class Agent {
       plan.available,
       now,
       this.o.timeZone(),
-    );
-    // A resolve may arrive before the loop is due ("面试搞定了"): match any
+    );    // A resolve may arrive before the loop is due ("面试搞定了"): match any
     // still-open loop, not only due ones.
     const openIds = new Set(store.openLoops(peer.id, true).map((l) => l.id));
     result.resolveLoops = result.resolveLoops.filter((id) => openIds.has(id));
+    result.askedLoops = (result.askedLoops ?? []).filter((id) => openIds.has(id));
     result.descriptions = result.descriptions.filter(
       (d) => plan.available.has(d.messageId) && imageMessages.some((m) => m.id === d.messageId),
     );
@@ -553,7 +591,12 @@ export class Agent {
       }
       const stickers = this.o.stickers().slice(0, PROMPT_STICKERS);
       try {
-        return parseReply(completion.text, stickers, task.kind === 'proactive');
+        return parseReply(
+          completion.text,
+          stickers,
+          task.kind === 'proactive',
+          this.o.timeZone(),
+        );
       } catch (error) {
         if (repaired || attempt === MAX_REPLY_ATTEMPTS - 1) throw error;
         repaired = true;

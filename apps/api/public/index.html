@@ -213,6 +213,15 @@
             <article class="card">
               <div class="card-heading">
                 <div>
+                  <h2>她现在的状态</h2>
+                  <p class="hint">心情、惦记的事和联系节奏，只读展示。</p>
+                </div>
+              </div>
+              <div id="peer-states"></div>
+            </article>
+            <article class="card">
+              <div class="card-heading">
+                <div>
                   <h2>需要留意的事</h2>
                   <p class="hint">任务和发送异常会出现在这里。</p>
                 </div>
@@ -324,14 +333,30 @@
             aria-labelledby="tab-persona"
             hidden
           >
-            <div class="section-head">
-              <div>
-                <span class="eyebrow">A PERSONALITY OF HER OWN</span>
-                <h1>人物设定</h1>
-                <p>用你自己的话，写下她是谁，以及如何相处。可为不同联系人使用不同人格。</p>
+              <div class="section-head">
+                <div>
+                  <span class="eyebrow">A PERSONALITY OF HER OWN</span>
+                  <h1>人物设定</h1>
+                  <p>用你自己的话，写下她是谁，以及如何相处。可为不同联系人使用不同人格。</p>
+                </div>
+                <button id="persona-new" class="ghost">新建人格</button>
               </div>
-              <button id="persona-new" class="ghost">新建人格</button>
-            </div>
+              <form id="persona-create" class="card" hidden>
+                <label for="persona-create-name">新人格名称</label
+                ><input
+                  id="persona-create-name"
+                  maxlength="40"
+                  required
+                  placeholder="例如：安静的学生"
+                />
+                <div class="form-footer">
+                  <span class="hint">创建后可以在下方编辑她的设定。</span>
+                  <div class="actions">
+                    <button type="button" id="persona-create-cancel" class="ghost small">取消</button>
+                    <button type="submit">创建</button>
+                  </div>
+                </div>
+              </form>
             <article class="card">
               <div class="card-heading">
                 <div>
@@ -452,17 +477,6 @@
                       <label
                         >模型名称<input id="model" required placeholder="deepseek-chat"
                       /></label>
-                      <button
-                        class="ghost small"
-                        type="button"
-                        id="fetch-models"
-                        title="仅 OpenAI 兼容接口支持自动拉取模型列表"
-                      >
-                        拉取模型列表（仅 OpenAI 兼容）
-                      </button>
-                      <button class="ghost small" type="button" id="test-llm">
-                        测试模型连通性
-                      </button>
                       <label class="full-width"
                         >API 地址<input
                           id="baseUrl"
@@ -477,6 +491,22 @@
                           autocomplete="new-password"
                           placeholder="留空保持原值"
                       /></label>
+                      <div class="inline-actions">
+                        <button
+                          class="ghost small"
+                          type="button"
+                          id="fetch-models"
+                          title="仅 OpenAI 兼容接口支持自动拉取模型列表"
+                        >
+                          拉取模型列表
+                        </button>
+                        <button class="ghost small" type="button" id="test-llm">
+                          测试连通性
+                        </button>
+                        <button class="ghost small" type="button" id="clear-api-key">
+                          清除密钥
+                        </button>
+                      </div>
                       <label
                         >Tavily 搜索密钥<input
                           id="tavilyKey"
@@ -484,6 +514,11 @@
                           autocomplete="new-password"
                           placeholder="留空保持原值"
                       /></label>
+                      <div class="inline-actions">
+                        <button class="ghost small" type="button" id="clear-tavily-key">
+                          清除搜索密钥
+                        </button>
+                      </div>
                       <label class="check full-width"
                         ><input id="vision" type="checkbox" /><span
                           >启用图片理解<small>需要所选模型本身支持视觉输入。</small></span
@@ -501,9 +536,6 @@
                           id="embeddingModel"
                           placeholder="例如 text-embedding-3-small"
                       /></label>
-                      <button class="ghost small" type="button" id="test-embedding">
-                        测试向量连通性
-                      </button>
                       <label class="full-width"
                         >向量模型地址<input
                           id="embeddingBaseUrl"
@@ -515,8 +547,16 @@
                           id="embeddingApiKey"
                           type="password"
                           autocomplete="new-password"
-                          placeholder="留空则使用上方模型密钥"
+                          placeholder="独立填写，不回退到上方模型密钥"
                       /></label>
+                      <div class="inline-actions">
+                        <button class="ghost small" type="button" id="test-embedding">
+                          测试向量连通性
+                        </button>
+                        <button class="ghost small" type="button" id="clear-embedding-key">
+                          清除向量密钥
+                        </button>
+                      </div>
                     </div>
                   </article>
                   <article class="card">
@@ -689,7 +729,10 @@
                   </article>
                   <article class="card">
                     <div class="card-heading"><h2>最近的实际用量</h2></div>
-                    <div id="recent-usage"></div>
+                    <details id="recent-usage-details">
+                      <summary>展开最近 12 次调用</summary>
+                      <div id="recent-usage"></div>
+                    </details>
                     <p class="hint footnote">保存参数后试聊，可在这里比较输入、输出与耗时。</p>
                   </article>
                 </aside>

@@ -24,7 +24,8 @@ let authenticated = false,
   settingsVersion = 0,
   polling = false,
   chatSnapshot = '',
-  journalSnapshot = '';
+  journalSnapshot = '',
+  waitingReply = false;
 function show(message, error = false) {
   clearTimeout(noticeTimer);
   $('notice').textContent = message;
@@ -81,6 +82,31 @@ function empty(node, message) {
   node.replaceChildren(el('p', message, 'empty'));
 }
 const enc = encodeURIComponent;
+/** Inline confirmation for destructive actions: first tap arms the button
+ *  ("确认删除？"), second tap within 3s fires, then it resets. Replaces
+ *  native confirm() which is unstyleable and awkward on mobile. */
+function confirmButton(label, message, handler, classes = 'ghost small danger') {
+  const node = button(label, async () => {
+    if (node.dataset.armed !== '1') {
+      node.dataset.armed = '1';
+      node.textContent = message;
+      node.classList.add('armed');
+      setTimeout(() => {
+        if (node.isConnected) {
+          node.dataset.armed = '';
+          node.textContent = label;
+          node.classList.remove('armed');
+        }
+      }, 3000);
+      return;
+    }
+    node.dataset.armed = '';
+    node.textContent = label;
+    node.classList.remove('armed');
+    await handler();
+  }, classes);
+  return node;
+}
 async function loadPeers() {
   peers = await api('/api/peers');
   const wechatPeers = peers.filter((p) => p.channel === 'wechat');
@@ -110,6 +136,28 @@ async function loadPeers() {
         show('该联系人的人格已更新。');
       }, personaSelect);
     if (personaState.list.length) fillPersonaSelect(personaSelect, peer.persona_id ?? '');
+    row.append(heading, personaSelect);
+    target.append(row);
+  }
+  // The preview peer drives 试聊, so it needs persona binding too — the old UI
+  // could only ever test the default persona.
+  const previewPeer = peers.find((p) => p.id === 'preview:default');
+  if (previewPeer) {
+    const row = el('div', undefined, 'row'),
+      heading = el('div', undefined, 'row-title');
+    heading.append(el('span', '本地试聊'));
+    const personaSelect = document.createElement('select');
+    personaSelect.dataset.personaFor = previewPeer.id;
+    personaSelect.setAttribute('aria-label', '人格选择：本地试聊');
+    personaSelect.onchange = () =>
+      perform(async () => {
+        await api('/api/peers/' + enc(previewPeer.id) + '/persona', 'PUT', {
+          personaId: personaSelect.value,
+        });
+        personaState.bindings[previewPeer.id] = personaSelect.value;
+        show('试聊人格已更新，下一次对话生效。');
+      }, personaSelect);
+    if (personaState.list.length) fillPersonaSelect(personaSelect, previewPeer.persona_id ?? '');
     row.append(heading, personaSelect);
     target.append(row);
   }
@@ -176,8 +224,10 @@ async function status() {
     ])
       actions.append(
         button(label, async () => {
-          if (action === 'retry' && !(await confirmDialog({ title: '重新发送', message: '请先确认微信中没有收到这条消息，再重新发送。' })))
+          if (action === 'retry') {
+            show('请先确认微信中没有收到这条消息，再选择重新发送。', true);
             return;
+          }
           await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
           await status();
         }),
@@ -186,6 +236,50 @@ async function status() {
     issues.append(row);
   }
   if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。');
+  // A restart mid-send leaves deliveries "uncertain" and the peer silently
+  // stops replying until an admin resolves it — surface that loudly.
+  const stuckPeers = new Set(state.issues.deliveries.map((d) => d.peer_id));
+  $('issues').classList.toggle('attention', stuckPeers.size > 0);
+  const states = $('peer-states');
+  states.replaceChildren();
+  for (const peer of state.states ?? []) {
+    const row = el('div', undefined, 'row'),
+      title = el('div', undefined, 'row-title');
+    title.append(el('span', peer.address));
+    if (stuckPeers.has(peer.peerId))
+      title.append(el('span', '发送待确认，暂停回复', 'badge alert'));
+    const badges = el('div', undefined, 'actions');
+    if (peer.mood) {
+      const parts = [];
+      if (peer.mood.valence >= 0.3) parts.push('心情不错');
+      else if (peer.mood.valence <= -0.3) parts.push('心情低落');
+      else if (peer.mood.valence <= -0.12) parts.push('情绪平平');
+      if (peer.mood.energy <= -0.3) parts.push('有点累');
+      else if (peer.mood.energy >= 0.3) parts.push('精力足');
+      if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
+      if (peer.mood.reason) badges.append(el('span', peer.mood.reason, 'badge'));
+    }
+    if (peer.dueLoops) badges.append(el('span', `惦记 ${peer.dueLoops} 件事`, 'badge'));
+    if (peer.lastProactiveAt)
+      badges.append(
+        el(
+          'span',
+          '上次问候 ' +
+            new Date(peer.lastProactiveAt).toLocaleString('zh-CN', {
+              month: 'numeric',
+              day: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+          'badge',
+        ),
+      );
+    if (!peer.approved) badges.append(el('span', '未允许', 'badge'));
+    row.append(title, badges);
+    if (!badges.childNodes.length) row.append(el('p', '状态平静，暂无惦记的事。', 'hint'));
+    states.append(row);
+  }
+  if (!states.childNodes.length) empty(states, '还没有联系人的状态可以显示。');
   $('usage').replaceChildren(
     ...state.usage.map((u) => {
       const card = el('div', undefined, 'usage-card');
@@ -216,14 +310,13 @@ async function status() {
       );
       time.dateTime = new Date(u.created_at).toISOString();
       heading.append(el('strong', purposeName(u.purpose)), time);
-      row.append(
-        heading,
-        el(
-          'p',
-          `输入 ${formatNumber(u.input_tokens)} · 输出 ${formatNumber(u.output_tokens)} token`,
-        ),
-        el('p', `${(u.duration_ms / 1000).toFixed(2)} 秒 · ${u.address || '已删除的对话'}`),
+      const detail = el(
+        'p',
+        `入 ${formatNumber(u.input_tokens)} · 出 ${formatNumber(u.output_tokens)} · ${(u.duration_ms / 1000).toFixed(1)} 秒`,
       );
+      const address = el('p', u.address || '已删除的对话', 'recent-address');
+      address.title = u.address || '';
+      row.append(heading, detail, address);
       return row;
     }),
   );
@@ -240,7 +333,7 @@ function applySettings(c) {
   $('tavilyKey').placeholder = c.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('embeddingApiKey').placeholder = c.hasEmbeddingApiKey
     ? '已配置，留空保持原值'
-    : '留空则使用上方模型密钥';
+    : '独立填写，不回退到上方模型密钥';
   $('apiKey').value = '';
   $('tavilyKey').value = '';
   $('embeddingApiKey').value = '';
@@ -309,17 +402,12 @@ async function loadPersonas(selectId) {
       );
     actions.append(
       button('编辑', () => selectPersona(persona.id)),
-      button(
-        '删除',
-        async () => {
-          if (!(await confirmDialog({ title: '删除人格', message: `删除人格「${persona.name}」？绑定了它的联系人将改用默认人格。`, confirmLabel: '删除' }))) return;
-          await api('/api/personas/' + enc(persona.id), 'DELETE');
-          if (personaSelected === persona.id) personaSelected = '';
-          await loadPersonas();
-          show('人格已删除。');
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除', '确认删除？', async () => {
+        await api('/api/personas/' + enc(persona.id), 'DELETE');
+        if (personaSelected === persona.id) personaSelected = '';
+        await loadPersonas();
+        show('人格已删除。');
+      }),
     );
     row.append(heading, actions);
     target.append(row);
@@ -346,12 +434,10 @@ function loadPersonasBound() {
 function fillPersonaSelect(select, boundId) {
   const current = select.value;
   select.replaceChildren();
-  const defaultPersona = personaState.list.find((p) => p.id === personaState.defaultId);
-  const auto = el('option', '默认（' + (defaultPersona?.name ?? '未设置') + '）');
+  const auto = el('option', '默认人格（' + (personaState.list.find((p) => p.id === personaState.defaultId)?.name ?? '') + '）');
   auto.value = '';
   select.append(auto);
   for (const persona of personaState.list) {
-    if (persona.id === personaState.defaultId) continue;
     const option = el('option', persona.name);
     option.value = persona.id;
     select.append(option);
@@ -361,17 +447,28 @@ function fillPersonaSelect(select, boundId) {
   if (current && [...select.options].some((o) => o.value === current) && boundId === undefined)
     select.value = current;
 }
-$('persona-new').onclick = () =>
+$('persona-new').onclick = () => {
+  const form = $('persona-create');
+  form.hidden = !form.hidden;
+  if (!form.hidden) $('persona-create-name').focus();
+};
+$('persona-create-cancel').onclick = () => {
+  $('persona-create').hidden = true;
+  $('persona-create-name').value = '';
+};
+$('persona-create').onsubmit = (e) => {
+  e.preventDefault();
   perform(async () => {
-    const name = await confirmDialog({ title: '新建人格', message: '给新人格起个名字：', input: '', maxLength: 40, placeholder: '例如：安静的学生', confirmLabel: '创建' });
-    if (name === null) return;
     const entry = await api('/api/personas', 'POST', {
-      name,
-      content: '（在这里写下她是谁）',
+      name: $('persona-create-name').value,
+      content: (personaState.list.find((p) => p.id === personaSelected)?.content) || '（在这里写下她是谁）',
     });
+    $('persona-create').hidden = true;
+    $('persona-create-name').value = '';
     await loadPersonas(entry.id);
     show('已创建，编辑内容后保存。');
-  }, $('persona-new'));
+  }, e.submitter);
+};
 $('persona-name').oninput = countPersona;
 async function loadChat() {
   const peer = $('chat-peer').value || 'preview:default';
@@ -399,19 +496,21 @@ async function loadChat() {
     for (const media of message.media)
       if (media.description) bubble.append(el('p', media.description, 'hint'));
     bubble.append(
-      button(
-        '删除',
-        async () => {
-          if (!(await confirmDialog({ title: '删除原文', message: '删除这条原文及依赖它的日记和记忆？微信中已经发送的消息仍会保留。', confirmLabel: '删除' }))) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
-          await loadChat();
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除', '确认删除？', async () => {
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
+        await loadChat();
+      }),
     );
     container.append(bubble);
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
+  // A reply arrived (assistant bubble added since the send) → clear waiting.
+  if (waitingReply && history.some((m) => m.role === 'assistant')) {
+    waitingReply = false;
+  } else if (waitingReply) {
+    container.append(el('div', '亚托莉正在输入……', 'typing'));
+    container.scrollTop = container.scrollHeight;
+  }
   $('chat-form').hidden = peer !== 'preview:default';
   $('chat-hint').textContent =
     peer === 'preview:default'
@@ -442,15 +541,10 @@ async function loadJournal() {
     const actions = el('div', undefined, 'actions');
     actions.append(
       button(`查看 ${section.sources.length} 条依据`, () => showSources(peer, section.sources)),
-      button(
-        '删除这一段',
-        async () => {
-          if (!(await confirmDialog({ title: '删除日记', message: '删除这段日记及直接依赖它的记忆？', confirmLabel: '删除' }))) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
-          await loadJournal();
-        },
-        'ghost small danger',
-      ),
+      confirmButton('删除这一段', '确认删除？', async () => {
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
+        await loadJournal();
+      }),
     );
     row.append(actions);
     journal.append(row);
@@ -462,7 +556,7 @@ async function loadJournal() {
     const row = el('div', undefined, 'row');
     row.append(
       el('span', item.kind === 'stated' ? '对话中确认' : '主观理解', 'badge'),
-      item.pinned ? el('span', '已置顶', 'badge') : null,
+      ...(item.pinned ? [el('span', '已置顶', 'badge')] : []),
       el('p', item.content),
     );
     const actions = el('div', undefined, 'actions');
@@ -474,23 +568,45 @@ async function loadJournal() {
         });
         await loadJournal();
       }),
-      button('更正', async () => {
-        const content = await confirmDialog({ title: '更正记忆', message: '把正确的信息写在这里：', input: item.content, maxLength: 800, confirmLabel: '保存' });
-        if (!content?.trim()) return;
+    );
+    // Inline correction: the old prompt() dialog couldn't show the full text
+    // and fought the mobile keyboard.
+    const correct = button('更正', () => {
+      editor.hidden = !editor.hidden;
+      if (!editor.hidden) {
+        editor.querySelector('textarea').value = item.content;
+        editor.querySelector('textarea').focus();
+      }
+    });
+    actions.append(correct);
+    const editor = el('form', undefined, 'memory-correction');
+    editor.hidden = true;
+    editor.append(
+      el('label', '更正为正确信息', 'sr-only'),
+      Object.assign(document.createElement('textarea'), {
+        rows: 3,
+        maxLength: 3000,
+        required: true,
+        textContent: item.content,
+      }),
+      el('div', undefined, 'actions'),
+    );
+    const editorActions = editor.querySelector('.actions');
+    editorActions.append(
+      button('取消', () => (editor.hidden = true), 'ghost small'),
+      button('保存更正', async () => {
+        const content = editor.querySelector('textarea').value.trim();
+        if (!content) return;
         await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id), 'PUT', { content });
         await loadJournal();
       }),
-      button(
-        '删除',
-        async () => {
-          if (!(await confirmDialog({ title: '删除记忆', message: '删除这条记忆？如果还想移除对应经历，请在对话中删除相关原文。', confirmLabel: '删除' }))) return;
-          await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
-          await loadJournal();
-        },
-        'ghost small danger',
-      ),
     );
-    row.append(actions);
+    const del = confirmButton('删除', '确认删除？', async () => {
+      await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
+      await loadJournal();
+    });
+    actions.append(del);
+    row.append(actions, editor);
     memory.append(row);
   }
   if (!memories.length) empty(memory, '重要的偏好、约定和认识会留在这里。');
@@ -574,7 +690,9 @@ async function enter() {
   $('dashboard').hidden = false;
   $('logout').hidden = false;
   $('notice').hidden = true;
-  await Promise.all([status(), loadPeers(), loadSettings(), loadPersonas()]);
+  // Personas first: peer rows render persona selects from that state.
+  await loadPersonas();
+  await Promise.all([status(), loadPeers(), loadSettings()]);
   await selectTab(currentTab);
 }
 async function selectTab(tab) {
@@ -602,37 +720,6 @@ document.querySelectorAll('[data-open]').forEach((b) => {
       window.scrollTo({ top: 0, behavior: 'instant' });
     });
 });
-function confirmDialog(options) {
-  return new Promise((resolve) => {
-    const dialog = el('dialog', undefined, 'confirm-dialog');
-    dialog.setAttribute('aria-label', options.title);
-    dialog.append(el('h2', options.title));
-    if (options.message) dialog.append(el('p', options.message));
-    let input;
-    if (options.input !== undefined) {
-      input = document.createElement('input');
-      input.value = options.input;
-      input.maxLength = options.maxLength ?? 40;
-      input.placeholder = options.placeholder ?? '';
-      input.className = 'confirm-input';
-      dialog.append(input);
-    }
-    const footer = el('div', undefined, 'confirm-actions');
-    footer.append(
-      button('取消', () => dialog.close('cancel'), 'ghost'),
-      button(options.confirmLabel ?? '确定', () => dialog.close('ok')),
-    );
-    dialog.append(footer);
-    dialog.addEventListener('close', () => {
-      const ok = dialog.returnValue === 'ok';
-      resolve(ok ? (input ? input.value : true) : input ? null : false);
-      dialog.remove();
-    });
-    document.body.append(dialog);
-    dialog.showModal();
-    if (input) input.focus(), input.select();
-  });
-}
 const tablist = document.querySelector('[role="tablist"]');
 const mobileNav = window.matchMedia('(max-width: 960px)');
 function orientTabs() {
@@ -702,7 +789,9 @@ $('chat-form').onsubmit = (e) => {
     });
     lastTask = result.taskId;
     $('chat-input').value = '';
-    await loadPeers();
+    // Waiting state: the poll picks up the reply; loadChat shows a typing
+    // line until an assistant bubble lands, then the flag clears.
+    waitingReply = true;
     await loadChat();
   }, e.submitter);
 };
@@ -756,6 +845,17 @@ $('test-embedding').onclick = () =>
       `向量连通正常：${result.model} · 维度 ${result.dims} · 延迟 ${result.latencyMs} ms`,
     );
   }, $('test-embedding'));
+for (const [id, field] of [
+  ['clear-api-key', 'clearApiKey'],
+  ['clear-tavily-key', 'clearTavilyKey'],
+  ['clear-embedding-key', 'clearEmbeddingApiKey'],
+])
+  $(id).onclick = () =>
+    perform(async () => {
+      const saved = await api('/api/config', 'PUT', { [field]: true });
+      applySettings(saved);
+      show('密钥已清除，对应服务在重新填写前不可用。');
+    }, $(id));
 function settingsChanged() {
   settingsVersion++;
   $('settings-saved').textContent = '有尚未保存的修改。';
@@ -812,6 +912,7 @@ $('sticker-form').onsubmit = (e) => {
     show('表情已加入目录。');
   }, e.submitter);
 };
+let journalPoll = 0;
 setInterval(async () => {
   if (!authenticated || document.hidden || polling) return;
   polling = true;
@@ -829,7 +930,12 @@ setInterval(async () => {
           } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
         }
       }
-      if (currentTab === 'journal') await loadJournal();
+      // Journal content changes at diary-writing pace, not chat pace; polling
+      // three full listings every 2.5s wasted real CPU once histories grew.
+      if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
+        journalPoll = Date.now();
+        await loadJournal();
+      }
     });
   } finally {
     polling = false;

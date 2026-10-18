@@ -82,10 +82,10 @@ export class Settings {
       requestTimeoutSeconds: 45,
       turnTimeoutSeconds: 90,
       temperature: null,
-      embeddingEnabled: false,
-      embeddingBaseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
+      embeddingEnabled: env.EMBEDDING_ENABLED === 'true',
+      embeddingBaseUrl: env.EMBEDDING_BASE_URL || env.LLM_BASE_URL || 'https://api.deepseek.com',
       embeddingApiKey: env.EMBEDDING_API_KEY || '',
-      embeddingModel: '',
+      embeddingModel: env.EMBEDDING_MODEL || '',
       maxConcurrentPeers: 3,
       debounceMs: 800,
     };
@@ -226,6 +226,13 @@ export class Settings {
       timeoutMs: Math.min(c.requestTimeoutSeconds, 60) * 1000,
     };
   }
+  /** Vector retrieval is on only when the switch is on *and* the endpoint is
+   *  fully configured; the switch used to be inert, so turning it off still
+   *  spent money embedding and still changed ranking. */
+  embeddingEnabled(): boolean {
+    const c = this.config();
+    return Boolean(c.embeddingEnabled && c.embeddingModel && c.embeddingApiKey);
+  }
   runtime(): RuntimeConfig {
     const c = this.config();
     return {
@@ -242,9 +249,26 @@ export class Settings {
       readFileSync(join(this.root, 'shared', 'prompts', `${name}.md`), 'utf8'),
     );
   }
+  /** `prompt('persona')` still backs the legacy endpoint, so it must reflect
+   *  the default persona's current text rather than the stale seed. */
+  personaPrompt(): string {
+    const { list, defaultId } = this.personaList();
+    return (
+      list.find((p) => p.id === defaultId)?.content ??
+      this.store.getSetting<string>('prompt:persona', this.prompt('persona'))
+    );
+  }
+  /** Legacy single-persona write: retargeted at the default persona so a
+   *  bookmark or older client no longer saves into a setting nobody reads. */
   savePersona(text: string) {
     if (!text.trim() || text.length > 12000) throw new Error('人设需要 1–12000 个字符');
-    this.store.setSetting('prompt:persona', text);
+    const { list, defaultId } = this.personaList();
+    const entry = list.find((p) => p.id === defaultId) ?? list[0];
+    if (!entry) {
+      this.store.setSetting('prompt:persona', text);
+      return;
+    }
+    this.personaUpdate(entry.id, { content: text });
   }
   personaList() {
     let list = this.store.getSetting<

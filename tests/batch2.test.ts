@@ -25,8 +25,29 @@ test('resolveDue 解析本地时间字符串，时区正确', () => {
   assert.equal(passed, Date.parse('2026-09-14T07:00:00+08:00'), '已过时刻顺延到明天');
   const md = resolveDue(undefined, '12-25 09:00', now, 'Asia/Shanghai');
   assert.equal(md, Date.parse('2026-12-25T09:00:00+08:00'));
-  assert.equal(resolveDue(12345, undefined, now, 'Asia/Shanghai'), 12345, '数字时间戳直接采用');
+  assert.equal(
+    resolveDue(now + 3600000, undefined, now, 'Asia/Shanghai'),
+    now + 3600000,
+    '合理范围的数字时间戳直接采用',
+  );
   assert.equal(resolveDue(undefined, '说不清', now, 'Asia/Shanghai'), undefined);
+});
+
+test('resolveDue 拒绝语义上不可能的时间戳（JSON 合法但胡编）', () => {
+  const now = Date.parse('2026-09-13T10:00:00+08:00');
+  // 1970 年附近的原始小数字、9999 年的远期时间戳都是模型幻觉产物
+  assert.equal(resolveDue(12345, undefined, now, 'Asia/Shanghai'), undefined, '过去太远');
+  assert.equal(
+    resolveDue(now + 10 * 365 * 86400000, undefined, now, 'Asia/Shanghai'),
+    undefined,
+    '未来超过 5 年',
+  );
+  assert.ok(resolveDue(now - 3600000, undefined, now, 'Asia/Shanghai'), '1 天内的过去时间允许（时钟偏差）');
+  assert.equal(
+    resolveDue(undefined, '1970-01-01 08:00', now, 'Asia/Shanghai'),
+    undefined,
+    'ISO 日期同样受范围约束',
+  );
 });
 
 test('parseOpenLoops 接受 due 字符串与 yearly 标记', () => {

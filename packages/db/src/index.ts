@@ -32,7 +32,7 @@ export interface Message {
   id: string;
   seq: number;
   peer_id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   media: Media[];
   status: string;
@@ -60,6 +60,10 @@ export interface Memory {
   hits: number;
   last_hit_at: number;
   pinned: number;
+  /** When a later fact superseded this one; 0 while still valid. */
+  invalid_at: number;
+  /** Write-time importance seed (0–1) that scales the ranking score. */
+  importance: number;
   created_at: number;
 }
 /** An unfinished arrangement the user mentioned ("明天面试"): created from a
@@ -105,6 +109,8 @@ export interface MemoryUpdate {
   kind: 'stated' | 'interpretation';
   sources: string[];
   supersedes?: string[];
+  /** Model's own 0–1 importance for the fact; absent means neutral 0.5. */
+  importance?: number;
 }
 export interface ReplyPart {
   type: 'text' | 'sticker';
@@ -163,9 +169,10 @@ export const OPEN_LOOP_EXPIRE_DAYS = 7;
 /** Proactive brake: unanswered pings before the cooldown stretches to days. */
 export const PROACTIVE_IGNORE_LIMIT = 2;
 export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
-/** Mood pulses decay toward neutral with these half-lives (hours). */
-export const MOOD_VALENCE_HALFLIFE_HOURS = 20;
-export const MOOD_ENERGY_HALFLIFE_HOURS = 8;
+/** Mood pulses decay toward neutral with these half-lives (hours). Tuned so
+ *  "生气" fades overnight and "累" fades within a nap, not a workday. */
+export const MOOD_VALENCE_HALFLIFE_HOURS = 12;
+export const MOOD_ENERGY_HALFLIFE_HOURS = 4;
 /** Usage rollup: keep this many days of per-call rows, older ones aggregate. */
 export const USAGE_RETENTION_DAYS = 30;
 /** Hard character cap on stored topic notes. */
@@ -179,7 +186,7 @@ export class Store {
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
-    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 3) {
+    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 4) {
       this.sql.close();
       throw new Error('数据库来自更新版本，不能用当前程序打开');
     }
@@ -250,6 +257,15 @@ export class Store {
       // Per-peer persona binding; empty string means "use the default persona".
       this.sql.exec('ALTER TABLE peers ADD COLUMN persona_id TEXT NOT NULL DEFAULT "";');
       this.sql.exec('PRAGMA user_version=3;');
+    }
+    if (openedAt < 4) {
+      // Facts are invalidated, never deleted: invalid_at records when a later
+      // statement replaced them, so "she changed her mind" stays traceable.
+      // importance is a write-time seed (0–1) that scales ranking; 0.5 is
+      // neutral and reproduces the old ordering for existing rows.
+      this.sql.exec('ALTER TABLE memories ADD COLUMN invalid_at INTEGER NOT NULL DEFAULT 0;');
+      this.sql.exec('ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;');
+      this.sql.exec('PRAGMA user_version=4;');
     }
   }
   close() {
@@ -332,6 +348,8 @@ export class Store {
     content: string,
     media: Media[] = [],
     timestamp = Date.now(),
+    /** Only the admin correction path writes anything but a user message. */
+    role: 'user' | 'system' = 'user',
   ) {
     return this.transaction(() => {
       const existing = this.sql
@@ -341,12 +359,25 @@ export class Store {
       const id = randomUUID();
       this.sql
         .prepare(
-          "INSERT INTO messages(id,peer_id,event_key,role,content,media,status,created_at) VALUES(?,?,?,'user',?,?,'received',?)",
+          'INSERT INTO messages(id,peer_id,event_key,role,content,media,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
         )
-        .run(id, peer, eventKey, content, JSON.stringify(media), timestamp);
-      this.sql
-        .prepare('UPDATE peers SET version=version+1,last_user_at=MAX(last_user_at,?) WHERE id=?')
-        .run(timestamp, peer);
+        .run(
+          id,
+          peer,
+          eventKey,
+          role,
+          content,
+          JSON.stringify(media),
+          role === 'system' ? 'note' : 'received',
+          timestamp,
+        );
+      // A system note is not something the user said: it must not move the
+      // silence clock that gates proactive contact.
+      if (role === 'user')
+        this.sql
+          .prepare('UPDATE peers SET version=version+1,last_user_at=MAX(last_user_at,?) WHERE id=?')
+          .run(timestamp, peer);
+      else this.sql.prepare('UPDATE peers SET version=version+1 WHERE id=?').run(peer);
       this.index(id, peer, 'message', content, timestamp);
       return { duplicate: false, message: this.getMessage(peer, id)! };
     });
@@ -405,6 +436,17 @@ export class Store {
         'INSERT OR IGNORE INTO tasks(id,peer_id,kind,dedupe_key,payload,run_at,created_at) VALUES(?,?,?,?,?,?,?)',
       )
       .run(id, peer, kind, key, JSON.stringify(payload), runAt, Date.now());
+    // A terminal-but-not-done row (failed/superseded/interrupted) used to
+    // swallow every future enqueue with the same dedupe key, which permanently
+    // froze that key: notes kept reusing the same `through`, diary the same
+    // day, a yearly loop the same id. Reviving it keeps dedupe for in-flight
+    // work while letting a later attempt actually run.
+    this.sql
+      .prepare(
+        `UPDATE tasks SET state='queued',payload=?,run_at=?,error='',attempts=0
+         WHERE peer_id=? AND kind=? AND dedupe_key=? AND state IN ('failed','superseded','interrupted')`,
+      )
+      .run(JSON.stringify(payload), runAt, peer, kind, key);
     return String(
       this.sql
         .prepare('SELECT id FROM tasks WHERE peer_id=? AND kind=? AND dedupe_key=?')
@@ -637,11 +679,16 @@ export class Store {
     const version = Number(this.sql.prepare('SELECT version FROM peers WHERE id=?').get(peer)?.version ?? -1);
     const cached = this.memoryCache.get(peer);
     if (cached && cached.version === version) return cached.memories;
+    // Pinned rows are fetched separately: a lifetime of chat makes the newest
+    // 500 a sliding window that would silently drop a pinned memory created
+    // long ago, defeating "置顶的记忆永远会带在身边".
     const rows = this.sql
       .prepare(
-        "SELECT * FROM memories WHERE peer_id=? AND status='active' ORDER BY created_at DESC LIMIT 500",
+        `SELECT * FROM memories WHERE peer_id=? AND status='active'
+         AND (pinned=1 OR id IN (SELECT id FROM memories WHERE peer_id=? AND status='active' ORDER BY created_at DESC LIMIT 500))
+         ORDER BY pinned DESC, created_at DESC`,
       )
-      .all(peer)
+      .all(peer, peer)
       .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as Memory);
     // Bounded cache; setMemoryPinned/correctMemory invalidate explicitly and a
     // version bump covers every write path, so staleness is impossible.
@@ -660,6 +707,10 @@ export class Store {
    *  Pinned memories always come first and never participate in the budget
    *  trim that pops from the tail. */
   rankedMemories(peer: string, limit = 10): Memory[] {
+    return this.rankedMemoriesScored(peer, limit).map((s) => s.memory);
+  }
+  /** Same ranking, exposing scores/ages so callers can apply semantic boost. */
+  rankedMemoriesScored(peer: string, limit = 10): { memory: Memory; score: number; pinned: boolean }[] {
     const now = Date.now(),
       halflifeMs = MEMORY_HALFLIFE_DAYS * 86400000;
     const scored = this.memories(peer).map((m) => {
@@ -673,16 +724,17 @@ export class Store {
       const kindWeight =
         m.kind === 'stated' ? MEMORY_STATED_WEIGHT : MEMORY_INTERPRETATION_WEIGHT;
       const hits = m.hits ?? 0;
+      // Importance is a mild multiplier (0.6–1.4 around the neutral 0.5): it
+      // nudges the order without letting a single "important" tag bury every
+      // recent fact.
+      const importance = 0.6 + (Number.isFinite(m.importance) ? m.importance : 0.5) * 0.8;
       return {
         memory: m,
-        score: (1 + Math.sqrt(hits)) * recency * kindWeight,
+        score: (1 + Math.sqrt(hits)) * recency * kindWeight * importance,
         pinned: false,
       };
     });
-    return scored
-      .sort((a, b) => b.score - a.score || b.memory.created_at - a.memory.created_at)
-      .slice(0, limit)
-      .map((s) => s.memory);
+    return scored.sort((a, b) => b.score - a.score || b.memory.created_at - a.memory.created_at).slice(0, limit);
   }
   /** Count prompt inclusions per memory so reused memories outrank one-offs. */
   markMemoriesUsed(peer: string, ids: string[], now = Date.now()) {
@@ -711,33 +763,62 @@ export class Store {
     )
       return;
     if (update.kind === 'stated' && sources.some((s) => s.kind === 'diary')) return;
-    const sourceHash = hash(update.content.trim() + '\n' + ids.sort().join(','));
+    // "Stated" means the user confirmed it. A memory sourced only from the
+    // assistant's own text lets a guess become a user fact. Admin corrections
+    // arrive as system notes, which are deliberate user-side evidence.
+    if (
+      update.kind === 'stated' &&
+      !sources.some(
+        (s) => s.kind === 'message' && (s.role === 'user' || s.role === 'system'),
+      )
+    )
+      return;
+    const content = update.content.trim();
+    const sourceHash = hash(content + '\n' + ids.sort().join(','));
+    // Identical wording from a different turn is the same fact; only extend
+    // its evidence instead of storing a duplicate row.
+    const duplicate = this.sql
+      .prepare(
+        "SELECT id,sources FROM memories WHERE peer_id=? AND content=? AND status='active' LIMIT 1",
+      )
+      .get(peer, content.slice(0, 800)) as Row | undefined;
+    if (duplicate) {
+      const merged = [...new Set([...parse<string[]>(duplicate.sources, []), ...ids])].slice(0, 20);
+      this.sql
+        .prepare('UPDATE memories SET sources=?,importance=MAX(importance,?) WHERE id=?')
+        .run(JSON.stringify(merged), update.importance ?? 0.5, String(duplicate.id));
+      this.memoryCache.delete(peer);
+      return;
+    }
     const id = randomUUID();
     const result = this.sql
       .prepare(
-        'INSERT OR IGNORE INTO memories(id,peer_id,content,kind,sources,source_hash,created_at) VALUES(?,?,?,?,?,?,?)',
+        'INSERT OR IGNORE INTO memories(id,peer_id,content,kind,sources,source_hash,importance,created_at) VALUES(?,?,?,?,?,?,?,?)',
       )
       .run(
         id,
         peer,
-        update.content.slice(0, 800),
+        content.slice(0, 800),
         update.kind,
         JSON.stringify(ids),
         sourceHash,
+        Math.max(0, Math.min(1, update.importance ?? 0.5)),
         now,
       );
     if (!result.changes) return;
     for (const previous of update.supersedes ?? []) {
+      // Invalidate rather than delete: the old row leaves default recall but
+      // keeps its text and the moment it stopped being true.
       if (
         this.sql
           .prepare(
-            "UPDATE memories SET status='superseded' WHERE peer_id=? AND id=? AND status='active'",
+            "UPDATE memories SET status='superseded',invalid_at=? WHERE peer_id=? AND id=? AND status='active'",
           )
-          .run(peer, previous).changes
+          .run(now, peer, previous).changes
       )
         this.unindex(previous);
     }
-    this.index(id, peer, 'memory', update.content.slice(0, 800), now);
+    this.index(id, peer, 'memory', content.slice(0, 800), now);
   }
   addMemory(peer: string, update: MemoryUpdate, expectedVersion: number) {
     return this.transaction(() => {
@@ -754,7 +835,12 @@ export class Store {
         )
         .get(peer, id) as Row | undefined;
       if (!original) throw new Error('记忆不存在');
-      const msg = this.ingest(peer, randomUUID(), `[管理页更正] ${content}`).message;
+      // The correction is evidence in its own right, but it must not masquerade
+      // as a user message: `ingest` writes role='user' and refreshes
+      // last_user_at, which would reset the proactive silence clock and show
+      // up in history as if the user had said it.
+      const msg = this.ingest(peer, randomUUID(), `[管理页更正] ${content}`, [], Date.now(), 'system')
+        .message;
       const carried = {
         hits: Number(original.hits ?? 0),
         at: Number(original.last_hit_at ?? 0),
@@ -957,43 +1043,79 @@ export class Store {
           .map((r) => r as Row),
       );
     }
-    return [...new Map(rows.map((r) => [r.id, r])).values()]
+    // One query for every vector instead of a prepare+get per row: the result
+    // set reaches 2000 rows when vectors are on, and that used to be 2000
+    // round trips inside a reply.
+    const vectors = new Map<string, Float32Array>();
+    if (queryVector) {
+      const ids = [...new Set(rows.map((r) => String(r.id)))];
+      for (let i = 0; i < ids.length; i += 400) {
+        const slice = ids.slice(i, i + 400);
+        for (const row of this.sql
+          .prepare(
+            `SELECT id,vector FROM memory_embeddings WHERE id IN (${slice.map(() => '?').join(',')})`,
+          )
+          .all(...slice) as Row[]) {
+          const buf = row.vector as Buffer;
+          vectors.set(
+            String(row.id),
+            new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)),
+          );
+        }
+      }
+    }
+    const now = Date.now();
+    const scored = [...new Map(rows.map((r) => [r.id, r])).values()]
       .filter((r) => !kind || r.kind === kind)
       .map((r) => {
         const body = String(r.content).normalize('NFKC').toLowerCase();
-        const score = terms.reduce((n, t) => n + (body.includes(t) ? Math.min(t.length, 8) : 0), 0);
+        const lexical = terms.reduce((n, t) => n + (body.includes(t) ? Math.min(t.length, 8) : 0), 0);
+        const vector = vectors.get(String(r.id));
+        const semantic = queryVector && vector ? Math.max(0, cosineSimilarity(queryVector, vector)) : 0;
+        // Recency boost applies only to genuine matches: without the similarity
+        // floor a fresh-but-irrelevant row would outrank an old exact hit.
+        const ageDays = Math.max(0, now - Number(r.created_at)) / 86400000;
+        const boost =
+          semantic >= 0.35 || lexical > 0
+            ? 1 + 0.2 * Math.pow(0.5, ageDays / MEMORY_HALFLIFE_DAYS)
+            : 1;
+        const base = lexical + semantic * 4;
+        const kindBonus = lexical ? (r.kind === 'memory' ? 0.5 : r.kind === 'diary' ? 0.25 : 0) : 0;
         return {
-          ...r,
+          row: r,
           created_at: Number(r.created_at),
-          score: score + (score ? (r.kind === 'memory' ? 0.5 : r.kind === 'diary' ? 0.25 : 0) : 0),
-          vector: this.vectorOf(String(r.id)),
-        } as unknown as Row & { vector?: Float32Array };
-      })
-      .filter((r) => (r as { score: number }).score > 0 || (r as { vector?: Float32Array }).vector)
-      .map((r) => {
-        const row = r as Row & { vector?: Float32Array };
-        // Hybrid: lexical score leads; semantic similarity lifts paraphrases
-        // that share no surface form with the query.
-        const semantic = queryVector && row.vector
-          ? Math.max(0, cosineSimilarity(queryVector, row.vector))
-          : 0;
-        const score = (row.score as number) + semantic * 4;
-        return { ...row, score } as unknown as SearchHit;
+          score: (base + kindBonus) * boost,
+          vector,
+        };
       })
       .filter((r) => r.score > 0)
-      .sort((a, b) => b.score - a.score || b.created_at - a.created_at)
-      .slice(0, Math.max(1, Math.min(limit, 20)))
-      .map((hit) => this.describeHit(hit));
-  }
-  private vectorOf(id: string): Float32Array | undefined {
-    const row = this.sql
-      .prepare('SELECT vector FROM memory_embeddings WHERE id=?')
-      .get(id) as Row | undefined;
-    if (!row) return undefined;
-    const buf = row.vector as Buffer;
-    return new Float32Array(
-      buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
-    );
+      .sort((a, b) => b.score - a.score || b.created_at - a.created_at);
+    // MMR keeps the top-k from being one topic repeated: pick the best hit,
+    // then penalise candidates too similar to what is already chosen.
+    const picked: typeof scored = [];
+    const candidates = [...scored];
+    const cap = Math.max(1, Math.min(limit, 20));
+    while (picked.length < cap && candidates.length) {
+      let best = 0,
+        bestScore = -Infinity;
+      for (let i = 0; i < candidates.length; i++) {
+        const candidate = candidates[i]!;
+        let penalty = 0;
+        for (const chosen of picked) {
+          if (chosen.vector && candidate.vector)
+            penalty = Math.max(penalty, cosineSimilarity(chosen.vector, candidate.vector));
+          else if (chosen.row.content === candidate.row.content) penalty = 1;
+        }
+        // λ=0.7: relevance still leads, redundancy only breaks near-ties.
+        const value = 0.7 * candidate.score - 0.3 * penalty;
+        if (value > bestScore) {
+          bestScore = value;
+          best = i;
+        }
+      }
+      picked.push(candidates.splice(best, 1)[0]!);
+    }
+    return picked.map((p) => this.describeHit({ ...p.row, score: p.score } as unknown as SearchHit));
   }
   openLoops(peer: string, onlyOpen = false): OpenLoop[] {
     return this.sql
@@ -1014,6 +1136,22 @@ export class Store {
       .map((r) => ({ ...r, sources: parse(r.sources, []) }) as unknown as OpenLoop);
   }
   addOpenLoop(peer: string, input: OpenLoopInput, now = Date.now()): OpenLoop {
+    const content = input.content.slice(0, 300);
+    // The same plan is often re-extracted on the next turn ("我明天面试" comes
+    // up twice); storing it again would create duplicate reminders.
+    const existing = this.sql
+      .prepare(
+        "SELECT * FROM open_loops WHERE peer_id=? AND status='open' AND content=? AND ABS(due_at-?)<3600000 ORDER BY created_at LIMIT 1",
+      )
+      .get(peer, content, input.dueAt) as Row | undefined;
+    if (existing) {
+      // Same plan, maybe with a better due time or one more source: merge.
+      const sources = [...new Set([...parse<string[]>(existing.sources, []), ...input.sources])].slice(0, 10);
+      this.sql
+        .prepare('UPDATE open_loops SET due_at=?,due_text=?,sources=? WHERE id=?')
+        .run(input.dueAt, input.dueText ?? String(existing.due_text ?? ''), JSON.stringify(sources), String(existing.id));
+      return this.openLoops(peer).find((l) => l.id === String(existing.id))!;
+    }
     const id = randomUUID();
     this.sql
       .prepare(
@@ -1022,7 +1160,7 @@ export class Store {
       .run(
         id,
         peer,
-        input.content.slice(0, 300),
+        content,
         input.dueAt,
         input.dueText ?? '',
         JSON.stringify([...new Set(input.sources)].slice(0, 10)),
@@ -1032,7 +1170,9 @@ export class Store {
     return this.openLoops(peer).find((l) => l.id === id)!;
   }
   /** The user answered about this arrangement: close it quietly. Recurring
-   *  loops instead move to next year — a birthday never "resolves". */
+   *  loops instead move to next year — a birthday never "resolves". Because a
+   *  yearly loop rolls in place, `loopTaskKey` includes the new due date so a
+   *  fresh ping is not swallowed by the previous year's finished task. */
   resolveOpenLoop(peer: string, id: string, now = Date.now()) {
     const loop = this.sql
       .prepare("SELECT recurring,due_at FROM open_loops WHERE peer_id=? AND id=? AND status='open'")
@@ -1050,6 +1190,10 @@ export class Store {
         "UPDATE open_loops SET status='resolved',resolved_at=? WHERE peer_id=? AND id=? AND status='open'",
       )
       .run(now, peer, id);
+  }
+  /** Dedupe key for a loop ping; the due date makes each yearly roll distinct. */
+  loopTaskKey(loop: { id: string; due_at: number }): string {
+    return `loop:${loop.id}:${loop.due_at}`;
   }
   markLoopAsked(peer: string, id: string, now = Date.now()) {
     this.sql
@@ -1075,7 +1219,9 @@ export class Store {
       Math.abs(v) * Math.pow(0.5, Math.max(0, Date.now() - at) / (halflifeHours * 3600000));
     return {
       valence: decay(raw.valence, MOOD_VALENCE_HALFLIFE_HOURS) * Math.sign(raw.valence),
-      energy: decay(raw.energy, MOOD_ENERGY_HALFLIFE_HOURS),
+      // Energy is bipolar too: a tired pulse must stay negative, otherwise the
+      // prose hint flips "有点累了" into "精力挺足".
+      energy: decay(raw.energy, MOOD_ENERGY_HALFLIFE_HOURS) * Math.sign(raw.energy),
       reason: typeof raw.reason === 'string' ? raw.reason : undefined,
       at,
     };
@@ -1097,10 +1243,11 @@ export class Store {
     peer: string,
     exchange: { user: string; assistant: string; userAt: number },
     now = Date.now(),
+    timeZone = 'Asia/Shanghai',
   ) {
     const hour = Number(
       new Intl.DateTimeFormat('en-GB', {
-        timeZone: 'Asia/Shanghai',
+        timeZone,
         hour: '2-digit',
         hourCycle: 'h23',
       }).format(new Date(exchange.userAt)),
@@ -1116,7 +1263,7 @@ export class Store {
       valence = -0.3;
       reason = '对方提到了不开心的事';
       energy = -0.2;
-    } else if (/(晚安|睡了)/.test(exchange.user) || hour >= 1 || hour < 7) {
+    } else if (/(晚安|睡了)/.test(exchange.user) || (hour >= 1 && hour < 7)) {
       energy = -0.15;
     } else if (exchange.user.length > 80 && exchange.assistant.length > 80) {
       energy = 0.1;
@@ -1141,9 +1288,24 @@ export class Store {
     for (const row of rows) buckets[Number(formatter.format(new Date(Number(row.created_at))))]++;
     return buckets;
   }
+  /** Opening lines of proactive messages since `since`, newest first. Used to
+   *  keep the same hook from resurfacing two days in a row. */
+  proactiveHooks(peer: string, since: number): string[] {
+    return (
+      this.sql
+        .prepare(
+          `SELECT m.content FROM outbox o JOIN messages m ON m.id=o.id
+           WHERE o.peer_id=? AND o.status='sent' AND m.created_at>=?
+             AND o.task_id IN (SELECT id FROM tasks WHERE kind='proactive')
+           ORDER BY m.created_at DESC LIMIT 12`,
+        )
+        .all(peer, since) as Row[]
+    )
+      .map((r) => String(r.content).replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+  }
   /** Proactive brake: pings sent after the last user message got no reply. */
-  unansweredProactiveStreak(peer: string): number {
-    const lastUser = this.sql
+  unansweredProactiveStreak(peer: string): number {    const lastUser = this.sql
       .prepare("SELECT created_at FROM messages WHERE peer_id=? AND role='user' AND status='received' ORDER BY seq DESC LIMIT 1")
       .get(peer) as Row | undefined;
     const lastUserAt = lastUser ? Number(lastUser.created_at) : 0;

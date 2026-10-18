@@ -57,5 +57,7 @@ export const OPEN_LOOP_EXPIRE_DAYS = 7;
 export const OPEN_LOOP_PROMPT_MAX = 5;
 /** Rhythm hint: minimum hourly messages before a bucket counts as habitual. */
 export const RHYTHM_MIN_BUCKET = 3;
+/** How many busiest hours to describe when a user has no clear routine. */
+export const RHYTHM_PEAK_BUCKETS = 6;
 /** Embedding refresh: batch size per backfill pass. */
 export const EMBED_BACKFILL_BATCH = 64;
