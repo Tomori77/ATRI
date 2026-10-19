@@ -125,8 +125,16 @@ export class Settings {
       writeFileSync(passwordFile, this.adminPassword + '\n', { mode: 0o600, flag: 'wx' });
     }
     if (this.adminPassword.length < 12) throw new Error('ADMIN_PASSWORD 至少需要 12 个字符');
+    // Fail at startup, not on the first reply: an invalid TZ from the env only
+    // surfaced when a formatter first touched it, which crashed every turn
+    // with a stack trace instead of a readable message.
+    new Intl.DateTimeFormat('zh-CN', { timeZone: this.config().timeZone }).format();
   }
   config(): SavedConfig {
+    // The pump reads config every 300ms and proactiveGate twice per call;
+    // hitting SQLite plus JSON.parse each time is pure waste. The cache
+    // invalidates on every write (the only mutation path).
+    if (this.configCache) return this.configCache;
     const env = this.env;
     const defaults: SavedConfig = {
       baseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
@@ -160,8 +168,15 @@ export class Settings {
       maxConcurrentPeers: 3,
       debounceMs: 800,
     };
-    return { ...defaults, ...this.store.getSetting<Partial<SavedConfig>>('config', {}) };
+    // Unknown keys from older versions are dropped, not merged forever.
+    const stored = this.store.getSetting<Partial<SavedConfig>>('config', {});
+    const merged = { ...defaults } as Record<string, unknown>;
+    for (const key of Object.keys(defaults) as (keyof SavedConfig)[])
+      if (stored[key] !== undefined) merged[key] = stored[key];
+    this.configCache = merged as unknown as SavedConfig;
+    return this.configCache;
   }
+  private configCache: SavedConfig | null = null;
   publicConfig() {
     const { apiKey, tavilyKey, embeddingApiKey, ...rest } = this.config();
     return {
@@ -284,6 +299,7 @@ export class Settings {
       next.debounceMs = n;
     }
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timeZone }).format();
+    this.configCache = null;
     this.store.setSetting('config', next);
     return this.publicConfig();
   }

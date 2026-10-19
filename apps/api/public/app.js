@@ -41,6 +41,7 @@ let authenticated = false,
   noticeTimer,
   settingsVersion = 0,
   polling = false,
+  issuesSnapshot = '',
   chatSnapshot = '',
   journalSnapshot = '',
   peersSnapshot = '',
@@ -118,6 +119,33 @@ function confirmButton(label, message, handler, classes = 'ghost small danger') 
     await handler();
   }, classes);
   return node;
+}
+
+/** Arm-to-confirm for a static button: replaces its onclick so the handler
+ *  only fires on the second tap (within 3s of the first). */
+function decorateConfirm(node, message) {
+  if (!node) return;
+  const label = node.textContent;
+  const inner = node.onclick;
+  node.onclick = (event) => {
+    if (node.dataset.armed === '1') {
+      node.dataset.armed = '';
+      node.textContent = label;
+      node.classList.remove('armed');
+      inner?.call(node, event);
+      return;
+    }
+    node.dataset.armed = '1';
+    node.textContent = message;
+    node.classList.add('armed');
+    setTimeout(() => {
+      if (node.dataset.armed === '1') {
+        node.dataset.armed = '';
+        node.textContent = label;
+        node.classList.remove('armed');
+      }
+    }, 3000);
+  };
 }
 
 const openDropdowns = new Set();
@@ -291,17 +319,46 @@ function dayLabel(ts) {
   );
 }
 
+let lastDrawerOpener = null;
 function openDrawer(id) {
+  lastDrawerOpener = document.activeElement;
   closeDrawers();
-  $(id).hidden = false;
   const backdrop = $(id);
+  backdrop.hidden = false;
   backdrop.onclick = (event) => {
     if (event.target === backdrop) backdrop.hidden = true;
   };
+  // Keyboard users used to land outside the dialog: focus its first control
+  // and keep Tab cycling inside while it is open.
+  const focusable = backdrop.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  );
+  (focusable[1] ?? focusable[0])?.focus();
 }
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Tab') return;
+  const open = ['drawer-connection', 'drawer-issues'].map((id) => $(id)).find((d) => !d.hidden);
+  if (!open) return;
+  const focusable = [...open.querySelectorAll('button, [href], input, select, textarea')].filter(
+    (n) => !n.disabled && n.offsetParent !== null,
+  );
+  if (!focusable.length) return;
+  const first = focusable[0],
+    last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
 function closeDrawers() {
   for (const id of ['drawer-connection', 'drawer-issues']) $(id).hidden = true;
+  // Return focus to whatever opened the drawer, or keyboards get lost behind it.
+  if (lastDrawerOpener?.isConnected) lastDrawerOpener.focus();
+  lastDrawerOpener = null;
 }
 
 document.querySelectorAll('[data-drawer]').forEach((b) => {
@@ -317,6 +374,57 @@ document.querySelectorAll('[data-close]').forEach((b) => {
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawers();
 });
+
+function renderIssues(state) {
+  const issues = $('issues');
+  issues.replaceChildren();
+  for (const task of state.issues.tasks) {
+    const row = el('div', undefined, 'card');
+    row.append(
+      el('p', task.address + ' · ' + task.kind + '：' + task.error),
+      button('重试任务', async () => {
+        await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
+        issuesSnapshot = '';
+        await loadStatus();
+      }),
+    );
+    issues.append(row);
+  }
+  for (const delivery of state.issues.deliveries) {
+    const row = el('div', undefined, 'card');
+    row.append(
+      el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
+      el('p', delivery.content),
+      el(
+        'p',
+        (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
+        'hint',
+      ),
+    );
+    const actions = el('div', undefined, 'actions');
+    for (const [label, action] of [
+      ['已在微信收到', 'confirmed'],
+      ['跳过', 'skip'],
+    ])
+      actions.append(
+        button(label, async () => {
+          await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
+          issuesSnapshot = '';
+          await loadStatus();
+        }),
+      );
+    // Two-step resend: first tap explains and arms, second tap actually
+    // requeues — the old button was a dead end that only showed a hint.
+    actions.append(confirmButton('重新发送', '确认重发？', async () => {
+      await api('/api/deliveries/' + enc(delivery.id), 'POST', { action: 'retry' });
+      issuesSnapshot = '';
+      await loadStatus();
+    }));
+    row.append(actions);
+    issues.append(row);
+  }
+  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。一切正常。');
+}
 
 async function loadStatus() {
   const state = await api('/api/status');
@@ -340,51 +448,17 @@ async function loadStatus() {
   bell.textContent = issueCount > 99 ? '99+' : String(issueCount);
   bell.hidden = issueCount === 0;
 
-  const issues = $('issues');
-  issues.replaceChildren();
-  for (const task of state.issues.tasks) {
-    const row = el('div', undefined, 'card');
-    row.append(
-      el('p', task.address + ' · ' + task.kind + '：' + task.error),
-      button('重试任务', async () => {
-        await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
-        await loadStatus();
-      }),
-    );
-    issues.append(row);
+  // Snapshot guard: the issues list re-rendered every 2.5s poll, so the button
+  // a user was aiming at vanished mid-click. Rebuild only when the serialized
+  // content actually changed (same pattern the chat/journal views use).
+  const issuesSignature = JSON.stringify([
+    state.issues.tasks.map((t) => [t.id, t.error]),
+    state.issues.deliveries.map((d) => [d.id, d.status, d.error]),
+  ]);
+  if (issuesSignature !== issuesSnapshot) {
+    issuesSnapshot = issuesSignature;
+    renderIssues(state);
   }
-  for (const delivery of state.issues.deliveries) {
-    const row = el('div', undefined, 'card');
-    row.append(
-      el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
-      el('p', delivery.content),
-      el(
-        'p',
-        (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
-        'hint',
-      ),
-    );
-    const actions = el('div', undefined, 'actions');
-    for (const [label, action] of [
-      ['已在微信收到', 'confirmed'],
-      ['重新发送', 'retry'],
-      ['跳过', 'skip'],
-    ])
-      actions.append(
-        button(label, async () => {
-          if (action === 'retry') {
-            show('请先确认微信里没有收到这条消息，再选择重新发送。', true);
-            return;
-          }
-          await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
-          await loadStatus();
-        }),
-      );
-    row.append(actions);
-    issues.append(row);
-  }
-  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。一切正常。');
-
   const stuckPeers = new Set(state.issues.deliveries.map((d) => d.peer_id));
   const states = $('peer-states');
   states.replaceChildren();
@@ -1171,12 +1245,22 @@ function renderSandbox(state) {
   const kb = (state.usage.bytes / 1024).toFixed(1);
   const limit = state.sizeLimitBytes ? state.sizeLimitBytes / 1024 / 1024 + ' MB' : '不限制';
   const mem = state.memoryLimitMb ? state.memoryLimitMb + ' MB' : '不限制';
-  $('sandbox-status').textContent =
-    (state.enabled ? '已开启' : '已关闭') +
-    ' · ' + state.usage.files + ' 个文件 / ' + kb + ' KB' +
-    ' · 上限 ' + limit +
-    ' · 内存 ' + mem +
-    ' · ' + (state.isolation ? state.isolation.network : '');
+  // Labeled chips instead of one long "·"-joined sentence: the old single line
+  // wrapped arbitrarily at any character on narrow screens.
+  const chips = [
+    ['状态', state.enabled ? '已开启' : '已关闭'],
+    ['文件', state.usage.files + ' 个 / ' + kb + ' KB'],
+    ['大小上限', limit],
+    ['内存上限', mem],
+  ];
+  if (state.isolation?.network) chips.push(['网络', state.isolation.network]);
+  $('sandbox-status').replaceChildren(
+    ...chips.map(([label, value]) => {
+      const chip = el('span', undefined, 'status-chip');
+      chip.append(el('span', label, 'status-chip-label'), el('span', value, 'status-chip-value'));
+      return chip;
+    }),
+  );
 }
 $('refresh-sandbox').onclick = () =>
   perform(async () => renderSandbox(await api('/api/sandbox')), $('refresh-sandbox'));
@@ -1186,6 +1270,9 @@ $('clear-sandbox').onclick = () =>
     renderSandbox(await api('/api/sandbox'));
     show('沙箱目录已清空。');
   }, $('clear-sandbox'));
+// Destructive: stage it behind the same arm-to-confirm the journal uses, so a
+// mis-tap next to 刷新状态 cannot wipe the directory.
+decorateConfirm($('clear-sandbox'), '确认清空？');
 
 for (const [id, field] of [
   ['clear-api-key', 'clearApiKey'],
@@ -1255,6 +1342,7 @@ $('wechat-logout').onclick = () =>
     await api('/api/wechat/logout', 'POST');
     await loadStatus();
   }, $('wechat-logout'));
+decorateConfirm($('wechat-logout'), '确认断开？');
 
 $('login-form').onsubmit = (event) => {
   event.preventDefault();
@@ -1371,12 +1459,25 @@ async function enter() {
   await selectTab(currentTab);
 }
 
+let pollFailures = 0;
 setInterval(async () => {
   if (!authenticated || document.hidden || polling) return;
+  // A short server hiccup used to re-show the error toast every tick (each
+  // show() reset the 12s timer, so the toast never went away). Back off and
+  // only re-toast after a run of consecutive failures.
+  if (pollFailures >= 3) {
+    pollFailures++;
+    if (pollFailures === 8) {
+      pollFailures = 0;
+      show('服务器连续无响应，仍在自动重试。', true);
+    }
+    return;
+  }
   polling = true;
   try {
     await perform(async () => {
       const state = await loadStatus();
+      pollFailures = 0;
       if (lastTask) {
         const task = await api('/api/tasks/' + enc(lastTask));
         if (task.state === 'failed') {
@@ -1392,6 +1493,8 @@ setInterval(async () => {
       if ($('drawer-connection').hidden === false) await loadPeers();
       return state;
     });
+  } catch {
+    pollFailures++;
   } finally {
     polling = false;
   }

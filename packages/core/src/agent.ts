@@ -57,6 +57,10 @@ export interface AgentOptions {
   images?: (message: Message) => Promise<string[]>;
   /** Optional semantic search support; when absent, search stays lexical. */
   embedQuery?: (query: string) => Promise<Float32Array | undefined>;
+  /** Name of the embedding model behind embedQuery, so stored vectors from a
+   *  different model are excluded from semantic recall instead of being
+   *  cosine-compared into plausible-looking garbage. */
+  embeddingModel?: () => string;
   /** Optional operator-controlled code sandbox. When absent, or when it reports
    *  itself disabled, its tools are neither advertised nor dispatchable. */
   sandbox?: SandboxTools;
@@ -187,7 +191,8 @@ export function renderTimeGap(now: number, lastAt: number, timeZone: string): st
   const minutes = Math.floor(gapMs / 60000);
   const moment = `现在是${momentFormatter(timeZone).format(new Date(now))}`;
   if (gapMs < SILENCE_NOTIFY_MINUTES * 60000)
-    return `${moment}（距上一条消息不到 ${Math.max(1, minutes)} 分钟，是连续聊天）`;
+    // Ceiling, not floor: an actual gap of 29.5 minutes is not "不到 29 分钟".
+    return `${moment}（距上一条消息不到 ${Math.max(1, minutes) + (gapMs % 60000 > 0 ? 1 : 0)} 分钟，是连续聊天）`;
   if (gapMs < 24 * 3600000) {
     const hours = Math.floor(gapMs / 3600000);
     const text = hours >= 1 ? `${hours} 小时` : `${minutes} 分钟`;
@@ -195,8 +200,25 @@ export function renderTimeGap(now: number, lastAt: number, timeZone: string): st
       gapMs >= SILENCE_HOURS_THRESHOLD * 3600000 ? '，中间有一段明显的空白' : '';
     return `${moment}（距上一条消息约 ${text}${note}）`;
   }
-  const days = Math.floor(gapMs / 86400000);
+  // Calendar days, not 24h blocks: Mon 23:00 → Wed 00:30 should read as
+  // "隔了两天" — what a person would say — not "已有 1 天".
+  const days = Math.max(1, calendarDays(lastAt, now, timeZone));
   return `${moment}（距上一条消息已有 ${days} 天，中间没有聊过天）`;
+}
+const dayDiffFormatters = new Map<string, Intl.DateTimeFormat>();
+function calendarDays(from: number, to: number, timeZone: string): number {
+  let formatter = dayDiffFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    dayDiffFormatters.set(timeZone, formatter);
+  }
+  const day = (at: number) => Date.parse(formatter!.format(new Date(at)) + 'T00:00:00Z');
+  return Math.round((day(to) - day(from)) / 86400000);
 }
 export interface RecentStickerUse {
   slug: string;
@@ -235,25 +257,23 @@ export function recentStickerUse(
 export function renderMood(
   mood: { valence: number; energy: number; reason?: string; at: number },
   now: number,
-  timeZone: string,
 ): string {
   if (!mood.at) return '';
   // Neutral in either axis is fine; the guard used to require both, which
   // hid a tired-but-cheerful state behind the energy sign fix.
   if (Math.abs(mood.valence) < 0.05 && Math.abs(mood.energy) < 0.05) return '';
   const hours = (now - mood.at) / 3600000;
+  // Staleness applies to any state: "有点累了" left over from three nights ago
+  // must not read as current tiredness.
   const since =
-    hours >= 1
-      ? `，那是 ${Math.floor(hours)} 小时前留下的`
-      : '';
+    hours >= 1 ? `（这是 ${Math.floor(hours)} 小时前的状态，可能已经变了）` : '';
   const parts: string[] = [];
   if (mood.valence >= 0.3) parts.push('心情还不错，会更想分享');
-  else if (mood.valence <= -0.3)
-    parts.push(`心情还有些低落${mood.reason ? `（因为${mood.reason}）` : ''}${since}`);
+  else if (mood.valence <= -0.3) parts.push(`心情还有些低落${mood.reason ? `（因为${mood.reason}）` : ''}`);
   else if (mood.valence <= -0.12) parts.push('情绪平平，略有点提不起劲');
   if (mood.energy <= -0.3) parts.push('有点累了，语气可以短一些');
   else if (mood.energy >= 0.3) parts.push('精力挺足');
-  return parts.length ? `你当前的状态：${parts.join('；')}。这影响语气，但不要主动报数值。` : '';
+  return parts.length ? `你当前的状态：${parts.join('；')}${since}。这影响语气，但不要主动报数值。` : '';
 }
 /** Habitual active hours of the user, as a short prose hint. */
 export function renderRhythm(buckets: number[], hour: number): string {
@@ -306,8 +326,7 @@ export function renderOpenLoops(
       return `- [id:${l.id}] ${l.content}（约定时间：${l.due_text || due}${l.recurring === 'yearly' ? '，每年循环' : ''}）`;
     })
     .join('\n')}\nresolveLoops/askedLoops/openLoops 的字段用法见上方对话规则。当前时间戳：${now}。`;
-}
-/** Rotate the sticker window so the tail of the catalog is reachable: the
+}/** Rotate the sticker window so the tail of the catalog is reachable: the
  *  window steps by day, minus stickers used in the last few turns. */
 export function rotateStickers(
   all: Sticker[],
@@ -355,9 +374,16 @@ export function renderHits(
   const formatter = sourceFormatter(timeZone);
   return hits
     .map((h) => {
+      // `system` rows are operator corrections entered from the admin UI —
+      // rendering them as "你说" put words in her mouth when a correction
+      // was later recalled.
       const who =
         h.kind === 'message'
-          ? (h.role === 'user' ? '对方' : '你') + '说'
+          ? h.role === 'user'
+            ? '对方说'
+            : h.role === 'system'
+              ? '设定更正'
+              : '你说'
           : h.kind === 'memory'
             ? '记忆'
             : '日记';
@@ -425,7 +451,7 @@ export class Agent {
       queryVector = undefined;
     }
     const recalled = store
-      .search(peer.id, query, RECALL_HITS, undefined, queryVector)
+      .search(peer.id, query, RECALL_HITS, undefined, queryVector, this.o.embeddingModel?.() ?? '')
       .map((h) => ({ ...h, content: h.content.slice(0, RECALL_CONTENT_MAX_CHARS) }));
     const rawMemories = store.rankedMemories(peer.id, PROMPT_MEMORIES);
     // Memories whose content already surfaced via recall would appear twice in
@@ -471,7 +497,7 @@ export class Agent {
     const dynamic = [
       timeLine,
       `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
-      renderMood(mood, now, this.o.timeZone()),
+      renderMood(mood, now),
       renderRhythm(rhythm, currentHour),
       renderOpenLoops(openLoops, now, this.o.timeZone()),
       recentStickers.length
@@ -570,9 +596,10 @@ export class Agent {
   async reply(task: Task, parentSignal?: AbortSignal): Promise<ParsedReply> {
     const { store } = this.o;
     const peer = store.peer(task.peer_id)!;
-    const signal = parentSignal
-      ? AbortSignal.any([parentSignal, AbortSignal.timeout(this.o.turnTimeoutMs())])
-      : AbortSignal.timeout(this.o.turnTimeoutMs());
+    // The caller (Runtime.work) already owns the turn-timeout signal; building
+    // a second timeout here only added a redundant timer with the same deadline.
+    const signal =
+      parentSignal ?? AbortSignal.timeout(this.o.turnTimeoutMs());
     const now = Date.now();
     const through =
       typeof task.payload.through === 'number' ? task.payload.through : Number.MAX_SAFE_INTEGER;
@@ -802,7 +829,7 @@ export class Agent {
       } catch {
         queryVector = undefined;
       }
-      hits = store.search(peer, query, 8, kind, queryVector);
+      hits = store.search(peer, query, 8, kind, queryVector, this.o.embeddingModel?.() ?? '');
       if (kind === 'memory' && hits.length) store.markMemoriesUsed(peer, hits.map((h) => h.id));
     } else if (name === 'read_history') {
       if (!Array.isArray(args.ids)) throw new Error('请提供来源 ID 数组');

@@ -78,8 +78,10 @@ export function createServer(o: ServerOptions) {
   });
   app.setErrorHandler((error, request, reply) => {
     const e = error as Error & { statusCode?: number };
+    // 业务校验抛的是普通 Error，约定回 400；框架自身错误（解析失败、404）
+    // 自带 statusCode 会原样透传，不会被这里覆盖。
     reply
-      .code(e.statusCode && e.statusCode >= 400 && e.statusCode < 500 ? e.statusCode : 400)
+      .code(e.statusCode && e.statusCode >= 400 && e.statusCode < 600 ? e.statusCode : 400)
       .send({ error: e.message.slice(0, 300) });
   });
   app.get('/healthz', () => ({ ok: true }));
@@ -328,12 +330,11 @@ export function createServer(o: ServerOptions) {
       model: e.model,
     };
   });
-  app.get('/api/peers', () => {
-    // 试聊 uses the preview peer, so it must exist for persona binding even
-    // before the first message.
-    o.store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
-    return o.store.peers().map(({ context_token, ...peer }) => peer);
-  });
+  app.get('/api/peers', () =>
+    // ensurePeer once at startup instead of on every GET: a read endpoint that
+    // writes on each call also gave DNS-rebinding probes a free DB write.
+    o.store.peers().map(({ context_token, ...peer }) => peer),
+  );
   app.put<{ Params: { id: string }; Body: { approved: boolean } }>('/api/peers/:id', (request) => {
     if (typeof request.body.approved !== 'boolean' || !o.store.peer(request.params.id))
       throw new Error('联系人或设置无效');
@@ -422,6 +423,8 @@ export function createServer(o: ServerOptions) {
       return { ok: true };
     },
   );
+  // 试聊 uses the preview peer; created once at startup so GET /api/peers
+  // never needs to write, and re-ensured here (cheap upsert) before a chat.
   app.post<{ Body: { content: string; eventId?: string } }>('/api/chat', (request, reply) => {
     const peer = o.store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
     const event = o.runtime.accept(
@@ -447,17 +450,19 @@ export function createServer(o: ServerOptions) {
   app.post<{ Params: { id: string }; Body: { action: string } }>(
     '/api/deliveries/:id',
     (request) => {
-      const issue = o.store.issues().deliveries.find((d) => d.id === request.params.id);
-      if (!issue) throw new Error('待处理的发送记录不存在');
+      // Look the delivery up directly: issues() caps at 100 rows, so anything
+      // older was reported as "不存在" exactly when it was blocking a peer.
+      if (
+        !['confirmed', 'retry', 'skip'].includes(String(request.body?.action)) ||
+        !o.store.deliveryById(request.params.id)
+      )
+        throw new Error('待处理的发送记录不存在');
       const status =
         request.body.action === 'confirmed'
           ? 'sent'
           : request.body.action === 'retry'
             ? 'pending'
-            : request.body.action === 'skip'
-              ? 'cancelled'
-              : null;
-      if (!status) throw new Error('处理方式无效');
+            : 'cancelled';
       o.store.markDelivery(request.params.id, status);
       o.runtime.pump();
       return { ok: true };

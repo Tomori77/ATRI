@@ -25,6 +25,7 @@ const sandbox = new Sandbox(resolve(dataDir, '..', 'sandbox'), {
   // cgroup-backed limit would require --cgroupns=host on the host, which would
   // break the "just docker compose up" promise. 0 = unlimited.
   memoryLimitMb: () => settings.config().sandboxMemoryMb,
+  timeZone: () => settings.config().timeZone,
 });
 /** The runtime treats `enabled` as a hard off switch, separate from creds. */
 const embedder = {
@@ -60,8 +61,12 @@ const runtime = new Runtime({
     const [vector] = await embeddings.embed([query]);
     return vector && vector.some((v) => v !== 0) ? vector : undefined;
   },
+  embeddingModel: () => settings.embedding().model,
 });
 const app = createServer({ store, settings, stickers, bridge, runtime, sandbox });
+// The 试聊 preview peer must exist before the admin UI lists contacts, so the
+// contacts GET stays write-free.
+store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
@@ -69,6 +74,7 @@ async function shutdown() {
   bridge.stop();
   await runtime.stop();
   await app.close();
+  sandbox.dispose();
   store.close();
   process.exit(0);
 }

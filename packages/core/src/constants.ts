@@ -26,7 +26,6 @@ export const TOOL_RESULT_BUDGET_TOKENS = 6000;
 export const MAX_REPLY_PARTS = 6;
 export const MAX_MEMORY_UPDATES = 6;
 export const MAX_IMAGE_DESCRIPTIONS = 4;
-export const MAX_IMAGES_PER_TURN = 2;
 /** Notes (topic summary) token cap inside prompts. */
 export const NOTES_MAX_TOKENS = 1500;
 /** Notes trigger: recent window length and its share of the input budget. */

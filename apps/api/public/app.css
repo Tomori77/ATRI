@@ -1,4 +1,4 @@
-/* ATRI 控制台 · 暗色优先的陪伴式界面 */
+/* ATRI 控制台 · 奶油底色的陪伴式界面（浅色主题） */
 
 * {
   box-sizing: border-box;
@@ -302,10 +302,6 @@ svg {
   padding: 20px 22px 32px;
 }
 
-.view[hidden] {
-  display: none;
-}
-
 /* ---------- 通用组件 ---------- */
 
 .btn {
@@ -388,10 +384,6 @@ svg {
   color: var(--text-dim);
 }
 
-.stack > .card {
-  margin-bottom: 14px;
-}
-
 .stack-tight > .row {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
@@ -452,9 +444,34 @@ svg {
 
 .hint {
   margin: 0;
-  color: var(--text-faint);
+  /* --text-faint measured ~2.5:1 on the cream background — under half the
+     WCAG AA minimum for this size. --text-dim passes. */
+  color: var(--text-dim);
   font-size: 12.5px;
   overflow-wrap: anywhere;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 2px 8px 2px 0;
+  padding: 3px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.status-chip-label {
+  color: var(--text-dim);
+  flex: none;
+}
+
+.status-chip-value {
+  color: var(--text);
+  font-weight: 500;
 }
 
 .hint.alert-text {
@@ -487,7 +504,6 @@ svg {
 }
 
 .field input,
-.field select,
 .field textarea,
 .dropdown-host .dropdown-toggle {
   width: 100%;
@@ -501,11 +517,25 @@ svg {
 }
 
 .field input:focus,
-.field select:focus,
 .field textarea:focus,
 .dropdown-host .dropdown-toggle:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* Mouse clicks keep the quiet border treatment; keyboard focus still gets the
+   global visible outline, matching the rest of the console. */
+.field input:focus:not(:focus-visible),
+.field textarea:focus:not(:focus-visible),
+.dropdown-host .dropdown-toggle:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible,
+.dropdown-host .dropdown-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .field textarea {
@@ -1098,7 +1128,6 @@ svg {
   gap: 12px;
 }
 
-.persona-editor.grow,
 .persona-editor .field.grow textarea {
   min-height: 320px;
 }
@@ -1181,6 +1210,15 @@ svg {
 
   .settings-submit {
     grid-column: 1 / -1;
+  }
+}
+
+/* Between the mobile breakpoint and a comfortable desktop width, the left
+   settings column shrinks to ~500px and a three-column grid wrapped long
+   Chinese labels onto every line. Two columns read fine down to ~400px. */
+@media (min-width: 961px) and (max-width: 1200px) {
+  .grid-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -1579,6 +1617,36 @@ dialog .row {
 
   .field-with-action .btn {
     margin-bottom: 0;
+  }
+
+  /* iOS zooms any input under 16px on focus, blowing out the whole layout.
+     16px is the documented threshold. */
+  .field input,
+  .field textarea,
+  .dropdown-host .dropdown-toggle,
+  .composer textarea,
+  .model-filter {
+    font-size: 16px;
+  }
+
+  /* Row-level small buttons were ~30px tall — under half the recommended
+     touch target. Bubble delete gets a padded hit area instead of a bigger
+     visible glyph. */
+  .btn.small {
+    padding: 9px 14px;
+    font-size: 13px;
+  }
+
+  .bubble-del {
+    padding: 8px;
+  }
+
+  .pill {
+    padding: 7px 13px;
+  }
+
+  .settings-submit .btn {
+    width: 100%;
   }
 
   .drawer-backdrop {

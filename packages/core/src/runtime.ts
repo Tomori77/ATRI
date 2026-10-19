@@ -72,6 +72,15 @@ export function dayAt(at: number, timeZone: string): string {
 function hourAt(at: number, timeZone: string) {
   return Number(hourFormatter(timeZone).format(new Date(at)));
 }
+/** Retry backoff for failed non-chat tasks: 1 min, 2, 4, 8… capped at 30 min.
+ *  attempt 1 is the first failure, so the Nth failure waits 2^(N-1) minutes. */
+export function taskBackoffMs(attempts: number): number {
+  return Math.min(30, 2 ** Math.max(0, attempts - 1)) * 60000;
+}
+/** A user→assistant pair wider than this is not a conversation exchange; the
+ *  assistant message is a proactive ping answering silence, so the rule-based
+ *  mood pulse must not read the old user message as fresh evidence. */
+const REPLY_PAIR_WINDOW_MS = 30 * 60000;
 export function inQuietHours(hour: number, start: number, end: number) {
   return start === end
     ? false
@@ -147,6 +156,14 @@ export class Runtime {
     try {
       for (const peer of this.store.peers()) {
         if (this.stopped) return;
+        // A switched embedding model leaves the old vectors in place: they
+        // would never refresh (pendingEmbeddings only sees rows without any
+        // vector) and are not comparable with new query vectors. Drop them so
+        // the normal backfill re-embeds everything with the current model.
+        for (const stale of this.store.staleEmbeddingModels(peer.id, embedder.model)) {
+          this.store.dropEmbeddingsOfModel(stale);
+          this.options.log?.('检测到向量模型更换，已清理旧向量', { from: stale, to: embedder.model });
+        }
         for (;;) {
           const pending = this.store.pendingEmbeddings(peer.id, quick ? EMBED_BACKFILL_BATCH : 512);
           if (!pending.length) break;
@@ -246,9 +263,11 @@ export class Runtime {
             );
             return;
           }
-          if (delivery !== deliveries.at(-1)) {
+          if (delivery !== own.at(-1)) {
             // Human-like pacing: longer bubbles get longer pauses, never a
             // machine-gun burst. Capped so a batch still sends promptly.
+            // Compared against `own`, not the whole pending list: another
+            // task queued behind this one must not add a pointless pause.
             const next = own[own.indexOf(delivery) + 1];
             const chars = next?.part.type === 'text' ? (next.part.text?.length ?? 0) : 6;
             await new Promise((r) =>
@@ -285,7 +304,12 @@ export class Runtime {
             !isGreeting &&
             !this.proactiveGate(task, peer, Date.now())
           ) {
-            this.store.finish(task.id);
+            // superseded, not done: the usual veto reason is that jitter pushed
+            // run_at into quiet hours (or the daily quota was consumed by a
+            // racing ping). `done` would burn that dedupe key for the whole
+            // day/loop period; `superseded` lets the next scheduler tick
+            // re-enqueue and try again inside the remaining window.
+            this.store.finish(task.id, 'superseded');
             continue;
           }
           const typing = this.options.transport.typing?.(peer, true).catch(() => {});
@@ -327,6 +351,12 @@ export class Runtime {
         } else {
           this.store.finish(task.id, 'failed', error instanceof Error ? error.message : '任务失败');
           this.options.log?.('任务失败', { task: task.id, kind: task.kind, error: String(error) });
+          // Backoff, not an immediate re-queue: a systematically failing task
+          // (bad model output, persona over budget) must not burn one LLM call
+          // per scheduler minute. state stays 'failed' so issues() keeps listing
+          // it and a newer user reply can still supersede it; manual retry via
+          // /api/tasks/:id/retry resets run_at to now and re-queues.
+          this.store.deferFailed(task.id, taskBackoffMs(task.attempts));
         }
       }
     }
@@ -341,14 +371,18 @@ export class Runtime {
     if (!updates.length || !embedder || embedder.enabled === false || !embedder.configured) return;
     const memories = this.store.embeddings(peer).filter((e) => e.kind === 'memory');
     if (!memories.length) return;
-    for (const update of updates) {
-      if (update.content.trim().length < 4) continue;
-      let vector: Float32Array | undefined;
-      try {
-        [vector] = await embedder.embed([update.content], signal);
-      } catch {
-        continue;
-      }
+    // One batched call instead of one HTTP round trip per update: this ran
+    // before saveReply, so every serial embed was added to the visible reply
+    // latency.
+    const contents = updates.map((u) => u.content.trim());
+    let vectors: (Float32Array | undefined)[];
+    try {
+      vectors = await embedder.embed(contents, signal);
+    } catch {
+      return;
+    }
+    for (let i = 0; i < updates.length; i++) {
+      const vector = vectors[i];
       if (!vector?.some((v) => v !== 0)) continue;
       let bestId = '',
         bestSim = 0;
@@ -361,8 +395,8 @@ export class Runtime {
         }
       }
       if (bestSim >= SIMILARITY_SUPERSEDE) {
-        const superseded = new Set([...(update.supersedes ?? []), bestId]);
-        update.supersedes = [...superseded].slice(0, 12);
+        const superseded = new Set([...(updates[i].supersedes ?? []), bestId]);
+        updates[i].supersedes = [...superseded].slice(0, 12);
       }
     }
   }
@@ -417,7 +451,16 @@ export class Runtime {
     const recent = this.store.history(peerId, 2);
     const user = [...recent].reverse().find((m) => m.role === 'user');
     const assistant = [...recent].reverse().find((m) => m.role === 'assistant');
-    if (user && assistant && user.created_at <= assistant.created_at)
+    // Only a genuine exchange pulses: the user message must be inside the reply
+    // window before the assistant turn. Without this guard, a proactive ping
+    // paired itself with a days-old user message and re-injected the same stale
+    // mood (last week's "好累") on every ping.
+    if (
+      user &&
+      assistant &&
+      user.created_at <= assistant.created_at &&
+      assistant.created_at - user.created_at <= REPLY_PAIR_WINDOW_MS
+    )
       this.store.pulseMoodFromExchange(
         peerId,
         { user: user.content, assistant: assistant.content, userAt: user.created_at },
@@ -527,12 +570,17 @@ export class Runtime {
     if (this.stopped) return;
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
+    // Housekeeping piggybacks on the one-minute scheduler tick instead of
+    // having its own timer.
+    this.store.pruneTasks(now);
     for (const peer of this.store.peers().filter((p) => p.approved)) {
       if (hour >= c.diaryHour) this.queueDiary(peer.id, false, now);
       const casualAllowed = this.proactiveAllowed(peer, now);
+      // dueOpenLoops already filters asked=0 in SQL; re-filtering here did
+      // nothing except suggest the query was untrusted.
       const dueLoops = casualAllowed
         ? []
-        : this.store.dueOpenLoops(peer.id, now).filter((l) => !l.asked);
+        : this.store.dueOpenLoops(peer.id, now);
       const loopPing = !casualAllowed && dueLoops.length && this.loopPingAllowed(peer, now);
       if (casualAllowed || loopPing) {
         // Randomized delay so proactive pings do not land at the same minute

@@ -243,7 +243,7 @@ test('P2-11 空开场白不跳过主动联系门控', async (t) => {
   await f.runtime.drain();
   assert.equal(f.delivered.length, 0, '未开启主动联系时，空开场白不应发出消息');
   const task = f.store.sql.prepare("SELECT state FROM tasks WHERE dedupe_key='greeting-blank'").get() as any;
-  assert.equal(task.state, 'done');
+  assert.equal(task.state, 'superseded', '被门控否决的任务按取代处理，不冒充成功');
 });
 
 test('P2-11 非空开场白仍然跳过门控（保留原行为）', async (t) => {

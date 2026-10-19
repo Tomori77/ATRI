@@ -21,7 +21,7 @@ test('P0-1 情绪 energy 保持符号：累了不会渲染成精力足', (t) => 
   f.store.pulseMood('p1', { valence: 0, energy: -0.6, reason: '加班' }, now - 60000);
   const mood = f.store.mood('p1');
   assert.ok(mood.energy < 0, '负能量读回应为负');
-  const prose = renderMood(mood, now, 'Asia/Shanghai');
+  const prose = renderMood(mood, now);
   assert.match(prose, /有点累/);
   assert.doesNotMatch(prose, /精力挺足/);
 });

@@ -48,8 +48,8 @@ export interface SandboxOptions {
   /** Address space cap in MB; 0 means unlimited. Bounds a runaway allocation
    *  without needing cgroup access, which a plain container cannot provide. */
   memoryLimitMb?: () => number;
-  /** Max processes per command; 0 means unlimited. */
-  maxProcesses?: () => number;
+  /** Timezone handed to commands so `date` matches the persona's clock. */
+  timeZone?: () => string;
   /** Whether sandboxed commands may reach the network. Off by default: the
    *  command gets its own empty net namespace. */
   network: () => boolean;
@@ -143,6 +143,12 @@ export class Sandbox {
   clear(): void {
     if (existsSync(this.root)) rmSync(this.root, { recursive: true, force: true });
     mkdirSync(this.root, { recursive: true });
+  }
+
+  /** Release the scratch dir. Called on shutdown; without it every restart
+   *  left an `atri-sandbox-*` directory in the OS temp folder forever. */
+  dispose(): void {
+    rmSync(this.tmpDir, { recursive: true, force: true });
   }
 
   /** Reject before running anything that would obviously blow past the quota,
@@ -320,7 +326,7 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     return new Promise<SandboxResult>((resolvePromise) => {
       const child = spawn(bin, args, {
         cwd: this.root,
-        env: safeEnv(this.tmpDir),
+        env: safeEnv(this.tmpDir, this.options.timeZone?.()),
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
@@ -428,9 +434,11 @@ const SANDBOX_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
  *  into a chat message. HOME points at the scratch dir: npm and git need a
  *  writable cache there, and an empty HOME breaks `#!/usr/bin/env node`
  *  shebangs outright. */
-const safeEnv = (tmpDir: string): NodeJS.ProcessEnv => ({
+const safeEnv = (tmpDir: string, timeZone: string | undefined): NodeJS.ProcessEnv => ({
   PATH: SANDBOX_PATH,
   HOME: tmpDir,
   LANG: process.env.LANG || 'C.UTF-8',
-  TZ: process.env.TZ,
+  // Same clock the persona uses; otherwise `date` in the sandbox and "现在是…"
+  // in her prompt disagree about what time it is.
+  TZ: timeZone || process.env.TZ,
 });

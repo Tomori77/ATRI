@@ -13,8 +13,6 @@ export interface ModelConfig {
   vision: boolean;
   contextWindowTokens?: number;
   inputBudgetTokens?: number;
-  embeddingModel?: string;
-  embeddingDims?: number;
 }
 export interface ToolDefinition {
   name: string;

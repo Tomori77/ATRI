@@ -5,6 +5,13 @@ import { dirname } from 'node:path';
 import { cosineSimilarity } from '@atri/llm';
 export { createBackup, restoreBackup } from './backup.js';
 
+/** Attempts before a task stops being revived by later enqueues with the same
+ *  dedupe key. Without a cap, a permanently failing diary/notes task is
+ *  resurrected every scheduler minute and burns an LLM call each time. */
+export const MAX_TASK_ATTEMPTS = 5;
+/** Terminal task rows older than this are pruned by the scheduler. */
+const TASK_RETENTION_DAYS = 7;
+
 const hourFormatters = new Map<string, Intl.DateTimeFormat>();
 export function hourFormatter(timeZone: string): Intl.DateTimeFormat {
   let formatter = hourFormatters.get(timeZone);
@@ -258,7 +265,7 @@ export class Store {
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
-    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 4) {
+    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 5) {
       this.sql.close();
       throw new Error('数据库来自更新版本，不能用当前程序打开');
     }
@@ -338,6 +345,17 @@ export class Store {
       this.sql.exec('ALTER TABLE memories ADD COLUMN invalid_at INTEGER NOT NULL DEFAULT 0;');
       this.sql.exec('ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;');
       this.sql.exec('PRAGMA user_version=4;');
+    }
+    if (openedAt < 5) {
+      // The delivery pump scans pending outbox rows per peer every 300 ms and
+      // usage is aggregated by a 30-day created_at window; both used to be
+      // full scans on growing tables.
+      this.sql.exec(
+        "CREATE INDEX IF NOT EXISTS outbox_peer_status ON outbox(peer_id,status);\n" +
+          'CREATE INDEX IF NOT EXISTS usage_created ON usage(created_at);\n' +
+          'CREATE INDEX IF NOT EXISTS memory_embeddings_peer_model ON memory_embeddings(peer_id,model);',
+      );
+      this.sql.exec('PRAGMA user_version=5;');
     }
   }
   close() {
@@ -512,13 +530,16 @@ export class Store {
     // swallow every future enqueue with the same dedupe key, which permanently
     // froze that key: notes kept reusing the same `through`, diary the same
     // day, a yearly loop the same id. Reviving it keeps dedupe for in-flight
-    // work while letting a later attempt actually run.
+    // work while letting a later attempt actually run. attempts is preserved:
+    // a task that keeps failing must hit the retry cap instead of being
+    // re-armed every scheduler tick and burning an LLM call each minute.
     this.sql
       .prepare(
-        `UPDATE tasks SET state='queued',payload=?,run_at=?,error='',attempts=0
+        `UPDATE tasks SET state=CASE WHEN attempts>=? THEN state ELSE 'queued' END,
+         payload=?,run_at=?,error=''
          WHERE peer_id=? AND kind=? AND dedupe_key=? AND state IN ('failed','superseded','interrupted')`,
       )
-      .run(JSON.stringify(payload), runAt, peer, kind, key);
+      .run(MAX_TASK_ATTEMPTS, JSON.stringify(payload), runAt, peer, kind, key);
     return String(
       this.sql
         .prepare('SELECT id FROM tasks WHERE peer_id=? AND kind=? AND dedupe_key=?')
@@ -583,6 +604,13 @@ export class Store {
       )
       .run(Date.now() + delay, id);
   }
+  /** 失败退避：state 仍是 failed（issues() 要能列出、新回复要能 supersede），
+   *  只把 run_at 推迟，saveReply 的 revival 只认 queued 以下状态，不会提前跑。 */
+  deferFailed(id: string, delay: number) {
+    this.sql
+      .prepare("UPDATE tasks SET run_at=? WHERE id=? AND state='failed'")
+      .run(Date.now() + delay, id);
+  }
   recover() {
     this.transaction(() => {
       this.sql.exec(
@@ -645,8 +673,17 @@ export class Store {
       return true;
     });
   }
-  startDelivery(id: string) {
-    this.sql
+  /** Direct lookup for the delivery-action endpoint: issues() is a capped
+   *  overview, not a registry of every pending row. */
+  deliveryById(id: string): { id: string; peer_id: string; status: string } | undefined {
+    const row = this.sql
+      .prepare('SELECT id,peer_id,status FROM outbox WHERE id=?')
+      .get(id);
+    return row
+      ? { id: String(row.id), peer_id: String(row.peer_id), status: String(row.status) }
+      : undefined;
+  }
+  startDelivery(id: string) {    this.sql
       .prepare(
         "UPDATE outbox SET status='sending',attempts=attempts+1 WHERE id=? AND status='pending'",
       )
@@ -679,6 +716,26 @@ export class Store {
           .get(String(row.task_id))!.n,
       );
       if (!count) this.finish(String(row.task_id));
+    });
+  }
+  /** Terminal tasks are pure operations debris — chat rows are created per
+   *  user message, and done/failed/superseded rows are only ever re-read by
+   *  the scheduler scans. Prune ones old enough that no delivery issue or
+   *  dedupe key can still reference them. Called from the scheduler tick. */
+  pruneTasks(now = Date.now()): number {
+    const cutoff = now - TASK_RETENTION_DAYS * 86400000;
+    // Outbox rows reference their task, so only tasks whose deliveries are all
+    // in a terminal state (or never had any) are safe to remove; the outbox
+    // itself keeps rows forever so the UI can still audit history.
+    return this.transaction(() => {
+      const gone = this.sql
+        .prepare(
+          `DELETE FROM tasks WHERE state IN ('done','failed','superseded','interrupted')
+           AND created_at < ?
+           AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.task_id=tasks.id AND outbox.status IN ('pending','sending','uncertain'))`,
+        )
+        .run(cutoff);
+      return Number(gone.changes);
     });
   }
   cancelUnsent(task: Task): boolean {
@@ -824,26 +881,28 @@ export class Store {
     // Every write path bumps peers.version, but the bump lands before or after
     // this within the same transaction; drop the cache defensively per write.
     this.memoryCache.delete(peer);
-    const ids = [...new Set(update.sources)];
-    const sources = this.sources(peer, ids);
-    if (
-      !update.content.trim() ||
-      !ids.length ||
-      ids.length !== sources.length ||
-      sources.some((s) => s.kind === 'memory')
-    )
-      return;
-    if (update.kind === 'stated' && sources.some((s) => s.kind === 'diary')) return;
-    // "Stated" means the user confirmed it. A memory sourced only from the
-    // assistant's own text lets a guess become a user fact. Admin corrections
-    // arrive as system notes, which are deliberate user-side evidence.
-    if (
-      update.kind === 'stated' &&
-      !sources.some(
-        (s) => s.kind === 'message' && (s.role === 'user' || s.role === 'system'),
-      )
-    )
-      return;
+    const rawIds = [...new Set(update.sources)];
+    const found = this.sources(peer, rawIds);
+    const byId = new Map(found.map((s) => [s.id, s]));
+    // Keep the legal subset instead of dropping the whole update. The prompt
+    // tells the model to cite what it saw this turn, which includes memory
+    // ids — discarding everything because one citation was a memory (or was
+    // already forgotten, or a stale id) silently lost real facts while the
+    // model believed they were stored.
+    const keptIds = rawIds.filter((id) => {
+      const s = byId.get(id);
+      return s && s.kind !== 'memory';
+    });
+    // "Stated" additionally needs user-side evidence in what remains; diary
+    // citations don't count, an assistant-only observation is a guess.
+    const statedOk =
+      update.kind !== 'stated' ||
+      keptIds.some((id) => {
+        const s = byId.get(id)!;
+        return s.kind === 'message' && (s.role === 'user' || s.role === 'system');
+      });
+    if (!update.content.trim() || !keptIds.length || !statedOk) return;
+    const ids = keptIds;
     const content = update.content.trim();
     const sourceHash = hash(content + '\n' + ids.sort().join(','));
     // Identical wording from a different turn is the same fact; only extend
@@ -1055,7 +1114,16 @@ export class Store {
         created_at: Number(r.created_at),
       }));
   }
-  search(peer: string, query: string, limit = 6, kind?: SourceKind, queryVector?: Float32Array): SearchHit[] {
+  search(
+    peer: string,
+    query: string,
+    limit = 6,
+    kind?: SourceKind,
+    queryVector?: Float32Array,
+    // Vectors from a different embedding model (or dimensionality) must not be
+    // cosine-compared with the query: the numbers look plausible and are garbage.
+    queryVectorModel = '',
+  ): SearchHit[] {
     const normalized = query.normalize('NFKC').toLowerCase();
     const words = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
     const terms = [
@@ -1103,14 +1171,17 @@ export class Store {
     // are stored vectors — the whole point of hybrid retrieval. Vector scan is
     // capped: recency-weighted slice keeps the cost bounded on long histories.
     if (queryVector) {
+      // model/dims 过滤只在查询侧声明了向量模型时生效：调用方没接 embedder 时
+      // （测试夹具、降级部署）不该因为空串匹配不到任何行而失去向量召回。
+      const modelFilter = queryVectorModel ? 'AND e.model=? AND e.dims=?' : '';
       rows.push(
         ...this.sql
           .prepare(
             `SELECT s.id,s.kind,s.content,s.created_at FROM memory_embeddings e JOIN search_index s ON s.id=e.id
-           WHERE e.peer_id=? ${kind ? 'AND s.kind=?' : ''}
+           WHERE e.peer_id=? ${kind ? 'AND s.kind=?' : ''} ${modelFilter}
            ORDER BY s.created_at DESC LIMIT 2000`,
           )
-          .all(peer, ...(kind ? [kind] : []))
+          .all(peer, ...(kind ? [kind] : []), ...(queryVectorModel ? [queryVectorModel, queryVector.length] : []))
           .map((r) => r as Row),
       );
     }
@@ -1347,10 +1418,15 @@ export class Store {
     // positive-first cascade scored the most common negative phrase as a
     // happy exchange. Distress is detected first, and a negated positive
     // ("不开心" / "没意思") never counts as cheer.
-    const text = exchange.user;
-    const distressed = /(烦|难过|累|好累|疲|生气|委屈|难受|不开心|不高兴|没意思|压力|崩溃|emo|不开心)/i.test(
-      text,
+    // Negation stripping: "今天不累了" / "没什么压力" must not score as
+    // distress, so negated forms are removed before the coarse word lists run.
+    // Only negative words may be stripped: "不开心" IS the distress token
+    // itself, so stripping it would erase the very signal we look for.
+    const text = exchange.user.replace(
+      /(不|没|没有|不太|不怎么)(太|什么)?(累|疲|烦|难过|生气|委屈|难受|压力大?|崩溃)/g,
+      '',
     );
+    const distressed = /(烦|难过|累|好累|疲|生气|委屈|难受|不开心|不高兴|没意思|压力|崩溃|emo)/i.test(text);
     const grateful = /(谢谢|感谢|辛苦|有你真好)/.test(text);
     const cheerful = !/(不开心|不高兴|没意思)/.test(text) && /(开心|哈哈哈|笑死|哈哈|嘻嘻|好耶)/.test(text);
     let valence = 0,
@@ -1555,6 +1631,21 @@ export class Store {
         for (const id of [...new Set(ids)]) del.run(peer, id);
       });
     } else this.sql.prepare('DELETE FROM memory_embeddings WHERE peer_id=?').run(peer);
+  }
+  /** Remove vectors from a retired embedding model so they neither bloat the
+   *  database nor (before the model filter existed) pollute cosine recall.
+   *  Affected rows are re-embedded by the normal backfill. Returns the count. */
+  dropEmbeddingsOfModel(model: string): number {
+    const gone = this.sql.prepare('DELETE FROM memory_embeddings WHERE model=?').run(model);
+    return Number(gone.changes);
+  }
+  /** One model per peer is the norm, but old rows can linger; report any model
+   *  other than `current` that still has vectors for this peer. */
+  staleEmbeddingModels(peer: string, current: string): string[] {
+    return this.sql
+      .prepare('SELECT DISTINCT model FROM memory_embeddings WHERE peer_id=? AND model<>?')
+      .all(peer, current)
+      .map((r) => String(r.model));
   }
   async backup(destination: string) {
     mkdirSync(dirname(destination), { recursive: true });
