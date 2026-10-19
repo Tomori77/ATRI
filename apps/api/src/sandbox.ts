@@ -11,6 +11,7 @@ import {
   realpathSync,
 } from 'node:fs';
 import { join, resolve, dirname, isAbsolute, relative, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -73,8 +74,9 @@ export class Sandbox {
     mkdirSync(this.root, { recursive: true });
     // Only the sandbox root is writable, so give toolchains somewhere to put
     // their scratch files (npm's _cacache, git's objects) instead of failing
-    // against a read-only /tmp.
-    this.tmpDir = mkdirTemp('atri-sandbox-');
+    // against a read-only /tmp. Kept outside the sandbox directory so tool
+    // caches never eat into the operator's quota or show up in list_files.
+    this.tmpDir = mkdirTemp(join(tmpdir(), 'atri-sandbox-'));
     this.timeoutMs = options.timeoutMs ?? SANDBOX_TIMEOUT_MS;
     this.outputLimit = options.outputLimit ?? SANDBOX_OUTPUT_LIMIT;
   }
