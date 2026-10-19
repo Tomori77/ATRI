@@ -1054,9 +1054,11 @@ svg {
   margin-bottom: 16px;
 }
 
-/* Inside the centered journal column the tab strip follows the text flow
-   instead of stretching; the fit-content rule above keeps it centerable. */
+/* Inside the centered journal column the tab strip must become block-level
+   before auto margins can center it: an inline-flex box resolves auto
+   margins to zero per CSS2.1, which is why it stayed glued to the left. */
 .view[data-panel='journal'] > .subtabs {
+  display: flex;
   width: fit-content;
 }
 
