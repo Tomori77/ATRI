@@ -223,6 +223,13 @@ export class Runtime {
     }
     throw new Error('等待队列处理超时');
   }
+  /** Abort any in-flight turn for the peer before its records are deleted. */
+  forgetPeer(peerId: string) {
+    const entry = this.active.get(peerId);
+    if (!entry) return;
+    entry.controller.abort();
+    this.active.delete(peerId);
+  }
   private async work(peerId: string, entry: { controller: AbortController; kind?: string }) {
     for (let n = 0; n < 12 && !this.stopped; n++) {
       const peer = this.store.peer(peerId)!;

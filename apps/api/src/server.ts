@@ -325,6 +325,13 @@ export function createServer(o: ServerOptions) {
     o.runtime.pump();
     return { ok: true };
   });
+  app.delete<{ Params: { id: string } }>('/api/peers/:id', (request) => {
+    if (request.params.id === 'preview:default') throw new Error('本地试聊不可删除');
+    if (!o.store.peer(request.params.id)) throw new Error('联系人不存在');
+    o.runtime.forgetPeer(request.params.id);
+    o.store.deletePeer(request.params.id);
+    return { ok: true };
+  });
   app.get<{ Params: { id: string } }>('/api/peers/:id/history', (request) =>
     o.store.history(request.params.id, 100).map(({ media, ...m }) => ({
       ...m,

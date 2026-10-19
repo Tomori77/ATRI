@@ -382,3 +382,31 @@ test('人格接口：CRUD、默认切换、绑定与删除回落', async (t) => 
   });
   assert.equal(removedOld.statusCode, 200);
 });
+
+test('删除联系人会清除其全部记录且本地试聊不可删除', async (t) => {
+  const f = server(t);
+  f.store.ensurePeer('wechat:bot:alice', 'wechat', 'alice', 'tok', true);
+  f.store.ingest('wechat:bot:alice', 'e1', '一段共同经历');
+  f.store.setPeerPersona('wechat:bot:alice', '');
+  const forbidden = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/peers/preview%3Adefault',
+    headers: f.headers,
+  });
+  assert.equal(forbidden.statusCode, 400);
+  const removed = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/peers/' + encodeURIComponent('wechat:bot:alice'),
+    headers: f.headers,
+  });
+  assert.equal(removed.statusCode, 200);
+  assert.equal(f.store.peer('wechat:bot:alice'), undefined);
+  assert.equal(f.store.history('wechat:bot:alice').length, 0);
+  assert.equal(f.store.memories('wechat:bot:alice').length, 0);
+  const again = await f.app.inject({
+    method: 'DELETE',
+    url: '/api/peers/' + encodeURIComponent('wechat:bot:alice'),
+    headers: f.headers,
+  });
+  assert.equal(again.statusCode, 400);
+});

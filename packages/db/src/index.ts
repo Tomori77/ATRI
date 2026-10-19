@@ -349,6 +349,31 @@ export class Store {
       .prepare('UPDATE peers SET persona_id=? WHERE id=?')
       .run(personaId, id);
   }
+  /** Hard-delete a peer and every record tied to it. Messages/media rows keep
+   * their files on disk until the next backup prunes orphans; search index,
+   * vectors, tasks, outbox and mood settings go too. */
+  deletePeer(id: string) {
+    this.transaction(() => {
+      const tables = [
+        'messages',
+        'memories',
+        'memory_embeddings',
+        'diary_sections',
+        'open_loops',
+        'tasks',
+        'outbox',
+        'search_index',
+        'usage',
+      ];
+      for (const table of tables)
+        this.sql.prepare(`DELETE FROM ${table} WHERE peer_id=?`).run(id);
+      this.memoryCache.delete(id);
+      for (const key of ['mood', 'diary_cursor'])
+        this.removeSetting(`${key}:${id}`);
+      // Usage daily aggregates have no peer dimension; leave them (totals only).
+      this.sql.prepare('DELETE FROM peers WHERE id=?').run(id);
+    });
+  }
   private message(row: Row): Message {
     return { ...row, media: parse(row.media, []) } as unknown as Message;
   }

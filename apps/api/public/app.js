@@ -488,6 +488,15 @@ async function loadPeers() {
         await loadStatus();
       }),
     );
+    if (peer.id !== 'preview:default')
+      heading.append(
+        confirmButton('删除', '确认删除？', async () => {
+          await api('/api/peers/' + enc(peer.id), 'DELETE');
+          await loadPeers();
+          await loadStatus();
+          show('联系人及其全部记录已删除。');
+        }),
+      );
     row.append(heading, buildPersonaSelect(peer));
     target.append(row);
   }
