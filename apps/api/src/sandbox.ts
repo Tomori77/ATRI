@@ -276,9 +276,11 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     // line would fail with "node: No such file or directory" the moment the
     // sandbox reaches for it. Make it visible read-only like the rest.
     if (existsSync('/usr/local')) args.push('--bindmount_ro', '/usr/local');
-    // A writable scratch dir: npm writes its cache under HOME, git writes
-    // objects, and both fail on the read-only /tmp nsjail hands out.
-    args.push('--bindmount', this.tmpDir, '--tmpfsmount', '/tmp');
+    // A writable scratch dir for npm's cache, git's objects, /tmp, and HOME.
+    // It must be bound straight onto /tmp: adding a bare --bindmount for it and
+    // a separate --tmpfsmount /tmp makes nsjail mount the same directory at both
+    // destinations, which fails outright with "Launching child process failed".
+    args.push(`--bindmount=${this.tmpDir}:/tmp`);
     // Blank out the app and its data volume so the command cannot read the
     // source or the SQLite database. Never mask the sandbox's own directory:
     // mounting an empty tmpfs over the cwd would leave the shell with no
