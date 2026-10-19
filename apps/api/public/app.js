@@ -1501,7 +1501,13 @@ setInterval(async () => {
         if (task.state === 'failed') {
           show(task.error + '，可在右上角铃铛里重试。', true);
           lastTask = null;
-        } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
+          waitingReply = false;
+        } else if (['done', 'superseded'].includes(task.state)) {
+          lastTask = null;
+          // A finished task that produced no new assistant bubble (empty reply
+          // or skipped turn) must not leave the typing indicator up forever.
+          waitingReply = false;
+        }
       }
       if (currentTab === 'chat') await loadChat();
       if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
