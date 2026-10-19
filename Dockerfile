@@ -3,12 +3,13 @@
 # It must be cloned with submodules because kafel (the seccomp policy engine) is a
 # git submodule; a plain tarball would fail the build.
 FROM debian:bookworm-slim AS nsjail
+# nsjail tags releases without a "v" prefix (3.6, not v3.6).
 ARG NSJAIL_VERSION=3.6
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git make g++ protobuf-compiler libprotobuf-dev \
       libnl-route-3-dev pkg-config bison flex \
  && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch v${NSJAIL_VERSION} --recurse-submodules --shallow-submodules \
+RUN git clone --depth 1 --branch "${NSJAIL_VERSION}" --recurse-submodules --shallow-submodules \
       https://github.com/google/nsjail.git /src/nsjail \
  && cd /src/nsjail \
  && make -j"$(nproc)" nsjail \
