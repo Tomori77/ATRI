@@ -94,6 +94,13 @@
           </svg>
           <span>表情</span>
         </button>
+        <button class="nav-item" id="tab-sticker-stats" role="tab" data-tab="sticker-stats" aria-selected="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 3v18h18" />
+            <path d="M7 15v3m5-9v9m5-13v13" />
+          </svg>
+          <span>表情统计</span>
+        </button>
         <button class="nav-item" id="tab-settings" role="tab" data-tab="settings" aria-selected="false">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3" />
@@ -227,7 +234,7 @@
           <section class="card">
             <h2>情绪库</h2>
             <p class="hint">表情按情绪与强度（1-4 档）归类，模型先选情绪再选强度。未归类的表情进入「其他」。</p>
-            <div id="mood-list" class="stack-tight"></div>
+            <div id="mood-list" class="chip-list"></div>
             <form id="mood-form" class="actions">
               <input id="mood-name" maxlength="20" required placeholder="新情绪名称，例如：吃醋" />
               <button class="btn ghost" type="submit">添加情绪</button>
@@ -235,15 +242,20 @@
           </section>
           <section class="card">
             <h2>表情归类与强度</h2>
-            <p class="hint">为每张表情勾选所属情绪并选择强度档位（1 轻度 → 4 强烈），可同时属于多个情绪。</p>
-            <div id="sticker-intensity-list" class="stack-tight"></div>
-          </section>
-          <section class="card">
-            <h2>表情使用统计</h2>
-            <p class="hint">按联系人统计每张表情的发送次数，模型提示词会优先展示低频表情。</p>
-            <div id="sticker-usage" class="stack-tight"></div>
+            <p class="hint">点开一张表情，勾选所属情绪并选择强度档位（1 轻度 → 4 强烈），可同时属于多个情绪。</p>
+            <div id="sticker-intensity-list" class="intensity-grid"></div>
           </section>
           <div id="sticker-list" class="sticker-grid"></div>
+        </section>
+
+        <section class="view" data-panel="sticker-stats" role="tabpanel" aria-labelledby="tab-sticker-stats">
+          <div class="section-head">
+            <div>
+              <h1>表情统计</h1>
+              <p>按联系人统计每张表情的发送次数，模型提示词会优先展示低频表情。</p>
+            </div>
+          </div>
+          <div id="sticker-usage" class="stack-tight"></div>
         </section>
 
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">

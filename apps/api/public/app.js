@@ -1021,18 +1021,20 @@ function renderMoodList() {
   const target = $('mood-list');
   target.replaceChildren();
   for (const mood of allMoods()) {
-    const row = el('div', undefined, 'row');
-    const heading = el('div', undefined, 'row-title');
-    heading.append(el('span', mood.name), el('span', mood.id, 'hint'));
-    row.append(heading);
-    if (stickerMoodState.custom.some((m) => m.id === mood.id))
-      row.append(
-        confirmButton('删除', '确认删除？', async () => {
+    const chip = el('span', undefined, 'chip');
+    chip.append(el('span', mood.name));
+    if (stickerMoodState.custom.some((m) => m.id === mood.id)) {
+      const remove = el('button', '×', 'chip-remove');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', '删除情绪 ' + mood.name);
+      remove.onclick = () =>
+        perform(async () => {
           await api('/api/sticker-moods/' + enc(mood.id), 'DELETE');
           await loadStickers();
-        }),
-      );
-    target.append(row);
+        }, remove);
+      chip.append(remove);
+    }
+    target.append(chip);
   }
   if (!allMoods().length) empty(target, '还没有情绪。');
 }
@@ -1044,47 +1046,84 @@ function renderStickerIntensityList(stickers) {
     empty(target, '先添加情绪，再为表情归类。');
     return;
   }
+  const levelNames = [[1, '轻度'], [2, '中度'], [3, '较强'], [4, '强烈']];
   for (const sticker of stickers) {
-    const row = el('div', undefined, 'row');
-    const heading = el('div', undefined, 'row-title');
-    heading.append(el('span', sticker.slug), el('span', sticker.description, 'hint'));
-    const box = el('div', undefined, 'actions');
-    for (const mood of moods) {
-      const label = document.createElement('label');
-      label.className = 'check';
-      const current = sticker.intensity?.[mood.id] ?? 0;
-      const check = document.createElement('input');
-      check.type = 'checkbox';
-      check.checked = current > 0;
-      const level = document.createElement('select');
-      for (const [value, name] of [[1, '轻度'], [2, '中度'], [3, '较强'], [4, '强烈']]) {
-        const option = el('option', name);
-        option.value = value;
-        level.append(option);
+    const card = el('article', undefined, 'intensity-card');
+    const img = document.createElement('img');
+    img.src = '/api/stickers/' + enc(sticker.slug) + '/image';
+    img.alt = sticker.description;
+    img.loading = 'lazy';
+    const toggle = el('button', undefined, 'intensity-toggle');
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.append(
+      img,
+      el('strong', sticker.slug),
+      el('span', sticker.description, 'hint'),
+    );
+    const currentSummary = () =>
+      Object.entries(sticker.intensity ?? {})
+        .map(([id, lv]) => `${moods.find((m) => m.id === id)?.name ?? id}·${lv}`)
+        .join('、') || '未归类';
+    const summary = el('span', currentSummary(), 'hint');
+    toggle.append(summary);
+    const box = el('div', undefined, 'intensity-box');
+    box.hidden = true;
+    const rebuild = () => {
+      box.replaceChildren();
+      for (const mood of moods) {
+        const row = el('div', undefined, 'intensity-mood');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.checked = (sticker.intensity?.[mood.id] ?? 0) > 0;
+        check.id = 'iv-' + sticker.slug + '-' + mood.id;
+        const level = document.createElement('select');
+        for (const [value, name] of levelNames) {
+          const option = el('option', name);
+          option.value = value;
+          level.append(option);
+        }
+        level.value = sticker.intensity?.[mood.id] || 2;
+        level.disabled = !check.checked;
+        check.onchange = () => {
+          level.disabled = !check.checked;
+        };
+        row.append(check, el('label', mood.name), level);
+        row.querySelector('label').htmlFor = check.id;
+        box.append(row);
       }
-      level.value = current || 2;
-      level.hidden = !current;
-      check.onchange = () => {
-        level.hidden = !check.checked;
-      };
-      label.append(check, el('span', mood.name), level);
-      box.append(label);
-    }
-    const save = confirmButton('保存', '确认保存？', async () => {
-      const intensity = {};
-      for (const label of box.querySelectorAll('label')) {
-        const check = label.querySelector('input[type=checkbox]');
-        const level = label.querySelector('select');
-        if (check.checked) intensity[allMoods()[[...box.querySelectorAll('label')].indexOf(label)].id] = Number(level.value);
-      }
-      await api('/api/stickers/' + enc(sticker.slug) + '/intensity', 'PUT', { intensity });
-      show('「' + sticker.slug + '」的归类已保存。');
-    });
-    save.type = 'button';
-    box.append(save);
-    row.append(heading, box);
-    target.append(row);
+      const save = el('button', '保存归类', 'btn primary small');
+      save.type = 'button';
+      save.onclick = () =>
+        perform(async () => {
+          const intensity = {};
+          for (const moodRow of box.querySelectorAll('.intensity-mood')) {
+            const check = moodRow.querySelector('input[type=checkbox]');
+            const level = moodRow.querySelector('select');
+            const mood = moods[[...box.querySelectorAll('.intensity-mood')].indexOf(moodRow)];
+            if (check.checked) intensity[mood.id] = Number(level.value);
+          }
+          await api('/api/stickers/' + enc(sticker.slug) + '/intensity', 'PUT', { intensity });
+          sticker.intensity = Object.keys(intensity).length ? intensity : undefined;
+          summary.textContent = currentSummary();
+          box.hidden = true;
+          toggle.setAttribute('aria-expanded', 'false');
+          show('「' + sticker.slug + '」的归类已保存。');
+        }, save);
+      box.append(save);
+    };
+    toggle.onclick = () => {
+      box.hidden = !box.hidden;
+      toggle.setAttribute('aria-expanded', String(!box.hidden));
+      if (!box.hidden) rebuild();
+    };
+    card.append(toggle, box);
+    target.append(card);
   }
+}
+async function loadStickerStats() {
+  stickerUsageState = await api('/api/sticker-usage');
+  renderStickerUsage();
 }
 function renderStickerUsage() {
   const target = $('sticker-usage');
@@ -1099,10 +1138,17 @@ function renderStickerUsage() {
     const heading = el('div', undefined, 'row-title');
     heading.append(el('span', peerId));
     row.append(heading);
-    const lines = Object.entries(stats)
-      .sort((a, b) => b[1].count - a[1].count)
-      .map(([slug, s]) => `${slug} × ${s.count}`);
-    row.append(el('p', lines.join(' · '), 'hint'));
+    const sorted = Object.entries(stats).sort((a, b) => b[1].count - a[1].count);
+    const max = sorted[0]?.[1].count ?? 1;
+    const table = el('div', undefined, 'usage-bars');
+    for (const [slug, s] of sorted) {
+      const bar = el('div', undefined, 'usage-bar');
+      const fill = el('span');
+      fill.style.width = Math.max(6, Math.round((s.count / max) * 100)) + '%';
+      bar.append(el('span', slug, 'usage-slug'), fill, el('span', String(s.count), 'usage-count'));
+      table.append(bar);
+    }
+    row.append(table);
     row.append(
       confirmButton('清零', '确认清零？', async () => {
         await api('/api/sticker-usage/' + enc(peerId), 'DELETE');
@@ -1363,6 +1409,7 @@ async function selectTab(tab) {
   if (tab === 'chat') await loadChat();
   if (tab === 'journal') await loadJournal();
   if (tab === 'stickers') await loadStickers();
+  if (tab === 'sticker-stats') await loadStickerStats();
   if (tab === 'persona') await loadPersonas(personaSelected);
   if (tab === 'settings') await loadStatus();
 }
