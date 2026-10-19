@@ -15,7 +15,16 @@ const numberSettings = [
   'debounceMs',
 ];
 const purposeName = (value) =>
-  ({ chat: '对话', diary: '日记', notes: '话题整理', proactive: '主动联系' })[value] || value;
+  ({
+    chat: '对话',
+    diary: '日记',
+    notes: '话题整理',
+    proactive: '主动联系',
+    chat_tool: '对话·工具查询',
+    diary_tool: '日记·工具查询',
+    notes_tool: '话题整理·工具查询',
+    proactive_tool: '主动联系·工具查询',
+  })[value] || value;
 const formatNumber = (value) => (Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—');
 
 let authenticated = false,
@@ -391,7 +400,9 @@ async function loadStatus() {
       if (peer.mood.energy <= -0.3) parts.push('有点累');
       else if (peer.mood.energy >= 0.3) parts.push('精力足');
       if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
-      if (peer.mood.reason) badges.append(el('span', peer.mood.reason, 'badge'));
+      // Only show the cause while the state it describes still holds; a carried
+      // -over reason used to print "心情不错 · 对方提到了不开心的事".
+      if (peer.mood.reason && parts.length) badges.append(el('span', peer.mood.reason, 'badge'));
     }
     if (peer.dueLoops) badges.append(el('span', '惦记 ' + peer.dueLoops + ' 件事', 'badge'));
     if (peer.lastProactiveAt)
@@ -650,17 +661,17 @@ async function loadChat() {
       if (media.description) msg.append(el('p', '图片：' + media.description, 'media-note'));
     container.append(msg);
   }
+  // Compare against the PREVIOUS baseline first: assigning it before the test
+  // made the condition permanently false, so the indicator never cleared even
+  // after her reply had been rendered.
+  if (waitingReply && assistantCount > waitingBaseline) waitingReply = false;
   waitingBaseline = assistantCount;
   if (waitingReply) {
-    if (assistantCount > waitingBaseline) {
-      waitingReply = false;
-    } else {
-      const typing = el('div', undefined, 'typing');
-      const dots = el('span', undefined, 'typing-dots');
-      dots.append(el('i'), el('i'), el('i'));
-      typing.append(dots, '她正在输入……');
-      container.append(typing);
-    }
+    const typing = el('div', undefined, 'typing');
+    const dots = el('span', undefined, 'typing-dots');
+    dots.append(el('i'), el('i'), el('i'));
+    typing.append(dots, '她正在输入……');
+    container.append(typing);
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
   const isPreview = peer === 'preview:default';
@@ -1267,9 +1278,12 @@ document.querySelectorAll('[data-tab]').forEach((b) => {
 });
 
 formatDropdown = createDropdown({
+  // All three formats the backend accepts; gemini was missing here even though
+  // config validation and the request builder both support it.
   options: [
-    { value: 'openai', label: 'openai' },
-    { value: 'anthropic', label: 'anthropic' },
+    { value: 'openai', label: 'OpenAI 兼容（含 DeepSeek）' },
+    { value: 'anthropic', label: 'Anthropic Messages' },
+    { value: 'gemini', label: 'Gemini' },
   ],
   value: 'openai',
   ariaLabel: '接口格式',

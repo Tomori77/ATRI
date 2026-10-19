@@ -187,10 +187,68 @@ export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
  *  "生气" fades overnight and "累" fades within a nap, not a workday. */
 export const MOOD_VALENCE_HALFLIFE_HOURS = 12;
 export const MOOD_ENERGY_HALFLIFE_HOURS = 4;
+/** Share of the remaining distance to ±1 that a repeat same-sign pulse closes.
+ *  Kept small enough that an evening of complaints settles well short of the
+ *  energy floor which blocks proactive contact entirely. */
+export const MOOD_PULSE_SHARE = 0.2;
 /** Usage rollup: keep this many days of per-call rows, older ones aggregate. */
 export const USAGE_RETENTION_DAYS = 30;
 /** Hard character cap on stored topic notes. */
 export const NOTES_MAX_CHARS = 4000;
+
+const dateFormatters = new Map<string, Intl.DateTimeFormat>();
+function dateParts(at: number, timeZone: string) {
+  let formatter = dateFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    });
+    dateFormatters.set(timeZone, formatter);
+  }
+  return formatter
+    .formatToParts(new Date(at))
+    .reduce<Record<string, string>>((acc, p) => ({ ...acc, [p.type]: p.value }), {});
+}
+
+/** Same wall-clock time one calendar year later, in `timeZone`.
+ *
+ *  Adding a fixed 365 days drifts: a 2 月 29 日 birthday became 2 月 28 日 and
+ *  then oscillated between the two. Feb 29 maps to Feb 28 in common years, and
+ *  every other month/day is preserved exactly. */
+export function addYear(at: number, timeZone = 'Asia/Shanghai'): number {
+  const p = dateParts(at, timeZone);
+  const year = Number(p.year);
+  const month = Number(p.month);
+  const day = Number(p.day);
+  const hour = Number(p.hour);
+  const minute = Number(p.minute);
+  const second = Number(p.second);
+  const daysInTargetMonth = (y: number, m: number) =>
+    new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const targetDay = Math.min(day, daysInTargetMonth(year + 1, month));
+  // Reconstruct through UTC by locating the zone's offset at the candidate time.
+  const asUtc = Date.UTC(year + 1, month - 1, targetDay, hour, minute, second);
+  let result = asUtc;
+  for (let i = 0; i < 2; i++) {
+    const offsetName = new Intl.DateTimeFormat('en-GB', { timeZone, timeZoneName: 'longOffset' })
+      .formatToParts(new Date(result))
+      .find((x) => x.type === 'timeZoneName')!
+      .value;
+    const match = /GMT([+-])(\d{2}):?(\d{2})?/.exec(offsetName);
+    const sign = match?.[1] === '-' ? -1 : 1;
+    const oh = Number(match?.[2] ?? 0),
+      om = Number(match?.[3] ?? 0);
+    result = asUtc - sign * (oh * 3600000 + om * 60000);
+  }
+  return result;
+}
 
 export class Store {
   readonly sql: DatabaseSync;
@@ -1186,13 +1244,13 @@ export class Store {
    *  loops instead move to next year — a birthday never "resolves". Because a
    *  yearly loop rolls in place, `loopTaskKey` includes the new due date so a
    *  fresh ping is not swallowed by the previous year's finished task. */
-  resolveOpenLoop(peer: string, id: string, now = Date.now()) {
+  resolveOpenLoop(peer: string, id: string, now = Date.now(), timeZone = 'Asia/Shanghai') {
     const loop = this.sql
       .prepare("SELECT recurring,due_at FROM open_loops WHERE peer_id=? AND id=? AND status='open'")
       .get(peer, id) as Row | undefined;
     if (!loop) return;
     if (String(loop.recurring) === 'yearly') {
-      const next = Number(loop.due_at) + 365 * 86400000;
+      const next = addYear(Number(loop.due_at), timeZone);
       this.sql
         .prepare("UPDATE open_loops SET due_at=?,asked=0 WHERE peer_id=? AND id=?")
         .run(next, peer, id);
@@ -1239,13 +1297,39 @@ export class Store {
       at,
     };
   }
+  /** Fold a pulse into the current state.
+   *
+   *  Two behaviours are needed at once. A single explicit pulse must land close
+   *  to the value it carries ("energy: -0.6" has to read back as clearly
+   *  tired), but repeated same-sign exchanges must not accumulate without
+   *  limit: plain addition pinned the state at ±1 and, since every pulse reset
+   *  `at`, the decay clock kept restarting, so one bad evening left `energy`
+   *  under the proactive-contact floor for days. So the first pulse moves
+   *  directly to its magnitude, and each later same-sign pulse only closes a
+   *  fraction of the remaining distance to the extreme.
+   */
   pulseMood(peer: string, delta: Partial<Omit<MoodState, 'at'>>, now = Date.now()) {
     const current = this.mood(peer);
     const clamp = (v: number) => Math.max(-1, Math.min(1, v));
+    const fold = (from: number, magnitude: number) => {
+      const value = clamp(magnitude);
+      if (!value) return from;
+      const target = Math.sign(value);
+      // Opposite sign, or a neutral start: the pulse states the new level.
+      if (Math.sign(from) !== target || from === 0) return value;
+      // Same sign: creep toward the extreme, never reaching it.
+      const room = 1 - Math.abs(from);
+      if (room <= 0) return from;
+      return Math.sign(from) * Math.min(1, Math.abs(from) + room * MOOD_PULSE_SHARE);
+    };
+    const valence = delta.valence ?? 0;
+    const energy = delta.energy ?? 0;
     this.setSetting(`mood:${peer}`, {
-      valence: clamp((delta.valence ?? 0) + current.valence),
-      energy: clamp((delta.energy ?? 0) + current.energy),
-      reason: delta.reason ?? current.reason,
+      valence: fold(current.valence, valence),
+      energy: fold(current.energy, energy),
+      // A reason describes the pulse that just landed. Carrying the previous one
+      // forward produced contradictions like "心情不错 · 对方提到了不开心的事".
+      reason: delta.reason ?? '',
       at: now,
     });
   }
@@ -1259,20 +1343,32 @@ export class Store {
     timeZone = 'Asia/Shanghai',
   ) {
     const hour = Number(hourFormatter(timeZone).format(new Date(exchange.userAt)));
-    const clamp = (v: number) => Math.max(-1, Math.min(1, v));
+    // Order matters and used to be inverted: "不开心" contains "开心", so a
+    // positive-first cascade scored the most common negative phrase as a
+    // happy exchange. Distress is detected first, and a negated positive
+    // ("不开心" / "没意思") never counts as cheer.
+    const text = exchange.user;
+    const distressed = /(烦|难过|累|好累|疲|生气|委屈|难受|不开心|不高兴|没意思|压力|崩溃|emo|不开心)/i.test(
+      text,
+    );
+    const grateful = /(谢谢|感谢|辛苦|有你真好)/.test(text);
+    const cheerful = !/(不开心|不高兴|没意思)/.test(text) && /(开心|哈哈哈|笑死|哈哈|嘻嘻|好耶)/.test(text);
     let valence = 0,
       energy = 0,
       reason: string | undefined;
-    if (/(谢谢|感谢|辛苦|有你真好|开心|哈哈哈|笑死)/.test(exchange.user)) {
-      valence = 0.2;
-      reason = /(谢谢|感谢|辛苦)/.test(exchange.user) ? '对方表达了感谢' : '聊得挺开心';
-    } else if (/(烦|难过|累|生气|委屈|难受|不开心|压力)/.test(exchange.user)) {
+    if (distressed) {
       valence = -0.3;
       reason = '对方提到了不开心的事';
       energy = -0.2;
-    } else if (/(晚安|睡了)/.test(exchange.user) || (hour >= 1 && hour < 7)) {
+    } else if (grateful) {
+      valence = 0.2;
+      reason = '对方表达了感谢';
+    } else if (cheerful) {
+      valence = 0.2;
+      reason = '聊得挺开心';
+    } else if (/(晚安|睡了|好困)/.test(text) || (hour >= 1 && hour < 7)) {
       energy = -0.15;
-    } else if (exchange.user.length > 80 && exchange.assistant.length > 80) {
+    } else if (text.length > 80 && exchange.assistant.length > 80) {
       energy = 0.1;
     }
     if (valence === 0 && energy === 0) return;
@@ -1375,21 +1471,33 @@ export class Store {
       .all() as Row[];
     const archived = this.sql
       .prepare(
-        'SELECT purpose,sum(calls) AS calls,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,0 AS average_ms FROM usage_daily GROUP BY purpose',
+        'SELECT purpose,sum(calls) AS calls,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,round(sum(average_ms*calls)*1.0/sum(calls)) AS average_ms FROM usage_daily GROUP BY purpose',
       )
       .all() as Row[];
     const merged = new Map<string, Row>();
     for (const row of [...recent, ...archived]) {
       const prior = merged.get(String(row.purpose));
-      merged.set(String(row.purpose), prior
-        ? {
-            purpose: row.purpose,
-            calls: Number(prior.calls) + Number(row.calls),
-            input_tokens: Number(prior.input_tokens) + Number(row.input_tokens),
-            output_tokens: Number(prior.output_tokens) + Number(row.output_tokens),
-            average_ms: Number(row.average_ms) || Number(prior.average_ms),
-          }
-        : row);
+      if (!prior) {
+        merged.set(String(row.purpose), row);
+        continue;
+      }
+      // Weighted by call count: the archive previously reported average_ms=0
+      // and the `|| prior` fallback then let a handful of recent calls overwrite
+      // the real average for everything older than the retention window.
+      const priorCalls = Number(prior.calls),
+        rowCalls = Number(row.calls),
+        total = priorCalls + rowCalls;
+      merged.set(String(row.purpose), {
+        purpose: row.purpose,
+        calls: total,
+        input_tokens: Number(prior.input_tokens) + Number(row.input_tokens),
+        output_tokens: Number(prior.output_tokens) + Number(row.output_tokens),
+        average_ms: total
+          ? Math.round(
+              (Number(prior.average_ms) * priorCalls + Number(row.average_ms) * rowCalls) / total,
+            )
+          : 0,
+      });
     }
     return [...merged.values()];
   }

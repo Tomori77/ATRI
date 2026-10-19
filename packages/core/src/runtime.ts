@@ -272,10 +272,17 @@ export class Runtime {
         if (task.kind === 'chat' || task.kind === 'proactive') {
           // Greeting tasks are the first-contact hello queued on approval; the
           // normal proactive gate (silence clock, quiet hours) would veto a
-          // peer that has never messaged, so greetings skip it.
+          // peer that has never messaged, so a non-empty greeting skips it.
+          // Blank means "no opener configured" — the server no longer enqueues
+          // those, but a legacy row may still exist, and an empty string is
+          // falsy so it correctly falls through to the regular gate.
+          const isGreeting =
+            task.kind === 'proactive' &&
+            typeof task.payload.greeting === 'string' &&
+            (task.payload.greeting as string).trim() !== '';
           if (
             task.kind === 'proactive' &&
-            task.payload.greeting === undefined &&
+            !isGreeting &&
             !this.proactiveGate(task, peer, Date.now())
           ) {
             this.store.finish(task.id);
@@ -375,7 +382,8 @@ export class Runtime {
       peer = task.peer_id,
       now = Date.now();
     store.expireOpenLoops(peer, now);
-    for (const id of reply.resolveLoops ?? []) store.resolveOpenLoop(peer, id, now);
+    for (const id of reply.resolveLoops ?? [])
+      store.resolveOpenLoop(peer, id, now, this.options.config().timeZone);
     for (const loop of reply.openLoops ?? []) {
       if (!Number.isFinite(loop.dueAt) || loop.dueAt < now - 86400000) continue;
       if (!loop.sources.length) continue;

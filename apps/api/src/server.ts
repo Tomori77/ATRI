@@ -21,6 +21,8 @@ export interface ServerOptions {
   stickers: Stickers;
 }
 const digest = (v: string) => createHash('sha256').update(v).digest();
+/** Short stable digest for building task dedupe keys. */
+const hashGreeting = (v: string) => createHash('sha256').update(v).digest('hex').slice(0, 12);
 const text = (v: unknown, max = 12000) => {
   if (typeof v !== 'string' || !v.trim() || v.length > max)
     throw new Error(`文本需要 1–${max} 个字符`);
@@ -199,9 +201,10 @@ export function createServer(o: ServerOptions) {
     );
     return { list, defaultId, bindings };
   });
-  app.get('/api/persona-presets', () =>
-    PERSONA_PRESETS.map(({ id, name, description }) => ({ id, name, description })),
-  );
+  // `content` is included on purpose: the create form builds the new persona
+  // straight from the chosen preset, and without the text every template
+  // silently produced the placeholder.
+  app.get('/api/persona-presets', () => PERSONA_PRESETS);
   app.post<{ Body: { name: string; content: string } }>('/api/personas', (request) =>
     o.settings.personaCreate(text(request.body.name, 40), text(request.body.content)),
   );
@@ -316,11 +319,22 @@ export function createServer(o: ServerOptions) {
       throw new Error('联系人或设置无效');
     const peer = o.store.peer(request.params.id)!;
     o.store.approve(request.params.id, request.body.approved);
-    // First approval of a real contact: queue a one-shot greeting proactive
-    // task. The dedupe key makes it fire at most once per peer, ever.
+    // First approval of a real contact: queue a one-shot greeting task. An empty
+    // greeting means the operator asked for no opener, so nothing is enqueued.
+    // The version-qualified dedupe key lets a later re-approval send the updated
+    // greeting: the previous key's task is already `done`, and enqueue only
+    // revives failed/superseded/interrupted rows, so reusing "greeting" froze
+    // every new opener behind the finished task.
     if (request.body.approved && !peer.approved && peer.channel === 'wechat') {
       const greeting = o.settings.personaGreetingFor(peer.id);
-      o.store.enqueue(peer.id, 'proactive', 'greeting', { greeting }, Date.now());
+      if (greeting.trim())
+        o.store.enqueue(
+          peer.id,
+          'proactive',
+          `greeting:${peer.version}:${hashGreeting(greeting)}`,
+          { greeting },
+          Date.now(),
+        );
     }
     o.runtime.pump();
     return { ok: true };
@@ -372,7 +386,12 @@ export function createServer(o: ServerOptions) {
     '/api/peers/:peer/loops/:id/resolve',
     (request) => {
       if (!o.store.peer(request.params.peer)) throw new Error('联系人不存在');
-      o.store.resolveOpenLoop(request.params.peer, request.params.id);
+      o.store.resolveOpenLoop(
+        request.params.peer,
+        request.params.id,
+        Date.now(),
+        o.settings.config().timeZone,
+      );
       return { ok: true };
     },
   );

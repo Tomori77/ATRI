@@ -184,8 +184,13 @@ test('近期表情使用从历史提取，供反重复提示', (t) => {
     .prepare("INSERT INTO messages(id,peer_id,role,content,status,created_at) VALUES(?,?, 'assistant', ?, 'sent', ?)")
     .run('r2', 'p1', '[表情：加油] 一起努力', source.created_at + 2000);
   const history = f.store.history('p1');
-  const uses = recentStickerUse(history);
-  assert.deepEqual(uses.map((u) => u.slug), ['开心', '加油']);
+  // 修复前这里返回的是消息里出现的原始文本（描述），与 rotateStickers 比对的
+  // slug 永远对不上，防重复等于没做。现在必须给出目录，按描述/标签解析成 slug。
+  const uses = recentStickerUse(history, [
+    { slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' },
+    { slug: 'go', description: '加油', tags: ['加油'], file: 'go.png' },
+  ]);
+  assert.deepEqual(uses.map((u) => u.slug), ['happy', 'go']);
 });
 
 test('高频聊天后，重要旧记忆仍进提示词（最新10条陷阱回归）', async (t) => {

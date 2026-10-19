@@ -20,3 +20,7 @@ backups/
 .DS_Store
 Thumbs.db
 restore.compose.yaml
+# 提交脚本的临时产物
+.commitmsg
+# 其他工具的本地记忆文件
+.monkeycode/

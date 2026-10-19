@@ -150,13 +150,31 @@ export function renderTimeGap(now: number, lastAt: number, timeZone: string): st
 export interface RecentStickerUse {
   slug: string;
   at: number;
-}/** Extract recently sent stickers from assistant history for anti-repetition. */
-export function recentStickerUse(history: Message[]): RecentStickerUse[] {
+}
+/** Extract recently sent stickers from assistant history for anti-repetition.
+ *  History stores the sticker as `[表情：description]`, so the captured text is
+ *  resolved back to its catalog slug here — comparing descriptions against
+ *  slugs would never match and the filter would silently do nothing. */
+export function recentStickerUse(
+  history: Message[],
+  stickers: Sticker[] = [],
+): RecentStickerUse[] {
+  const byName = new Map<string, string>();
+  for (const s of stickers) {
+    byName.set(s.slug.toLowerCase(), s.slug);
+    byName.set(s.description.toLowerCase(), s.slug);
+    for (const tag of s.tags ?? []) byName.set(tag.toLowerCase(), s.slug);
+  }
   const uses: RecentStickerUse[] = [];
   for (const m of history) {
     if (m.role !== 'assistant') continue;
     for (const match of m.content.matchAll(/\[表情：([^】\]]+?)\]/g)) {
-      uses.push({ slug: match[1]!.trim(), at: m.created_at });
+      const name = match[1]!.trim();
+      const slug = byName.get(name.toLowerCase());
+      // Unresolvable names are skipped rather than stored as pseudo-slugs: a
+      // bogus entry would only make the prompt's "recently sent" list lie.
+      if (!slug || uses.some((u) => u.slug === slug)) continue;
+      uses.push({ slug, at: m.created_at });
       if (uses.length >= STICKER_RECENT_SHOWN * 2) break;
     }
   }
@@ -250,9 +268,18 @@ export function rotateStickers(
   const day = Math.floor(now / 86400000);
   const order = [...all.slice(day % all.length), ...all.slice(0, day % all.length)];
   const used = new Set(recentUse.map((u) => u.slug));
+  // Recently sent stickers stay eligible but sink to the tail, so the model
+  // reaches one only when nothing fresh fits. They used to be filtered out of
+  // the window entirely whenever enough unused ones existed.
   const fresh = order.filter((s) => !used.has(s.slug));
-  const picked = [...fresh, ...order.filter((s) => used.has(s.slug))].slice(0, window);
-  return all.filter((s) => picked.includes(s));
+  const stale = order.filter((s) => used.has(s.slug));
+  // Reserve room for the tail entries so a used sticker is never evicted by
+  // sheer volume of unused ones.
+  const keep = Math.max(0, window - stale.length);
+  // Return the picked order itself, not a filtered copy of `order`: re-sorting
+  // back into catalog order would silently undo the sink and put a
+  // just-used sticker back in the front half of the prompt.
+  return [...fresh.slice(0, keep), ...stale].slice(0, window);
 }
 /** Memories as compact prose lines instead of full JSON — the model needs the
  *  fact and its citation IDs, not hits counters or timestamps. */
@@ -289,7 +316,7 @@ export function renderHits(
 }
 export class Agent {
   constructor(private readonly o: AgentOptions) {}
-  private async complete(
+  private async call(
     task: Task,
     messages: ModelMessage[],
     tools: ToolDefinition[],
@@ -304,13 +331,25 @@ export class Agent {
       sessionId: `atri:${task.peer_id}:${task.kind}`,
       maxTokens,
     });
+    // Usage is recorded by the caller, once the round's purpose (tool lookup
+    // vs final generation) is known.
+    return { result, elapsedMs: Date.now() - started };
+  }
+  private async complete(
+    task: Task,
+    messages: ModelMessage[],
+    tools: ToolDefinition[],
+    signal: AbortSignal,
+    maxTokens?: number,
+  ) {
+    const { result, elapsedMs } = await this.call(task, messages, tools, signal, maxTokens);
     this.o.store.recordUsage(
       task.peer_id,
       task.id,
       task.kind,
       result.inputTokens,
       result.outputTokens,
-      Date.now() - started,
+      elapsedMs,
     );
     return result;
   }
@@ -353,7 +392,7 @@ export class Agent {
     const dedupedMemoryIds = rawMemories
       .filter((m) => seen.has(m.id) && !m.pinned)
       .map((m) => m.id);
-    const recentStickers = recentStickerUse(history);
+    const recentStickers = recentStickerUse(history, this.o.stickers());
     const stickers = rotateStickers(this.o.stickers(), recentStickers, now);
     const lastUser = [...history].reverse().find((m) => m.role === 'user');
     const timeLine = lastUser
@@ -470,6 +509,11 @@ export class Agent {
       ],
       available,
       budget,
+      // The exact catalogue shown in the prompt. Reply validation must accept
+      // this window, not a fresh slice of the catalog: rotateStickers hands the
+      // model a different 32 every day, so validating against stickers.slice(0,32)
+      // silently dropped most of what the prompt advertised.
+      stickers,
     };
   }
   async reply(task: Task, parentSignal?: AbortSignal): Promise<ParsedReply> {
@@ -564,7 +608,7 @@ export class Agent {
       totalTokens -= messageTokens(messages.splice(1, 1)[0]!);
       plan.recent.shift();
     }
-    const result = await this.runToolLoop(task, messages, plan.available, signal);
+    const result = await this.runToolLoop(task, messages, plan.available, plan.stickers, signal);
     result.memories = this.filteredUpdates(result.memories, plan.available);
     result.pickedMemoryIds = plan.pickedMemoryIds;
     result.openLoops = parseOpenLoops(
@@ -587,6 +631,7 @@ export class Agent {
     task: Task,
     messages: ModelMessage[],
     available: Set<string>,
+    stickers: Sticker[],
     signal: AbortSignal,
   ): Promise<ParsedReply> {
     let toolRounds = 0,
@@ -596,7 +641,20 @@ export class Agent {
     for (let attempt = 0; attempt < MAX_REPLY_ATTEMPTS; attempt++) {
       signal.throwIfAborted();
       const tools = toolRounds < MAX_TOOL_ROUNDS && toolCalls < MAX_TOOL_CALLS ? INFO_TOOLS : [];
-      const completion = await this.complete(task, messages, tools, signal);
+      const call = await this.call(task, messages, tools, signal);
+      // Attribute by what the round actually produced: a round that ends in
+      // tool calls is lookup work, the round that emits the reply is
+      // generation. Billing by "were tools offered" merged both into one
+      // number and made the two cost drivers impossible to compare.
+      this.o.store.recordUsage(
+        task.peer_id,
+        task.id,
+        call.result.calls.length ? `${task.kind}_tool` : task.kind,
+        call.result.inputTokens,
+        call.result.outputTokens,
+        call.elapsedMs,
+      );
+      const completion = call.result;
       if (completion.calls.length) {
         if (!tools.length) throw new Error('模型在工具预算耗尽后仍要求调用工具');
         messages.push(completion.continuation);
@@ -640,7 +698,6 @@ export class Agent {
           });
         continue;
       }
-      const stickers = this.o.stickers().slice(0, PROMPT_STICKERS);
       try {
         return parseReply(
           completion.text,
