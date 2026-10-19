@@ -1,6 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import {
   mkdirSync,
+  mkdtempSync as mkdirTemp,
   readdirSync,
   rmSync,
   statSync,
@@ -59,6 +60,7 @@ const NSJAIL = '/usr/local/bin/nsjail';
 
 export class Sandbox {
   readonly root: string;
+  readonly tmpDir: string;
   private readonly timeoutMs: number;
   private readonly outputLimit: number;
   /** Cached probe result. nsjail's availability cannot change at runtime, but the
@@ -69,6 +71,10 @@ export class Sandbox {
   constructor(rootDir: string, private readonly options: SandboxOptions) {
     this.root = resolve(rootDir);
     mkdirSync(this.root, { recursive: true });
+    // Only the sandbox root is writable, so give toolchains somewhere to put
+    // their scratch files (npm's _cacache, git's objects) instead of failing
+    // against a read-only /tmp.
+    this.tmpDir = mkdirTemp('atri-sandbox-');
     this.timeoutMs = options.timeoutMs ?? SANDBOX_TIMEOUT_MS;
     this.outputLimit = options.outputLimit ?? SANDBOX_OUTPUT_LIMIT;
   }
@@ -264,6 +270,13 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     const args = ['--really_quiet', '--chroot', '/', '--cwd', this.root, '--bindmount', this.root];
     for (const dir of ['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc'])
       if (existsSync(dir)) args.push('--bindmount_ro', dir);
+    // node is not under any of the paths above (/usr/local), so npm's own shebang
+    // line would fail with "node: No such file or directory" the moment the
+    // sandbox reaches for it. Make it visible read-only like the rest.
+    if (existsSync('/usr/local')) args.push('--bindmount_ro', '/usr/local');
+    // A writable scratch dir: npm writes its cache under HOME, git writes
+    // objects, and both fail on the read-only /tmp nsjail hands out.
+    args.push('--bindmount', this.tmpDir, '--tmpfsmount', '/tmp');
     // Blank out the app and its data volume so the command cannot read the
     // source or the SQLite database. Never mask the sandbox's own directory:
     // mounting an empty tmpfs over the cwd would leave the shell with no
@@ -297,7 +310,10 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     return new Promise<SandboxResult>((resolvePromise) => {
       const child = spawn(bin, args, {
         cwd: this.root,
-        env: SAFE_ENV,
+        // HOME points at the scratch dir so package managers have a writable
+        // cache. It holds nothing but tool output, and the env stays a
+        // whitelist either way.
+        env: { ...SAFE_ENV, HOME: this.tmpDir },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
