@@ -354,23 +354,24 @@ export class Store {
    * vectors, tasks, outbox and mood settings go too. */
   deletePeer(id: string) {
     this.transaction(() => {
+      // Child-first: outbox and diary_sections reference tasks(id), so tasks
+      // must go last; everything references peers(id), peers goes last of all.
       const tables = [
+        'outbox',
+        'diary_sections',
+        'open_loops',
         'messages',
         'memories',
         'memory_embeddings',
-        'diary_sections',
-        'open_loops',
-        'tasks',
-        'outbox',
         'search_index',
         'usage',
+        'tasks',
       ];
       for (const table of tables)
         this.sql.prepare(`DELETE FROM ${table} WHERE peer_id=?`).run(id);
       this.memoryCache.delete(id);
       for (const key of ['mood', 'diary_cursor'])
         this.removeSetting(`${key}:${id}`);
-      // Usage daily aggregates have no peer dimension; leave them (totals only).
       this.sql.prepare('DELETE FROM peers WHERE id=?').run(id);
     });
   }
