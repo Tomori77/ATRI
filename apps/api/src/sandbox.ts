@@ -281,6 +281,12 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     // a separate --tmpfsmount /tmp makes nsjail mount the same directory at both
     // destinations, which fails outright with "Launching child process failed".
     args.push(`--bindmount=${this.tmpDir}:/tmp`);
+    // nsjail replaces the environment wholesale, so PATH and HOME have to be
+    // stated here rather than inherited. HOME is not cosmetic: with it unset,
+    // `env` (and so every `#!/usr/bin/env node` script, npm included) walks
+    // "$HOME/.cargo/bin" and then reports "node: No such file or directory"
+    // even though node is right there on PATH.
+    args.push(`--env=PATH=${SANDBOX_PATH}`, `--env=HOME=/tmp`);
     // Blank out the app and its data volume so the command cannot read the
     // source or the SQLite database. Never mask the sandbox's own directory:
     // mounting an empty tmpfs over the cwd would leave the shell with no
@@ -314,10 +320,7 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     return new Promise<SandboxResult>((resolvePromise) => {
       const child = spawn(bin, args, {
         cwd: this.root,
-        // HOME points at the scratch dir so package managers have a writable
-        // cache. It holds nothing but tool output, and the env stays a
-        // whitelist either way.
-        env: { ...SAFE_ENV, HOME: this.tmpDir },
+        env: safeEnv(this.tmpDir),
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
@@ -417,11 +420,17 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
   }
 }
 
+/** PATH every sandboxed command gets, nsjail or fallback alike. */
+const SANDBOX_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
 /** Env handed to sandboxed commands. Anything secret (LLM keys, admin password,
  *  the SQLite path) is deliberately absent so a stray `printenv` cannot leak it
- *  into a chat message. */
-const SAFE_ENV: NodeJS.ProcessEnv = {
-  PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+ *  into a chat message. HOME points at the scratch dir: npm and git need a
+ *  writable cache there, and an empty HOME breaks `#!/usr/bin/env node`
+ *  shebangs outright. */
+const safeEnv = (tmpDir: string): NodeJS.ProcessEnv => ({
+  PATH: SANDBOX_PATH,
+  HOME: tmpDir,
   LANG: process.env.LANG || 'C.UTF-8',
   TZ: process.env.TZ,
-};
+});
