@@ -228,7 +228,8 @@
         </section>
 
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">
-          <form id="settings-form" class="settings-stack">
+          <form id="settings-form" class="settings-stack settings-columns">
+            <div class="settings-col">
             <section class="card">
               <h2>模型服务</h2>
               <div class="grid-2">
@@ -301,6 +302,34 @@
               <div class="actions end">
                 <button class="btn ghost" id="test-embedding" type="button">测试向量连通</button>
               </div>
+            </section>
+
+            <section class="card">
+              <h2>沙箱</h2>
+              <label class="check">
+                <input id="sandboxEnabled" type="checkbox" />
+                <span>允许她在沙箱里运行命令和读写文件</span>
+              </label>
+              <label class="field">
+                <span>沙箱大小上限（MB，0 表示不限制）</span>
+                <input id="sandboxSizeMb" type="number" min="0" max="102400" step="64" required />
+              </label>
+              <label class="field">
+                <span>单条命令内存上限（MB，0 表示不限制）</span>
+                <input id="sandboxMemoryMb" type="number" min="0" max="262144" step="128" required />
+              </label>
+              <p class="hint">
+                开启后她会多出 run_command、write_file、read_file、list_files
+                四个工具，可以在沙箱目录里执行 shell、写脚本、跑 python/node。命令默认
+                <strong>没有时间限制和输出长度限制</strong>，你可以放心让她跑长任务。
+                沙箱目录看不到任何密钥，路径不能跳出该目录，写满上限后会拒绝新的写入。
+              </p>
+              <div class="actions end">
+                <button class="btn ghost" id="refresh-sandbox" type="button">刷新状态</button>
+                <button class="btn ghost" id="clear-sandbox" type="button">清空沙箱目录</button>
+              </div>
+              <p class="hint" id="sandbox-status"></p>
+              <p class="hint" id="sandbox-isolation"></p>
             </section>
 
             <section class="card">
@@ -385,15 +414,18 @@
                 <span id="settings-saved" class="hint"></span>
               </div>
             </section>
+            </div>
 
+            <div class="settings-col">
             <section class="card">
               <h2>模型用量</h2>
               <div id="usage" class="usage-grid"></div>
               <h3>近期调用</h3>
               <div id="recent-usage" class="recent-list"></div>
             </section>
+            </div>
 
-            <div class="actions end">
+            <div class="actions end settings-submit">
               <button class="btn primary" type="submit">保存全部设置</button>
             </div>
           </form>

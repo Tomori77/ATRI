@@ -27,6 +27,9 @@ export interface SavedConfig {  baseUrl: string;
   embeddingBaseUrl: string;
   embeddingApiKey: string;
   embeddingModel: string;
+  sandboxEnabled: boolean;
+  sandboxSizeMb: number;
+  sandboxMemoryMb: number;
   maxConcurrentPeers: number;
   debounceMs: number;
 }
@@ -147,6 +150,9 @@ export class Settings {
       embeddingBaseUrl: env.EMBEDDING_BASE_URL || env.LLM_BASE_URL || 'https://api.deepseek.com',
       embeddingApiKey: env.EMBEDDING_API_KEY || '',
       embeddingModel: env.EMBEDDING_MODEL || '',
+      sandboxEnabled: env.SANDBOX_ENABLED === 'true',
+      sandboxSizeMb: Number(env.SANDBOX_SIZE_MB || 512),
+      sandboxMemoryMb: Number(env.SANDBOX_MEMORY_MB || 2048),
       maxConcurrentPeers: 3,
       debounceMs: 800,
     };
@@ -180,7 +186,7 @@ export class Settings {
         throw new Error('模型接口格式无效');
       next.format = input.format as ApiFormat;
     }
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled'] as const)
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled'] as const)
       if (input[key] !== undefined) {
         if (typeof input[key] !== 'boolean') throw new Error('开关格式无效');
         next[key] = input[key];
@@ -246,6 +252,20 @@ export class Settings {
         embedUrl.hash
       )
         throw new Error('向量模型地址需要是没有凭据和查询参数的 HTTP/HTTPS URL');
+    }
+    if (input.sandboxSizeMb !== undefined) {
+      const n = Number(input.sandboxSizeMb);
+      // 0 means unlimited, so the floor has to allow it explicitly.
+      if (!Number.isInteger(n) || n < 0 || n > 102400)
+        throw new Error('沙箱大小需要 0（不限制）到 102400 MB 之间的整数');
+      next.sandboxSizeMb = n;
+    }
+    if (input.sandboxMemoryMb !== undefined) {
+      const n = Number(input.sandboxMemoryMb);
+      // 0 means unlimited, so the floor has to allow it explicitly.
+      if (!Number.isInteger(n) || n < 0 || n > 262144)
+        throw new Error('沙箱内存需要 0（不限制）到 262144 MB 之间的整数');
+      next.sandboxMemoryMb = n;
     }
     if (input.maxConcurrentPeers !== undefined) {
       const n = Number(input.maxConcurrentPeers);

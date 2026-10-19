@@ -1151,6 +1151,39 @@ svg {
   max-width: 880px;
 }
 
+/* Desktop only: split settings into two columns so the right side is not dead
+   space. Below the breakpoint this falls back to a single stacked column, so
+   mobile keeps its original layout. */
+.settings-columns {
+  max-width: none;
+}
+
+@media (min-width: 961px) {
+  .settings-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
+    gap: 16px;
+    align-items: start;
+  }
+
+  .settings-col {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  /* The usage card is short; pinning it to the top avoids a tall empty column. */
+  .settings-col:last-of-type .card {
+    position: sticky;
+    top: 0;
+  }
+
+  .settings-submit {
+    grid-column: 1 / -1;
+  }
+}
+
 .budget-card {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);

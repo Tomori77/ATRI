@@ -11,6 +11,7 @@ import { sniffMediaMime } from '@atri/ilink';
 import type { Settings } from './config.js';
 import { PERSONA_PRESETS } from './config.js';
 import type { Stickers } from './stickers.js';
+import type { Sandbox } from './sandbox.js';
 import type { WeChatBridge } from './wechat.js';
 
 export interface ServerOptions {
@@ -19,6 +20,7 @@ export interface ServerOptions {
   runtime: Runtime;
   bridge: WeChatBridge;
   stickers: Stickers;
+  sandbox?: Sandbox;
 }
 const digest = (v: string) => createHash('sha256').update(v).digest();
 /** Short stable digest for building task dedupe keys. */
@@ -189,6 +191,24 @@ export function createServer(o: ServerOptions) {
   app.put<{ Body: Record<string, unknown> }>('/api/config', (request) =>
     o.settings.update(request.body),
   );
+  // Sandbox status for the settings page: enabled flag, what the directory
+  // currently holds, and what isolation this host actually provides.
+  app.get('/api/sandbox', async () => {
+    const sandbox = o.sandbox;
+    return {
+      enabled: Boolean(sandbox?.enabled),
+      root: sandbox ? sandbox.root : '',
+      usage: sandbox ? sandbox.usage() : { files: 0, bytes: 0 },
+      sizeLimitBytes: sandbox ? sandbox.sizeLimit : 0,
+      memoryLimitMb: o.settings.config().sandboxMemoryMb,
+      isolation: sandbox ? await sandbox.isolationInfo() : undefined,
+    };
+  });
+  app.post('/api/sandbox/clear', () => {
+    if (!o.sandbox) throw new Error('沙箱未配置');
+    o.sandbox.clear();
+    return { ok: true };
+  });
   app.get('/api/persona', () => ({ content: o.settings.personaPrompt() }));
   app.put<{ Body: { content: string } }>('/api/persona', (request) => {
     o.settings.savePersona(text(request.body.content));

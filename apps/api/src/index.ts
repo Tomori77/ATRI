@@ -4,6 +4,7 @@ import { HttpModel, EmbeddingClient } from '@atri/llm';
 import { Runtime, TavilyWeb } from '@atri/core';
 import { Settings } from './config.js';
 import { Stickers } from './stickers.js';
+import { Sandbox } from './sandbox.js';
 import { WeChatBridge } from './wechat.js';
 import { createServer } from './server.js';
 
@@ -14,6 +15,14 @@ const settings = new Settings(store, root);
 const stickers = new Stickers(root, dataDir, store);
 const bridge = new WeChatBridge(store, settings, stickers, (message) => console.warn(message));
 const embeddings = new EmbeddingClient(() => settings.embedding());
+const sandbox = new Sandbox(join(dataDir, 'sandbox'), {
+  enabled: () => settings.config().sandboxEnabled,
+  sizeLimitBytes: () => settings.config().sandboxSizeMb * 1024 * 1024,
+  // Address space cap only; nsjail needs no cgroup access for rlimits, and a
+  // cgroup-backed limit would require --cgroupns=host on the host, which would
+  // break the "just docker compose up" promise. 0 = unlimited.
+  memoryLimitMb: () => settings.config().sandboxMemoryMb,
+});
 /** The runtime treats `enabled` as a hard off switch, separate from creds. */
 const embedder = {
   get configured() {
@@ -42,13 +51,14 @@ const runtime = new Runtime({
   transport: bridge,
   log: (message, details) => console.warn(message, details),
   embedder,
+  sandbox,
   embedQuery: async (query) => {
     if (!settings.embeddingEnabled()) return undefined;
     const [vector] = await embeddings.embed([query]);
     return vector && vector.some((v) => v !== 0) ? vector : undefined;
   },
 });
-const app = createServer({ store, settings, stickers, bridge, runtime });
+const app = createServer({ store, settings, stickers, bridge, runtime, sandbox });
 let stopping = false;
 async function shutdown() {
   if (stopping) return;

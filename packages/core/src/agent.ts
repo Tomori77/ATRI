@@ -57,6 +57,24 @@ export interface AgentOptions {
   images?: (message: Message) => Promise<string[]>;
   /** Optional semantic search support; when absent, search stays lexical. */
   embedQuery?: (query: string) => Promise<Float32Array | undefined>;
+  /** Optional operator-controlled code sandbox. When absent, or when it reports
+   *  itself disabled, its tools are neither advertised nor dispatchable. */
+  sandbox?: SandboxTools;
+}
+export interface SandboxTools {
+  enabled: boolean;
+  run(command: string, signal: AbortSignal): Promise<{
+    ok: boolean;
+    code: number | null;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    truncated: boolean;
+    durationMs: number;
+  }>;
+  write(path: string, content: string): Promise<{ bytes: number; path: string }>;
+  read(path: string): Promise<{ content: string; path: string }>;
+  list(path: string): Promise<{ path: string; entries: { name: string; kind: string; size: number }[] }>;
 }
 const object = (properties: Record<string, unknown>, required: string[]) => ({
   type: 'object',
@@ -91,6 +109,39 @@ export const INFO_TOOLS: ToolDefinition[] = [
     name: 'open_page',
     description: '读取公开网页原文，核实搜索摘要中的信息。',
     parameters: object({ url: string }, ['url']),
+  },
+];
+
+/** Tools only offered when the operator has switched the sandbox on. They are
+ *  kept out of the default schema so a disabled sandbox costs no prompt tokens
+ *  and cannot be reached even if the model hallucinates a call to it. */
+export const SANDBOX_TOOLS: ToolDefinition[] = [
+  {
+    name: 'run_command',
+    description:
+      '在一个独立的工作目录里执行一条 shell 命令（Linux 基础命令、python3、node 均可）。' +
+      '没有时间限制也没有输出长度限制，可以放心跑长时间的编译、数据处理、训练脚本。' +
+      '每次调用都是独立的一次执行，上一次留下的文件会保留在同一个目录里。',
+    parameters: object({ command: { type: 'string', maxLength: 4000 } }, ['command']),
+  },
+  {
+    name: 'write_file',
+    description:
+      '把一段文本写进沙箱目录里的文件（自动创建父目录）。内容长度不限，但受沙箱大小上限约束。',
+    parameters: object({ path: { type: 'string', maxLength: 200 }, content: { type: 'string' } }, [
+      'path',
+      'content',
+    ]),
+  },
+  {
+    name: 'read_file',
+    description: '读取沙箱目录里某个文件的内容。',
+    parameters: object({ path: { type: 'string', maxLength: 200 } }, ['path']),
+  },
+  {
+    name: 'list_files',
+    description: '列出沙箱目录里的文件和子目录，用来确认上一步到底写进去了什么。',
+    parameters: object({ path: { type: 'string', maxLength: 200 } }, []),
   },
 ];
 const sourceFormatters = new Map<string, Intl.DateTimeFormat>();
@@ -640,7 +691,8 @@ export class Agent {
       toolTokens = 0;
     for (let attempt = 0; attempt < MAX_REPLY_ATTEMPTS; attempt++) {
       signal.throwIfAborted();
-      const tools = toolRounds < MAX_TOOL_ROUNDS && toolCalls < MAX_TOOL_CALLS ? INFO_TOOLS : [];
+      const tools =
+        toolRounds < MAX_TOOL_ROUNDS && toolCalls < MAX_TOOL_CALLS ? this.toolset() : [];
       const call = await this.call(task, messages, tools, signal);
       // Attribute by what the round actually produced: a round that ends in
       // tool calls is lookup work, the round that emits the reply is
@@ -719,6 +771,15 @@ export class Agent {
     }
     throw new Error('本轮模型调用已达上限');
   }
+  /** Tools offered to the model this round. Sandbox tools are appended only
+   *  while the operator has the switch on, so turning it off removes them from
+   *  the schema *and* from dispatch in one place. */
+  private toolset(): ToolDefinition[] {
+    const sandbox = this.o.sandbox;
+    if (!sandbox?.enabled) return INFO_TOOLS;
+    // Don't pay the extra schema tokens twice for a round that already has them.
+    return [...INFO_TOOLS, ...SANDBOX_TOOLS];
+  }
   private async tool(
     task: Task,
     name: string,
@@ -771,7 +832,17 @@ export class Agent {
         signal,
       );
     else if (name === 'open_page') return this.o.web.open(String(args.url ?? ''), signal);
-    else throw new Error('未知工具');
+    else if (SANDBOX_TOOLS.some((t) => t.name === name)) {
+      const sandbox = this.o.sandbox;
+      // Reachability check, not just a schema check: a hallucinated call while
+      // the switch is off must fail loudly instead of running anything.
+      if (!sandbox?.enabled) throw new Error('沙箱未启用，无法执行该操作');
+      const pathArg = () => String(args.path ?? '').trim();
+      if (name === 'run_command') return sandbox.run(String(args.command ?? ''), signal);
+      if (name === 'write_file') return sandbox.write(pathArg(), String(args.content ?? ''));
+      if (name === 'read_file') return sandbox.read(pathArg());
+      return sandbox.list(pathArg());
+    } else throw new Error('未知工具');
     hits = hits.slice(0, 12).map((h) => ({ ...h, content: h.content.slice(0, 1600) }));
     hits.forEach((h) => available.add(h.id));
     return hits;
