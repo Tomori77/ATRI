@@ -420,8 +420,8 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
       level: nsjail ? 'nsjail' : 'directory',
       note: nsjail
         ? 'nsjail 命名空间隔离：独立 mount/pid/ipc/uts/user 命名空间，系统目录只读挂载，沙箱目录是唯一可写路径，应用目录与数据库已被空 tmpfs 遮蔽。'
-        : 'nsjail 不可用，已回退到目录级隔离（工作目录 + 环境变量白名单 + 配额 + 软链防护）。',
-      network: nsjail ? network : wantsNetwork ? network + '（无命名空间隔离）' : '未禁用',
+        : 'nsjail 不可用，已回退到目录级隔离（工作目录 + 环境变量白名单 + 配额 + 软链防护）；此时网络开关与文件系统隔离均无法强制，命令实际可联网。',
+      network,
     };
   }
 }
