@@ -86,9 +86,11 @@ export class Sandbox {
       return false;
     }
     try {
-      // Probe with the same flags the real runs use. A bare `-- /bin/true` would
-      // pass even when the mount tree cannot be built, which is exactly the
-      // failure mode this has to catch.
+      // Probe with the same flags the real runs use, including the hidden
+      // tmpfs mounts: a bare invocation would pass even when the mount tree
+      // cannot be built, which is exactly the failure mode to catch. The
+      // working directory must exist first or the cwd bind fails.
+      mkdirSync(this.root, { recursive: true });
       const { args } = this.nsjailArgs('true');
       await exec(NSJAIL, args, { timeout: 15000 });
       this.nsjailUsable = true;
@@ -249,9 +251,17 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     const args = ['--really_quiet', '--chroot', '/', '--cwd', this.root, '--bindmount', this.root];
     for (const dir of ['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc'])
       if (existsSync(dir)) args.push('--bindmount_ro', dir);
-    // Blank out the app and its data volume: a bind mount would still expose
-    // them, and an empty tmpfs means "not there" from inside the jail.
-    for (const hidden of ['/app', '/data']) args.push('--tmpfsmount', hidden);
+    // Blank out the app and its data volume so the command cannot read the
+    // source or the SQLite database. Never mask the sandbox's own directory:
+    // mounting an empty tmpfs over the cwd would leave the shell with no
+    // working directory at all.
+    for (const hidden of ['/app', '/data']) {
+      if (!existsSync(hidden)) continue;
+      const target = resolve(hidden);
+      const rel = relative(target, this.root);
+      if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) continue;
+      args.push('--tmpfsmount', hidden);
+    }
     const mem = this.options.memoryLimitMb?.() ?? 0;
     if (mem > 0) args.push('--rlimit_as', String(mem * 1024));
     if (this.timeoutMs > 0) args.push('--time_limit', String(Math.ceil(this.timeoutMs / 1000)));

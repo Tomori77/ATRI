@@ -20,6 +20,10 @@ services:
       - '${ATRI_BIND:-127.0.0.1}:${ATRI_PORT:-3000}:3000'
     volumes:
       - atri-data:/data
+      # The sandbox lives outside /data because nsjail hides /data behind an
+      # empty tmpfs; if the working directory were inside it, every command
+      # would start with a cwd that no longer exists.
+      - atri-sandbox:/sandbox
     logging:
       driver: json-file
       options:
@@ -28,3 +32,4 @@ services:
     stop_grace_period: 45s
 volumes:
   atri-data:
+  atri-sandbox:

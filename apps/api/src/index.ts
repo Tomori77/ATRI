@@ -15,7 +15,9 @@ const settings = new Settings(store, root);
 const stickers = new Stickers(root, dataDir, store);
 const bridge = new WeChatBridge(store, settings, stickers, (message) => console.warn(message));
 const embeddings = new EmbeddingClient(() => settings.embedding());
-const sandbox = new Sandbox(join(dataDir, 'sandbox'), {
+// The sandbox lives outside DATA_DIR on purpose: nsjail hides the app's data
+// directory behind an empty tmpfs, and the working directory has to survive that.
+const sandbox = new Sandbox(resolve(dataDir, '..', 'sandbox'), {
   enabled: () => settings.config().sandboxEnabled,
   sizeLimitBytes: () => settings.config().sandboxSizeMb * 1024 * 1024,
   // Address space cap only; nsjail needs no cgroup access for rlimits, and a

@@ -45,9 +45,9 @@ COPY assets ./assets
 COPY apps/api/public ./apps/api/public
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY licenses ./licenses
-RUN mkdir -p /data && chown node:node /data
+RUN mkdir -p /data /sandbox && chown node:node /data /sandbox
 USER node
-VOLUME ["/data"]
+VOLUME ["/data", "/sandbox"]
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD node -e "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "dist/server.js"]
