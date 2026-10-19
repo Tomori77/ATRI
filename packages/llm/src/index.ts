@@ -93,6 +93,14 @@ function argumentsOf(value: unknown): Record<string, unknown> {
     return {};
   }
 }
+/** Some models inline reasoning as <think>…</think> in content itself instead
+ *  of a dedicated field. Strip it — balanced tags removed, then a stray
+ *  unmatched tag (often truncated by an output cap) dropped too. */
+function stripThinkTags(text: string): string {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  out = out.replace(/<\/?think>/gi, '');
+  return out.trimStart();
+}
 function imageParts(message: ModelMessage, format: ApiFormat): unknown[] {
   const parts: unknown[] = [
     { text: message.content, ...(format === 'anthropic' ? { type: 'text' } : {}) },
@@ -353,10 +361,16 @@ export class HttpModel implements Model {
       outputTokens = Number(data.usageMetadata?.candidatesTokenCount ?? 0);
     } else {
       const message: Json = data.choices?.[0]?.message ?? {};
+      // Thinking models (GLM, DeepSeek-R1, Qwen-W…, and OpenAI-compatible
+      // gateways generally) return reasoning in dedicated fields. They must
+      // never reach the conversation history: replaying them back inflates
+      // every later request, and they are not meant to be shown or stored.
+      delete message.reasoning_content;
+      delete message.reasoning;
       raw = message;
       text =
         typeof message.content === 'string'
-          ? message.content
+          ? stripThinkTags(message.content)
           : Array.isArray(message.content)
             ? message.content
                 .filter((p: Json) => p.type === 'text')

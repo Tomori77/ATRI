@@ -1114,7 +1114,8 @@ async function loadSettings() {
   try {
     renderSandbox(await api('/api/sandbox'));
   } catch {
-    $('sandbox-status').textContent = '沙箱状态读取失败。';
+    const fallback = $('sandbox-status');
+    fallback.replaceChildren(el('span', '沙箱状态读取失败。', 'hint'));
   }
 }
 

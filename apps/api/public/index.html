@@ -228,7 +228,7 @@
         </section>
 
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">
-          <form id="settings-form" class="settings-stack settings-columns">
+          <form id="settings-form" class="settings-columns">
             <div class="settings-col">
             <section class="card">
               <h2>模型服务</h2>
@@ -322,8 +322,8 @@
                 <span>单条命令内存上限（MB，0 表示不限制）</span>
                 <input id="sandboxMemoryMb" type="number" min="0" max="262144" step="128" required />
               </label>
-              <p class="hint" id="sandbox-status"></p>
-              <div class="actions">
+              <div id="sandbox-status" class="chip-row" role="status"></div>
+              <div class="actions sandbox-actions">
                 <button class="btn ghost" id="refresh-sandbox" type="button">刷新状态</button>
                 <button class="btn ghost danger" id="clear-sandbox" type="button">清空沙箱目录</button>
               </div>

@@ -69,8 +69,34 @@ test('OpenAI 兼容接口保存工具关联、推理续传字段和自定义会�
     (requests[0].init.headers as Record<string, string>)['x-zg-session-id'],
     'conversation:1',
   );
-  assert.equal(requests[1].body.messages[2].reasoning_content, 'opaque provider continuation');
+  // 思考字段不回传：续传消息里不得再出现 reasoning_content，否则每一轮
+  // 都在为上一次的推理内容重复付费（GLM 实测一轮数千 token）。
+  assert.equal(requests[1].body.messages[2].reasoning_content, undefined);
   assert.equal(requests[1].body.messages[3].tool_call_id, 'c1');
+});
+test('思考内容不进文本：reasoning 字段被剥除，<think> 标签被去掉', async () => {
+  const fetcher = (async (_url: unknown, _init: RequestInit) =>
+    Response.json({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: '<think>先想一下</think>好的，这就去查。',
+            reasoning_content: '内部推理串',
+          },
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    })) as typeof fetch;
+  const client = new HttpModel(config, fetcher);
+  const one = await client.complete([
+    { role: 'system', content: '角色' },
+    { role: 'user', content: '去查' },
+  ]);
+  assert.equal(one.text, '好的，这就去查。');
+  const raw = one.continuation.raw as Record<string, unknown>;
+  assert.equal(raw.reasoning_content, undefined);
+  assert.equal(raw.reasoning, undefined);
 });
 test('Anthropic 工具结果映射为 user tool_result，思考块不作为最终文字返回', async () => {
   const bodies: any[] = [];

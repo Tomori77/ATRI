@@ -18,7 +18,6 @@ const make = (
     enabled: boolean;
     network: boolean;
     sizeLimitBytes: number;
-    timeoutMs: number;
     outputLimit: number;
   }> = {},
 ) =>
@@ -26,7 +25,6 @@ const make = (
     enabled: () => patch.enabled ?? true,
     network: () => patch.network ?? false,
     sizeLimitBytes: () => patch.sizeLimitBytes ?? 0,
-    timeoutMs: patch.timeoutMs ?? 0,
     outputLimit: patch.outputLimit ?? 0,
   });
 
@@ -72,20 +70,11 @@ test('沙箱环境里没有模型密钥', { skip: !canRun }, async (t) => {
 
 test('默认没有时间限制，长命令可以跑完', { skip: !canRun }, async (t) => {
   const sandbox = make(temporary(t));
-  // 无超时：不设置 timer，命令自己跑完 4 秒。
+  // 无超时机制：命令自己跑完 4 秒，无人打断。
   const started = Date.now();
   const result = await sandbox.run('sleep 4');
-  assert.equal(result.timedOut, false);
   assert.equal(result.ok, true, result.stderr);
   assert.ok(Date.now() - started >= 3000, '命令应实际运行了完整时长');
-});
-
-test('设置时间上限后超时会杀掉并标记 timedOut', { skip: !canRun }, async (t) => {
-  // 300ms 代替生产的无限制，确认超时路径本身是通的。
-  const sandbox = make(temporary(t), { timeoutMs: 300 });
-  const result = await sandbox.run('sleep 60');
-  assert.equal(result.timedOut, true);
-  assert.equal(result.ok, false);
 });
 
 test('默认输出不受长度限制', { skip: !canRun }, async (t) => {

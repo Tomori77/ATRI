@@ -302,6 +302,17 @@ svg {
   padding: 20px 22px 32px;
 }
 
+/* Non-chat views read as a centered column instead of hugging the nav side.
+   The chat view manages its own two-pane layout and is excluded below. */
+.view[data-panel='journal'] > *,
+.view[data-panel='persona'] > *,
+.view[data-panel='stickers'] > *,
+.view[data-panel='settings'] > * {
+  max-width: 980px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* ---------- 通用组件 ---------- */
 
 .btn {
@@ -369,12 +380,12 @@ svg {
   background: var(--surface);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 18px;
-  margin: 0 0 14px;
+  padding: 20px 24px;
+  margin: 0 0 16px;
 }
 
 .card h2 {
-  margin: 0 0 14px;
+  margin: 0 0 16px;
   font-size: 16px;
 }
 
@@ -456,7 +467,7 @@ svg {
   align-items: baseline;
   gap: 6px;
   margin: 2px 8px 2px 0;
-  padding: 3px 10px;
+  padding: 4px 12px;
   border: 1px solid var(--border-soft);
   border-radius: 999px;
   background: var(--surface-2);
@@ -476,6 +487,19 @@ svg {
 
 .hint.alert-text {
   color: var(--danger);
+}
+
+/* Sandbox status chips sit between the quota fields and the action buttons;
+   breathing room on both sides keeps the three blocks distinct. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+
+.sandbox-actions {
+  margin-top: 4px;
 }
 
 .empty {
@@ -1039,7 +1063,6 @@ svg {
 .journal-list {
   display: grid;
   gap: 12px;
-  max-width: 860px;
 }
 
 .entry-date {
@@ -1134,8 +1157,10 @@ svg {
 
 /* ---------- 表情 ---------- */
 
-.sticker-form {
-  max-width: 1080px;
+/* The browser's native file button hugs the input edge; give the whole
+   control some inner padding so it doesn't look cramped. */
+.sticker-form input[type='file'] {
+  padding: 8px 10px;
 }
 
 .sticker-grid {
@@ -1176,17 +1201,13 @@ svg {
 
 /* ---------- 设置 ---------- */
 
-.settings-stack {
-  max-width: 880px;
+.settings-columns {
+  max-width: 1080px;
 }
 
 /* Desktop only: split settings into two columns so the right side is not dead
    space. Below the breakpoint this falls back to a single stacked column, so
    mobile keeps its original layout. */
-.settings-columns {
-  max-width: none;
-}
-
 @media (min-width: 961px) {
   .settings-columns {
     display: grid;

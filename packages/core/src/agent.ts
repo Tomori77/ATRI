@@ -72,7 +72,6 @@ export interface SandboxTools {
     code: number | null;
     stdout: string;
     stderr: string;
-    timedOut: boolean;
     truncated: boolean;
     durationMs: number;
   }>;
@@ -391,17 +390,23 @@ export function renderHits(
     })
     .join('\n');
 }
+/** Thrown before any request when the assembled messages would exceed the
+ *  input budget. Callers may shrink the conversation and retry. */
+export class BudgetError extends Error {
+  constructor() {
+    super('输入超过当前上下文预算，请在调试页增加输入预算或缩短人物设定、消息。');
+    this.name = 'BudgetError';
+  }
+}
 export class Agent {
   constructor(private readonly o: AgentOptions) {}
-  private async call(
-    task: Task,
+  private async call(    task: Task,
     messages: ModelMessage[],
     tools: ToolDefinition[],
     signal: AbortSignal,
     maxTokens?: number,
   ) {
-    if (estimateRequestTokens(messages, tools) > this.o.contextTokens())
-      throw new Error('输入超过当前上下文预算，请在调试页增加输入预算或缩短人物设定、消息。');
+    if (estimateRequestTokens(messages, tools) > this.o.contextTokens()) throw new BudgetError();
     const started = Date.now();
     const result = await this.o.model().complete(messages, tools, {
       signal,
@@ -736,23 +741,7 @@ export class Agent {
       const completion = call.result;
       if (completion.calls.length) {
         if (!tools.length) throw new Error('模型在工具预算耗尽后仍要求调用工具');
-        // Thinking models ship thousands of reasoning tokens per round (GLM
-        // counts them in output and the gateway ignores max_tokens for them).
-        // Neither the provider (it would recount them) nor our estimate —
-        // which prices CJK at 2 tokens/char, roughly double GLM's real
-        // tokenizer — should ever see them again.
-        const cont = completion.continuation;
-        if (cont.raw && typeof cont.raw === 'object' && !Array.isArray(cont.raw)) {
-          const raw = cont.raw as Record<string, unknown>;
-          delete raw.reasoning_content;
-          delete raw.reasoning;
-          if (typeof raw.content === 'string')
-            raw.content = trimToTokens(
-              raw.content,
-              Math.max(512, Math.floor(this.o.contextTokens() / 8)),
-            );
-        }
-        messages.push(cont);
+        messages.push(completion.continuation);
         toolRounds++;
         for (const call of completion.calls) {
           let result: unknown;
@@ -801,12 +790,13 @@ export class Agent {
           this.o.timeZone(),
         );
       } catch (error) {
-        // The pre-call budget check in call() throws this before any request
-        // goes out. Shrinking is legitimate here: the estimate prices CJK at
-        // ~2 tokens/char, roughly double what GLM actually counts. Drop the
-        // previous round's assistant message first, else the oldest turn;
-        // keep at least system + latest user. call() re-checks every round.
-        if (error instanceof Error && /输入超过当前上下文预算/.test(error.message) && messages.length > 2) {
+        // The pre-call budget check in call() throws BudgetError before any
+        // request goes out — usually our CJK estimate (~2 tokens/char, about
+        // double what GLM actually counts) inflated past the cap after tool
+        // rounds. Drop the previous round's assistant message first, else the
+        // oldest turn; keep at least system + latest user, then retry. The
+        // conversation must degrade gracefully, never dead-end the task.
+        if (error instanceof BudgetError && messages.length > 2) {
           let dropIndex = 1;
           for (let i = 1; i < messages.length - 1; i++)
             if (messages[i]!.role === 'assistant') {

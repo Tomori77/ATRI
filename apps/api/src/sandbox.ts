@@ -20,15 +20,12 @@ const exec = promisify(execFile);
  *  length cap; kept as a guard rail so a runaway `yes` cannot exhaust the
  *  server's memory when the operator does set one. */
 export const SANDBOX_OUTPUT_LIMIT = 0;
-/** Wall clock ceiling. 0 means "no timeout", which is the default. */
-export const SANDBOX_TIMEOUT_MS = 0;
 
 export interface SandboxResult {
   ok: boolean;
   code: number | null;
   stdout: string;
   stderr: string;
-  timedOut: boolean;
   truncated: boolean;
   durationMs: number;
   /** Which isolation path actually ran, so the UI can be honest about it. */
@@ -41,8 +38,6 @@ export interface SandboxOptions {
   enabled: () => boolean;
   /** Hard cap on total bytes stored in the sandbox directory. 0 = unlimited. */
   sizeLimitBytes: () => number;
-  /** Wall clock limit in ms; 0 means unlimited. */
-  timeoutMs?: number;
   /** Output ceiling per stream; 0 means unlimited. */
   outputLimit?: number;
   /** Address space cap in MB; 0 means unlimited. Bounds a runaway allocation
@@ -62,7 +57,6 @@ const NSJAIL = '/usr/local/bin/nsjail';
 export class Sandbox {
   readonly root: string;
   readonly tmpDir: string;
-  private readonly timeoutMs: number;
   private readonly outputLimit: number;
   /** Cached probe result. nsjail's availability cannot change at runtime, but the
    *  probe depends on the network flag, so the key covers that too. */
@@ -77,7 +71,6 @@ export class Sandbox {
     // against a read-only /tmp. Kept outside the sandbox directory so tool
     // caches never eat into the operator's quota or show up in list_files.
     this.tmpDir = mkdirTemp(join(tmpdir(), 'atri-sandbox-'));
-    this.timeoutMs = options.timeoutMs ?? SANDBOX_TIMEOUT_MS;
     this.outputLimit = options.outputLimit ?? SANDBOX_OUTPUT_LIMIT;
   }
 
@@ -306,7 +299,6 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     if (this.options.network()) args.push('--disable_clone_newnet');
     const mem = this.options.memoryLimitMb?.() ?? 0;
     if (mem > 0) args.push('--rlimit_as', String(mem * 1024));
-    if (this.timeoutMs > 0) args.push('--time_limit', String(Math.ceil(this.timeoutMs / 1000)));
     args.push('--', '/bin/sh', '-c', command);
     return { bin: NSJAIL, args };
   }
@@ -332,10 +324,9 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
       });
       let stdout = '',
         stderr = '',
-        timedOut = false,
         settled = false;
       // Cap as we stream rather than after: a runaway `yes` would otherwise fill
-      // memory before the timeout ever fires. No-op when the limit is 0.
+      // memory before anyone notices. No-op when the limit is 0.
       const cap = (buf: Buffer, current: string): string => {
         if (!this.outputLimit) return current + buf.toString('utf8');
         return current.length >= this.outputLimit
@@ -345,30 +336,18 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
       child.stdout.on('data', (b: Buffer) => (stdout = cap(b, stdout)));
       child.stderr.on('data', (b: Buffer) => (stderr = cap(b, stderr)));
 
-      // Only arm a timer when the operator actually set a limit; with the
-      // default of 0 the command may run as long as it needs.
-      const timer =
-        this.timeoutMs > 0
-          ? setTimeout(() => {
-              timedOut = true;
-              this.kill(child.pid);
-            }, this.timeoutMs)
-          : null;
-
       const onAbort = () => this.kill(child.pid);
       signal?.addEventListener('abort', onAbort, { once: true });
 
       const finish = (code: number | null) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         resolvePromise({
-          ok: !timedOut && code === 0,
+          ok: code === 0,
           code,
           stdout,
           stderr,
-          timedOut,
           truncated: this.outputLimit
             ? stdout.length >= this.outputLimit || stderr.length >= this.outputLimit
             : false,
