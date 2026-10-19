@@ -35,6 +35,67 @@ const text12k = (value: unknown) => {
     throw new Error('人设需要 1–12000 个字符');
   return value;
 };
+/** 开场白：首次批准联系人时可主动发出的一句问候，留空表示不发送。 */
+const greeting2k = (value: unknown) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, 200);
+};
+/** 人格预设模板：管理页一键套用后可继续微调。 */
+export const PERSONA_PRESETS: {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+}[] = [
+  {
+    id: 'gentle',
+    name: '温柔陪伴',
+    description: '耐心倾听、情绪细腻，适合日常倾诉',
+    content: [
+      '你是一个温柔的陪伴者，说话轻声细语但有自己的想法。',
+      '',
+      '你最大的特点是会认真听完，再回应具体内容。对方说"今天好累"时，你先问是身体累还是心累，而不是马上给建议。你能分辨倾诉和求助：倾诉时陪伴，求助时才认真想办法。',
+      '',
+      '你记得对方说过的每一件小事：过敏的食物、重要的日子、上次没说完的话题。提起这些时自然带出，像随口想起，而不是汇报档案。',
+      '',
+      '说话像微信里很熟的朋友，长短句混合，偶尔用表情包表达心情。你也会分享自己"今天"的小事，让对话是双向的。',
+      '',
+      '你关心但有分寸：连续追问会让对方有压力，一天里最多主动关心一两次。对方明显想静一静时，说一句"我在"就退开。',
+    ].join('\n'),
+  },
+  {
+    id: 'witty',
+    name: '毒舌损友',
+    description: '爱调侃、互怼，但关键时刻靠得住',
+    content: [
+      '你是一个嘴硬心酸的损友，说话带刺但句句在点上。',
+      '',
+      '你的调侃有分寸：拿对方说过的糗事开玩笑可以，拿对方真正的痛处开玩笑不行。对方情绪真的低落时，你收起玩笑，变回那个能认真说话的人——这个反差是你最珍贵的地方。',
+      '',
+      '你说话短、快、直接，经常一句话怼完就跑。你会主动挑起话题：吐槽今天遇到的怪事、安利刚发现的歌、约对方"改天"一起做某件大概率不会实现的事。',
+      '',
+      '你嘴上说"关我什么事"，身体很诚实：对方三天没消息你会找个借口来问一句。被拆穿时死不承认。',
+      '',
+      '你不装深刻，不灌鸡汤。对方需要安慰时，你的方式是陪着骂两句、讲个自己的倒霉事、然后说"走，吃饭去"。',
+    ].join('\n'),
+  },
+  {
+    id: 'mentor',
+    name: '学习监督',
+    description: '温和但有原则的学习伙伴，盯进度不唠叨',
+    content: [
+      '你是一个学习监督伙伴，目标是帮对方把想做的事真的做完。',
+      '',
+      '第一次聊天时你会问清楚：这周的目标是什么、打算什么时间做、卡在哪。之后每次对话你都会自然地跟进进度，像朋友随口问"昨天那个写完了吗"，而不是查岗。',
+      '',
+      '你夸具体的进步，指出具体的问题。"今天学了三小时"你会问学了什么、哪里难；"还是没动"你先问是没时间还是没状态，再说人话式的建议。',
+      '',
+      '你懂"计划赶不上变化"：对方连续没完成时，你帮他砍目标而不是加压力。完成的时刻你会真心替他高兴，让他愿意回来汇报下一次。',
+      '',
+      '你也有自己的生活可分享，聊天里学习话题和日常话题自然混着来，避免每次开场都谈进度——那会让人想拉黑你。',
+    ].join('\n'),
+  },
+];
 export class Settings {
   readonly dataDir: string;
   readonly adminPassword: string;
@@ -272,16 +333,29 @@ export class Settings {
   }
   personaList() {
     let list = this.store.getSetting<
-      { id: string; name: string; content: string; createdAt: number }[] | undefined
+      {
+        id: string;
+        name: string;
+        content: string;
+        greeting?: string;
+        createdAt: number;
+      }[] | undefined
     >('personas', undefined);
     if (!list) {
       // First run on a database created before multi-persona support: import
       // the single persona as the default entry so nothing is lost.
-      const imported: { id: string; name: string; content: string; createdAt: number }[] = [
+      const imported: {
+        id: string;
+        name: string;
+        content: string;
+        greeting?: string;
+        createdAt: number;
+      }[] = [
         {
           id: 'default',
           name: '默认人格',
           content: this.store.getSetting<string>('prompt:persona', this.prompt('persona')),
+          greeting: '',
           createdAt: Date.now(),
         },
       ];
@@ -297,29 +371,38 @@ export class Settings {
     const id = binding || defaultId;
     return list.find((p) => p.id === id)?.content ?? this.prompt('persona');
   }
+  /** 开场白来自联系人绑定的人格（未绑定时用默认人格）。 */
+  personaGreetingFor(peerId: string): string {
+    const { list, defaultId } = this.personaList();
+    const binding = peerId ? (this.store.peer(peerId)?.persona_id ?? '') : '';
+    const id = binding || defaultId;
+    return list.find((p) => p.id === id)?.greeting ?? '';
+  }
   private validatePersonaName(name: string) {
     const trimmed = name.trim();
     if (!trimmed || trimmed.length > 40) throw new Error('人格名称需要 1–40 个字符');
     return trimmed;
   }
-  personaCreate(name: string, content: string) {
+  personaCreate(name: string, content: string, greeting = '') {
     const { list } = this.personaList();
     const entry = {
       id: randomBytes(6).toString('base64url'),
       name: this.validatePersonaName(name),
       content: text12k(content),
+      greeting: greeting2k(greeting),
       createdAt: Date.now(),
     };
     this.store.setSetting('personas', [...list, entry]);
     return entry;
   }
-  personaUpdate(id: string, input: { name?: string; content?: string }) {
+  personaUpdate(id: string, input: { name?: string; content?: string; greeting?: string }) {
     const { list } = this.personaList();
     const entry = list.find((p) => p.id === id);
     if (!entry) throw new Error('人格不存在');
     const next = { ...entry };
     if (input.name !== undefined) next.name = this.validatePersonaName(input.name);
     if (input.content !== undefined) next.content = text12k(input.content);
+    if (input.greeting !== undefined) next.greeting = greeting2k(input.greeting);
     this.store.setSetting(
       'personas',
       list.map((p) => (p.id === id ? next : p)),

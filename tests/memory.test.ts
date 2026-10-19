@@ -204,3 +204,46 @@ test('很多短消息超过近期窗口时也会整理笔记', async (t) => {
   assert.match(f.store.peer('p1')!.notes, /生活小事/);
   assert.equal(f.store.sources('p1', [old.id]).length, 1);
 });
+
+test('语义去重：新记忆与已有记忆向量高度相似时自动替代旧记忆', async (t) => {
+  const f = fixture(t);
+  // 2 维玩具向量：已有记忆指向 [1,0]，新表述指向 [0.95, 0.31]（与前者夹角极小）
+  const vectors = new Map<string, Float32Array>();
+  const embedder = {
+    configured: true,
+    model: 'toy',
+    embed: async (texts: string[]) =>
+      texts.map((text) => {
+        if (vectors.has(text)) return vectors.get(text)!;
+        // 无关重述 0.5（低于阈值），"搬到"话题 0.95（高于阈值）
+        const v = text.includes('搬到')
+          ? new Float32Array([0.95, 0.31])
+          : new Float32Array([0.5, 0.87]);
+        vectors.set(text, v);
+        return v;
+      }),
+  };
+  (f.runtime as any).options.embedder = embedder;
+  const message = f.store.ingest('p1', 'a', '我住在北京工作').message;
+  f.store.addMemory(
+    'p1',
+    { content: '用户在北京工作', kind: 'stated', sources: [message.id], supersedes: [] },
+    f.store.peer('p1')!.version,
+  );
+  // 生产环境向量由后台回填生成；测试里直接注入
+  const existing = f.store.memories('p1').find((m: any) => m.status === 'active');
+  assert.ok(existing);
+  f.store.setEmbedding(existing.id, 'p1', 'memory', new Float32Array([1, 0]), 'toy');
+  const update = {
+    content: '他现在在上海生活',
+    kind: 'stated' as const,
+    sources: [message.id],
+    supersedes: [] as string[],
+  };
+  await (f.runtime as any).dedupeMemories('p1', [update]);
+  assert.deepEqual(update.supersedes.length, 0);
+  // 相似度 0.95 >= 0.9 → 自动替代
+  const similar = { ...update, content: '他已搬到上海工作' };
+  await (f.runtime as any).dedupeMemories('p1', [similar]);
+  assert.equal(similar.supersedes.length, 1);
+});

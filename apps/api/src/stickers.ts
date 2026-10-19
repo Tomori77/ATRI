@@ -6,22 +6,21 @@ import type { Sticker } from '@atri/core';
 import { sniffMediaMime, isVisionMime } from '@atri/ilink';
 
 export class Stickers {
+  private builtins?: Sticker[];
   constructor(
     readonly root: string,
     readonly dataDir: string,
     private readonly store: Store,
   ) {}
-  list(includeDisabled = false): (Sticker & { disabled: boolean })[] {
-    // Strip a UTF-8 BOM if present: catalogs edited on Windows may carry one,
-    // and JSON.parse rejects it with a confusing "Unexpected token '﻿'".
-    const builtins = JSON.parse(
-      readFileSync(join(this.root, 'assets', 'stickers', 'catalog.json'), 'utf8').replace(
-        /^\uFEFF/,
-        '',
-      ),
+  private catalog(): Sticker[] {
+    this.builtins ??= JSON.parse(
+      readFileSync(join(this.root, 'assets', 'stickers', 'catalog.json'), 'utf8'),
     ) as Sticker[];
+    return this.builtins;
+  }
+  list(includeDisabled = false): (Sticker & { disabled: boolean })[] {
     const disabled = new Set(this.store.getSetting<string[]>('stickers:disabled', []));
-    return [...builtins, ...this.store.getSetting<Sticker[]>('stickers:custom', [])]
+    return [...this.catalog(), ...this.store.getSetting<Sticker[]>('stickers:custom', [])]
       .map((s) => ({ ...s, disabled: disabled.has(s.slug) }))
       .filter((s) => includeDisabled || !s.disabled);
   }

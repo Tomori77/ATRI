@@ -125,6 +125,29 @@ test('文本里漏出的 [表情：x] 会被转换为目录内表情，匹配不
   assert.equal(plain.parts.length, 0);
 });
 
+test('英文伪协议 [sticker:slug] / (sticker:slug) 同样被转换或删除，不再漏进聊天', () => {
+  const stickers = [
+    { slug: 'cat053', description: '猫猫挥手', tags: ['猫', '打招呼'], file: 'cat.png' },
+  ];
+  for (const variant of [
+    '你好呀[sticker:cat053]',
+    '你好呀[sticker: cat053]',
+    '你好呀【sticker:cat053】',
+    '你好呀(sticker:cat053)',
+  ]) {
+    const r = parseReply(JSON.stringify({ messages: [variant], memoryUpdates: [] }), stickers);
+    assert.deepEqual(r.parts, [
+      { type: 'sticker', slug: 'cat053', description: '猫猫挥手' },
+      { type: 'text', text: '你好呀' },
+    ], variant);
+  }
+  const unknown = parseReply(
+    '{"messages":["你好呀[sticker:no-such]"],"memoryUpdates":[]}',
+    stickers,
+  );
+  assert.deepEqual(unknown.parts, [{ type: 'text', text: '你好呀' }]);
+});
+
 test('模型正确走 JSON 协议时行为不变', () => {
   const stickers = [
     { slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' },

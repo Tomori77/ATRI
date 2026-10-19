@@ -9,6 +9,7 @@ import { EmbeddingClient } from '@atri/llm';
 import type { Runtime } from '@atri/core';
 import { sniffMediaMime } from '@atri/ilink';
 import type { Settings } from './config.js';
+import { PERSONA_PRESETS } from './config.js';
 import type { Stickers } from './stickers.js';
 import type { WeChatBridge } from './wechat.js';
 
@@ -29,6 +30,25 @@ export function createServer(o: ServerOptions) {
   const app = Fastify({ bodyLimit: 5 * 1024 * 1024, logger: false });
   const sessions = new Map<string, number>(),
     failures = new Map<string, { count: number; until: number }>();
+  const publicDir = join(o.settings.root, 'apps', 'api', 'public');
+  const staticCache = new Map<string, Buffer>();
+  const asset = (name: string) => {
+    let bytes = staticCache.get(name);
+    if (!bytes) {
+      bytes = readFileSync(join(publicDir, name));
+      staticCache.set(name, bytes);
+    }
+    return bytes;
+  };
+  let qrKey: string | undefined,
+    qrDataUrl: string | undefined;
+  const qrData = async (content: string) => {
+    if (qrKey !== content) {
+      qrKey = content;
+      qrDataUrl = await QRCode.toDataURL(content, { width: 256, margin: 2 });
+    }
+    return qrDataUrl!;
+  };
   const credentials = digest(o.settings.adminPassword);
   app.addHook('onRequest', async (request, reply) => {
     reply.header('x-content-type-options', 'nosniff').header('referrer-policy', 'same-origin');
@@ -60,26 +80,20 @@ export function createServer(o: ServerOptions) {
   });
   app.get('/healthz', () => ({ ok: true }));
   app.get('/', (_request, reply) =>
-    reply
-      .type('text/html; charset=utf-8')
-      .send(readFileSync(join(o.settings.root, 'apps', 'api', 'public', 'index.html'), 'utf8')),
+    reply.type('text/html; charset=utf-8').send(asset('index.html')),
   );
   app.get('/app.js', (_request, reply) =>
-    reply
-      .type('application/javascript; charset=utf-8')
-      .send(readFileSync(join(o.settings.root, 'apps', 'api', 'public', 'app.js'), 'utf8')),
+    reply.type('application/javascript; charset=utf-8').send(asset('app.js')),
   );
   app.get('/app.css', (_request, reply) =>
-    reply
-      .type('text/css; charset=utf-8')
-      .send(readFileSync(join(o.settings.root, 'apps', 'api', 'public', 'app.css'), 'utf8')),
+    reply.type('text/css; charset=utf-8').send(asset('app.css')),
   );
   for (const file of ['atri.webp', 'avatar.webp']) {
     app.get('/' + file, (_request, reply) =>
       reply
         .type('image/webp')
         .header('cache-control', 'public, max-age=86400')
-        .send(readFileSync(join(o.settings.root, 'apps', 'api', 'public', file))),
+        .send(asset(file)),
     );
   }
   app.post<{ Body: { password?: string } }>('/api/login', async (request, reply) => {
@@ -129,9 +143,7 @@ export function createServer(o: ServerOptions) {
       wechat: {
         ...status,
         qrContent: undefined,
-        qrData: status.qrContent
-          ? await QRCode.toDataURL(status.qrContent, { width: 256, margin: 2 })
-          : undefined,
+        qrData: status.qrContent ? await qrData(status.qrContent) : undefined,
       },
       config: o.settings.publicConfig(),
       usage: o.store.usage(),
@@ -139,20 +151,23 @@ export function createServer(o: ServerOptions) {
       issues: o.store.issues(),
       // Read-only view of "how is she doing": mood, next proactive window,
       // loops waiting. Previously this data was invisible in the admin UI.
-      states: o.store.peers().map((peer) => {
-        const mood = o.store.mood(peer.id);
-        const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
-        return {
-          peerId: peer.id,
-          address: peer.address,
-          approved: !!peer.approved,
-          mood: mood.at ? mood : undefined,
-          dueLoops: dueLoops.length,
-          lastUserAt: peer.last_user_at,
-          lastProactiveAt: peer.last_proactive_at,
-          vectors: o.store.embeddingStatus().count,
-        };
-      }),
+      states: (() => {
+        const vectors = o.store.embeddingStatus().count;
+        return o.store.peers().map((peer) => {
+          const mood = o.store.mood(peer.id);
+          const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
+          return {
+            peerId: peer.id,
+            address: peer.address,
+            approved: !!peer.approved,
+            mood: mood.at ? mood : undefined,
+            dueLoops: dueLoops.length,
+            lastUserAt: peer.last_user_at,
+            lastProactiveAt: peer.last_proactive_at,
+            vectors,
+          };
+        });
+      })(),
     };
   });
   app.post('/api/wechat/login', () => o.bridge.login());
@@ -184,18 +199,22 @@ export function createServer(o: ServerOptions) {
     );
     return { list, defaultId, bindings };
   });
+  app.get('/api/persona-presets', () =>
+    PERSONA_PRESETS.map(({ id, name, description }) => ({ id, name, description })),
+  );
   app.post<{ Body: { name: string; content: string } }>('/api/personas', (request) =>
     o.settings.personaCreate(text(request.body.name, 40), text(request.body.content)),
   );
-  app.put<{ Params: { id: string }; Body: { name?: string; content?: string } }>(
+  app.put<{ Params: { id: string }; Body: { name?: string; content?: string; greeting?: string } }>(
     '/api/personas/:id',
     (request) => {
       const input = request.body ?? {};
-      if (input.name === undefined && input.content === undefined)
+      if (input.name === undefined && input.content === undefined && input.greeting === undefined)
         throw new Error('没有需要保存的修改');
       return o.settings.personaUpdate(request.params.id, {
         ...(input.name !== undefined ? { name: text(input.name, 40) } : {}),
         ...(input.content !== undefined ? { content: text(input.content) } : {}),
+        ...(input.greeting !== undefined ? { greeting: text(input.greeting, 200) } : {}),
       });
     },
   );
@@ -295,7 +314,14 @@ export function createServer(o: ServerOptions) {
   app.put<{ Params: { id: string }; Body: { approved: boolean } }>('/api/peers/:id', (request) => {
     if (typeof request.body.approved !== 'boolean' || !o.store.peer(request.params.id))
       throw new Error('联系人或设置无效');
+    const peer = o.store.peer(request.params.id)!;
     o.store.approve(request.params.id, request.body.approved);
+    // First approval of a real contact: queue a one-shot greeting proactive
+    // task. The dedupe key makes it fire at most once per peer, ever.
+    if (request.body.approved && !peer.approved && peer.channel === 'wechat') {
+      const greeting = o.settings.personaGreetingFor(peer.id);
+      o.store.enqueue(peer.id, 'proactive', 'greeting', { greeting }, Date.now());
+    }
     o.runtime.pump();
     return { ok: true };
   });
@@ -401,7 +427,10 @@ export function createServer(o: ServerOptions) {
   app.get('/api/stickers', () => o.stickers.list(true).map(({ file, ...s }) => s));
   app.get<{ Params: { slug: string } }>('/api/stickers/:slug/image', (request, reply) => {
     const bytes = o.stickers.bytes(request.params.slug);
-    return reply.type(sniffMediaMime(bytes) ?? 'application/octet-stream').send(bytes);
+    return reply
+      .type(sniffMediaMime(bytes) ?? 'application/octet-stream')
+      .header('cache-control', 'public, max-age=86400')
+      .send(bytes);
   });
   app.post<{ Body: { slug: string; description: string; tags: string[]; base64: string } }>(
     '/api/stickers',

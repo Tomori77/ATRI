@@ -8,6 +8,7 @@ import type {
 } from '@atri/db';
 import type { Model, ModelMessage, ToolDefinition } from '@atri/llm';
 import { estimateRequestTokens, estimateTextTokens, trimToTokens } from '@atri/llm';
+import { hourFormatter } from '@atri/db';
 import {
   parseJson,
   parseMemories,
@@ -92,31 +93,48 @@ export const INFO_TOOLS: ToolDefinition[] = [
     parameters: object({ url: string }, ['url']),
   },
 ];
+const sourceFormatters = new Map<string, Intl.DateTimeFormat>();
+function sourceFormatter(timeZone: string): Intl.DateTimeFormat {
+  let formatter = sourceFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    });
+    sourceFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+const momentFormatters = new Map<string, Intl.DateTimeFormat>();
+function momentFormatter(timeZone: string): Intl.DateTimeFormat {
+  let formatter = momentFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      dateStyle: 'full',
+      timeStyle: 'short',
+    });
+    momentFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
 /** Timezone is provided by the host config; tests use Asia/Shanghai by default. */
 export function renderMessage(m: Message, timeZone = 'Asia/Shanghai'): string {
   const media = m.media
     .map((a) => (a.description ? `[${a.kind}，模型观察：${a.description}]` : `[收到${a.kind}附件]`))
     .join('\n');
-  const at = new Intl.DateTimeFormat('zh-CN', {
-    timeZone,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).format(new Date(m.created_at));
+  const at = sourceFormatter(timeZone).format(new Date(m.created_at));
   return `[来源 ${m.id} | ${at}]\n${m.content}${media ? '\n' + media : ''}`;
 }
 /** Time-awareness: how the current moment relates to the last message. */
 export function renderTimeGap(now: number, lastAt: number, timeZone: string): string {
   const gapMs = Math.max(0, now - lastAt);
   const minutes = Math.floor(gapMs / 60000);
-  const formatter = new Intl.DateTimeFormat('zh-CN', {
-    timeZone,
-    dateStyle: 'full',
-    timeStyle: 'short',
-  });
-  const moment = `现在是${formatter.format(new Date(now))}`;
+  const moment = `现在是${momentFormatter(timeZone).format(new Date(now))}`;
   if (gapMs < SILENCE_NOTIFY_MINUTES * 60000)
     return `${moment}（距上一条消息不到 ${Math.max(1, minutes)} 分钟，是连续聊天）`;
   if (gapMs < 24 * 3600000) {
@@ -212,19 +230,13 @@ export function renderOpenLoops(
   timeZone: string,
 ): string {
   if (!loops.length) return '';
-  const formatter = new Intl.DateTimeFormat('zh-CN', {
-    timeZone,
-    month: 'numeric',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  const formatter = sourceFormatter(timeZone);
   return `未完的约定（对方提到过的安排，适合主动关心结果；每件只问一次，问过就放下）：\n${loops
     .map((l) => {
       const due = formatter.format(new Date(l.due_at));
       return `- [id:${l.id}] ${l.content}（约定时间：${l.due_text || due}${l.recurring === 'yearly' ? '，每年循环' : ''}）`;
     })
-    .join('\n')}\n若本轮对方话语表明某件已完成，用 resolveLoops 数组带上其 id（如 "resolveLoops":["id"]）了结；本轮你实际问到的那一件，用 askedLoops 数组带上其 id（如 "askedLoops":["id"]），没问就别填；若对方提出新的具体安排，用 openLoops 数组记录 {content, dueAt(毫秒时间戳) 或 due("明天 08:00" 这类本地时间), dueText, sources, recurring:"yearly"(生日纪念日等每年循环时填)}。当前时间戳：${now}。`;
+    .join('\n')}\nresolveLoops/askedLoops/openLoops 的字段用法见上方对话规则。当前时间戳：${now}。`;
 }
 /** Rotate the sticker window so the tail of the catalog is reachable: the
  *  window steps by day, minus stickers used in the last few turns. */
@@ -253,6 +265,26 @@ export function renderMemories(
       (m) =>
         `- ${m.content}（id:${m.id}，${m.kind === 'stated' ? '对话确认' : '主观理解'}${m.pinned ? '，置顶' : ''}）`,
     )
+    .join('\n');
+}
+/** Recalled hits as compact prose lines instead of JSON — the model needs the
+ *  text, its speaker and citation id, not score or raw timestamps. */
+export function renderHits(
+  hits: { id: string; kind: string; role?: string; content: string; created_at: number }[],
+  timeZone: string,
+): string {
+  if (!hits.length) return '暂无';
+  const formatter = sourceFormatter(timeZone);
+  return hits
+    .map((h) => {
+      const who =
+        h.kind === 'message'
+          ? (h.role === 'user' ? '对方' : '你') + '说'
+          : h.kind === 'memory'
+            ? '记忆'
+            : '日记';
+      return `- ${h.content}（${who}，${formatter.format(new Date(h.created_at))}，id:${h.id}）`;
+    })
     .join('\n');
 }
 export class Agent {
@@ -290,8 +322,6 @@ export class Agent {
   /** Budget planning: choose system prompt, recalled material and recent turns. */
   private async planReply(task: Task, peer: { id: string; notes: string }, history: Message[], now: number) {
     const { store } = this.o;
-    const through =
-      typeof task.payload.through === 'number' ? task.payload.through : Number.MAX_SAFE_INTEGER;
     const query = history
       .filter((m) => m.role === 'user')
       .slice(-RECALL_QUERY_MESSAGES)
@@ -328,17 +358,11 @@ export class Agent {
     const lastUser = [...history].reverse().find((m) => m.role === 'user');
     const timeLine = lastUser
       ? renderTimeGap(now, lastUser.created_at, this.o.timeZone())
-      : `现在是${new Intl.DateTimeFormat('zh-CN', { timeZone: this.o.timeZone(), dateStyle: 'full', timeStyle: 'long' }).format(new Date(now))}`;
+      : `现在是${momentFormatter(this.o.timeZone()).format(new Date(now))}`;
     const stickerLines = stickers.map(({ slug, description }) => `${slug}：${description}`);
     const mood = store.mood(peer.id);
     const rhythm = store.activityRhythm(peer.id, this.o.timeZone());
-    const currentHour = Number(
-      new Intl.DateTimeFormat('en-GB', {
-        timeZone: this.o.timeZone(),
-        hour: '2-digit',
-        hourCycle: 'h23',
-      }).format(new Date(now)),
-    );
+    const currentHour = Number(hourFormatter(this.o.timeZone()).format(new Date(now)));
     const openLoops = store.dueOpenLoops(peer.id, now);
     // Stable prefix first: persona, behaviour rules and the sticker catalogue
     // change rarely (or only once a day), so providers with automatic prefix
@@ -384,18 +408,18 @@ export class Agent {
     optional -= estimateTextTokens(notes);
     const memoryBudget = Math.min(3000, optional);
     const pickedMemories = [...memories];
-    while (
-      pickedMemories.length &&
-      estimateTextTokens(renderMemories(pickedMemories)) > memoryBudget
-    )
-      pickedMemories.pop();
-    optional -= estimateTextTokens(renderMemories(pickedMemories));
+    let memoriesTokens = estimateTextTokens(renderMemories(pickedMemories));
+    while (pickedMemories.length && memoriesTokens > memoryBudget) {
+      memoriesTokens -= estimateTextTokens(renderMemories([pickedMemories.pop()!]) + '\n');
+    }
+    optional -= memoriesTokens;
     const pickedRecalled = [...recalled];
-    while (
-      pickedRecalled.length &&
-      estimateTextTokens(JSON.stringify(pickedRecalled)) > Math.max(0, optional)
-    )
-      pickedRecalled.pop();
+    const recalledBudget = Math.max(0, optional);
+    let recalledTokens = estimateTextTokens(renderHits(pickedRecalled, this.o.timeZone()));
+    while (pickedRecalled.length && recalledTokens > recalledBudget) {
+      recalledTokens -= estimateTextTokens(renderHits([pickedRecalled.pop()!], this.o.timeZone()) + '\n');
+    }
+    optional -= recalledTokens;
     // 聊天内读空气: terse user replies mean pull back, not pile on questions.
     // Count meaningful characters after collapsing runs: "哈哈哈哈哈哈" is
     // long in raw length but is exactly as much content as "哈哈".
@@ -411,7 +435,7 @@ export class Agent {
       base,
       `当前话题笔记（资料）：\n${notes || '暂无'}`,
       `必要认识（资料，括号内是对话确认/主观理解与引用 id）：\n${renderMemories(pickedMemories)}`,
-      `相关旧事（资料）：\n${JSON.stringify(pickedRecalled)}`,
+      `相关旧事（资料）：\n${renderHits(pickedRecalled, this.o.timeZone())}`,
       terse ? '对方最近几条回复都很短，此刻收着点说：不要连环提问，不要长篇大论，给对方留出空间。' : '',
     ]
       .filter(Boolean)
@@ -467,7 +491,7 @@ export class Agent {
       let images: string[] = [];
       if (this.o.images && imageMessages.some((i) => i.id === m.id))
         images = await this.o.images(m);
-      const updated = store.getMessage(peer.id, m.id) ?? m;
+      const updated = m.media.length ? store.getMessage(peer.id, m.id) ?? m : m;
       messages.push({
         role: m.role,
         content: renderMessage(updated, this.o.timeZone()),
@@ -475,6 +499,23 @@ export class Agent {
       });
     }
     if (task.kind === 'proactive') {
+      if (typeof task.payload.greeting === 'string') {
+        // First-contact hello: no shared history to ground in, only the
+        // persona's configured opening line as style reference.
+        const greeting = (task.payload.greeting as string).slice(0, 200);
+        messages.push({
+          role: 'user',
+          content: [
+            '这是你们刚加上好友后的第一次主动问候，你们之间还没有任何聊天记录。',
+            greeting
+              ? `人格设定里准备了一句开场白（用自己的话自然说出来，可以改写，别照念）：${greeting}`
+              : '自然地打个招呼，简单介绍自己，留一个让对方容易接话的话头。',
+            '回复要短，一两句话就够。',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        });
+      } else {
       // Ground the ping in real material: her own recent diary voice and the
       // openings of past pings, so she neither skips nor repeats herself.
       const lastDiary = store
@@ -506,11 +547,21 @@ export class Agent {
           .filter(Boolean)
           .join('\n'),
       });
+      }
     }
     if (messages.length === 1) messages.push({ role: 'user', content: '请自然开始对话。' });
     // Retain the latest input and whole provider messages when images add input cost.
-    while (messages.length > 2 && estimateRequestTokens(messages, INFO_TOOLS) > plan.budget) {
-      messages.splice(1, 1);
+    const messageTokens = (m: ModelMessage) =>
+      32 +
+      estimateTextTokens(
+        m.raw === undefined
+          ? m.content + (m.calls ? JSON.stringify(m.calls) : '')
+          : JSON.stringify(m.raw),
+      ) +
+      (m.images?.length ?? 0) * 4096;
+    let totalTokens = estimateRequestTokens(messages, INFO_TOOLS);
+    while (messages.length > 2 && totalTokens > plan.budget) {
+      totalTokens -= messageTokens(messages.splice(1, 1)[0]!);
       plan.recent.shift();
     }
     const result = await this.runToolLoop(task, messages, plan.available, signal);
@@ -686,12 +737,12 @@ export class Agent {
     const budget = this.o.contextTokens();
     const notes = trimToTokens(peer.notes, Math.min(NOTES_MAX_TOKENS, budget * 0.08));
     const memories = store.rankedMemories(peer.id, 12);
-    while (
-      memories.length &&
-      estimateTextTokens(JSON.stringify(memories)) > Math.min(3000, budget * 0.15)
-    )
-      memories.pop();
-    const background = `日期：${String(task.payload.day ?? '')}\n当前话题笔记：${notes}\n已知认识：${JSON.stringify(memories)}\n本次原始记录：\n`;
+    let memoriesTokens = estimateTextTokens(renderMemories(memories));
+    const memoryBudget = Math.min(3000, budget * 0.15);
+    while (memories.length && memoriesTokens > memoryBudget) {
+      memoriesTokens -= estimateTextTokens(renderMemories([memories.pop()!]) + '\n');
+    }
+    const background = `日期：${String(task.payload.day ?? '')}\n当前话题笔记：${notes}\n已知认识：\n${renderMemories(memories)}\n本次原始记录：\n`;
     const availableTokens =
       budget -
       estimateRequestTokens([

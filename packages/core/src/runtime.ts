@@ -1,6 +1,7 @@
-import type { Store, Peer, ReplyPart, Task, Media } from '@atri/db';
+import type { Store, Peer, ReplyPart, Task, Media, MemoryUpdate } from '@atri/db';
+import { hourFormatter } from '@atri/db';
 import { Agent, renderMessage, type AgentOptions } from './agent.js';
-import { estimateTextTokens } from '@atri/llm';
+import { estimateTextTokens, cosineSimilarity } from '@atri/llm';
 import {
   NOTES_MIN_MESSAGES,
   NOTES_WINDOW,
@@ -11,6 +12,7 @@ import {
   EMBED_BACKFILL_BATCH,
   PROACTIVE_IGNORE_LIMIT,
   PROACTIVE_IGNORE_COOLDOWN_DAYS,
+  SIMILARITY_SUPERSEDE,
 } from './constants.js';
 
 /** Minimal embedding surface the runtime needs; implemented by apps/api. */
@@ -52,21 +54,23 @@ export interface RuntimeOptions extends AgentOptions {
   log?: (message: string, details?: unknown) => void;
   embedder?: Embedder;
 }
+const dayFormatters = new Map<string, Intl.DateTimeFormat>();
 export function dayAt(at: number, timeZone: string): string {
-  const p = new Intl.DateTimeFormat('en-CA', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(new Date(at));
+  let formatter = dayFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    dayFormatters.set(timeZone, formatter);
+  }
+  const p = formatter.formatToParts(new Date(at));
   return ['year', 'month', 'day'].map((t) => p.find((v) => v.type === t)!.value).join('-');
 }
 function hourAt(at: number, timeZone: string) {
-  return Number(
-    new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', hourCycle: 'h23' }).format(
-      new Date(at),
-    ),
-  );
+  return Number(hourFormatter(timeZone).format(new Date(at)));
 }
 export function inQuietHours(hour: number, start: number, end: number) {
   return start === end
@@ -228,7 +232,8 @@ export class Runtime {
         entry.kind = 'delivery';
         const task = this.store.taskById(deliveries[0].task_id)!;
         if (task.version !== peer.version && this.store.cancelUnsent(task)) continue;
-        for (const delivery of deliveries.filter((d) => d.task_id === task.id)) {
+        const own = deliveries.filter((d) => d.task_id === task.id);
+        for (const delivery of own) {
           this.store.startDelivery(delivery.id);
           try {
             await this.options.transport.send(this.store.peer(peerId)!, delivery.part, delivery.id);
@@ -244,9 +249,7 @@ export class Runtime {
           if (delivery !== deliveries.at(-1)) {
             // Human-like pacing: longer bubbles get longer pauses, never a
             // machine-gun burst. Capped so a batch still sends promptly.
-            const next = deliveries.filter((d) => d.task_id === task.id)[
-              deliveries.filter((d) => d.task_id === task.id).indexOf(delivery) + 1
-            ];
+            const next = own[own.indexOf(delivery) + 1];
             const chars = next?.part.type === 'text' ? (next.part.text?.length ?? 0) : 6;
             await new Promise((r) =>
               setTimeout(r, Math.min(2500, 400 + Math.min(80, chars) * 25)),
@@ -267,13 +270,21 @@ export class Runtime {
       ]);
       try {
         if (task.kind === 'chat' || task.kind === 'proactive') {
-          if (task.kind === 'proactive' && !this.proactiveGate(task, peer, Date.now())) {
+          // Greeting tasks are the first-contact hello queued on approval; the
+          // normal proactive gate (silence clock, quiet hours) would veto a
+          // peer that has never messaged, so greetings skip it.
+          if (
+            task.kind === 'proactive' &&
+            task.payload.greeting === undefined &&
+            !this.proactiveGate(task, peer, Date.now())
+          ) {
             this.store.finish(task.id);
             continue;
           }
           const typing = this.options.transport.typing?.(peer, true).catch(() => {});
           try {
             const reply = await this.agent.reply(task, signal);
+            await this.dedupeMemories(peerId, reply.memories, signal);
             const saved = this.store.saveReply(task, reply.parts, reply.memories);
             if (saved) {
               this.applyOpenLoops(task, reply);
@@ -310,6 +321,41 @@ export class Runtime {
           this.store.finish(task.id, 'failed', error instanceof Error ? error.message : '任务失败');
           this.options.log?.('任务失败', { task: task.id, kind: task.kind, error: String(error) });
         }
+      }
+    }
+  }
+  /** Semantic duplicate guard: models restate known facts in new wording and
+   *  only sometimes fill supersedes. Before persisting, embed each new memory
+   *  and, when it lands within SIMILARITY_SUPERSEDE of an active memory vector,
+   *  auto-supersede the old row so recall stays clean. Failures (no embedder,
+   *  embedding error) keep the model-provided supersedes untouched. */
+  private async dedupeMemories(peer: string, updates: MemoryUpdate[], signal?: AbortSignal) {
+    const embedder = this.options.embedder;
+    if (!updates.length || !embedder || embedder.enabled === false || !embedder.configured) return;
+    const memories = this.store.embeddings(peer).filter((e) => e.kind === 'memory');
+    if (!memories.length) return;
+    for (const update of updates) {
+      if (update.content.trim().length < 4) continue;
+      let vector: Float32Array | undefined;
+      try {
+        [vector] = await embedder.embed([update.content], signal);
+      } catch {
+        continue;
+      }
+      if (!vector?.some((v) => v !== 0)) continue;
+      let bestId = '',
+        bestSim = 0;
+      for (const row of memories) {
+        if (row.dims !== vector.length || row.model !== embedder.model) continue;
+        const sim = cosineSimilarity(vector, row.vector);
+        if (sim > bestSim) {
+          bestSim = sim;
+          bestId = row.id;
+        }
+      }
+      if (bestSim >= SIMILARITY_SUPERSEDE) {
+        const superseded = new Set([...(update.supersedes ?? []), bestId]);
+        update.supersedes = [...superseded].slice(0, 12);
       }
     }
   }
