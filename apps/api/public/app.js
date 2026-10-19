@@ -1,5 +1,7 @@
 const $ = (id) => document.getElementById(id);
-const textSettings = ['format', 'model', 'baseUrl', 'timeZone', 'embeddingModel', 'embeddingBaseUrl'];const numberSettings = [
+const enc = encodeURIComponent;
+const textSettings = ['model', 'baseUrl', 'timeZone', 'embeddingModel', 'embeddingBaseUrl'];
+const numberSettings = [
   'contextWindowTokens',
   'inputBudgetTokens',
   'maxOutputTokens',
@@ -12,12 +14,17 @@ const textSettings = ['format', 'model', 'baseUrl', 'timeZone', 'embeddingModel'
   'maxConcurrentPeers',
   'debounceMs',
 ];
-const formatNumber = (value) => (Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—');
 const purposeName = (value) =>
   ({ chat: '对话', diary: '日记', notes: '话题整理', proactive: '主动联系' })[value] || value;
+const formatNumber = (value) => (Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—');
+
 let authenticated = false,
-  currentTab = 'overview',
+  currentTab = 'chat',
+  currentPeer = 'preview:default',
   peers = [],
+  personaState = { list: [], defaultId: '', bindings: {} },
+  personaSelected = '',
+  stickerMap = new Map(),
   lastTask = null,
   lastQr = '',
   noticeTimer,
@@ -25,49 +32,31 @@ let authenticated = false,
   polling = false,
   chatSnapshot = '',
   journalSnapshot = '',
-  waitingReply = false;
-function show(message, error = false) {
-  clearTimeout(noticeTimer);
-  $('notice').textContent = message;
-  $('notice').classList.toggle('error', error);
-  $('notice').hidden = false;
-  noticeTimer = setTimeout(
-    () => {
-      $('notice').hidden = true;
-    },
-    error ? 12000 : 6000,
-  );
-}
-async function api(path, method = 'GET', body) {
-  const response = await fetch(path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const result = await response.json();
-  if (response.status === 401) {
-    authenticated = false;
-    $('dashboard').hidden = true;
-    $('login').hidden = false;
-    $('logout').hidden = true;
-    $('connection').textContent = '管理空间';
-    $('connection').classList.remove('online');
-  }
-  if (!response.ok) throw new Error(result.error || '请求失败');
-  return result;
-}
+  peersSnapshot = '',
+  journalSub = 'diaries',
+  journalPoll = 0,
+  waitingReply = false,
+  waitingBaseline = 0,
+  personaSelects = new Map(),
+  formatDropdown = null,
+  journalDropdown = null,
+  presetDropdown = null,
+  personaPresets = [];
+
 function el(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
   if (className) node.className = className;
   return node;
 }
+
 function button(label, handler, classes = 'ghost small') {
-  const node = el('button', label, classes);
+  const node = el('button', label, 'btn ' + classes);
   node.type = 'button';
   node.onclick = () => perform(handler, node);
   return node;
 }
+
 async function perform(action, node) {
   try {
     if (node) node.disabled = true;
@@ -78,13 +67,25 @@ async function perform(action, node) {
     if (node) node.disabled = false;
   }
 }
+
+function show(message, error = false) {
+  clearTimeout(noticeTimer);
+  const toast = $('notice');
+  toast.textContent = message;
+  toast.classList.toggle('error', error);
+  toast.hidden = false;
+  noticeTimer = setTimeout(
+    () => {
+      toast.hidden = true;
+    },
+    error ? 12000 : 6000,
+  );
+}
+
 function empty(node, message) {
   node.replaceChildren(el('p', message, 'empty'));
 }
-const enc = encodeURIComponent;
-/** Inline confirmation for destructive actions: first tap arms the button
- *  ("确认删除？"), second tap within 3s fires, then it resets. Replaces
- *  native confirm() which is unstyleable and awkward on mobile. */
+
 function confirmButton(label, message, handler, classes = 'ghost small danger') {
   const node = button(label, async () => {
     if (node.dataset.armed !== '1') {
@@ -107,85 +108,214 @@ function confirmButton(label, message, handler, classes = 'ghost small danger') 
   }, classes);
   return node;
 }
-async function loadPeers() {
-  peers = await api('/api/peers');
-  const wechatPeers = peers.filter((p) => p.channel === 'wechat');
-  $('overview-peers').textContent = formatNumber(wechatPeers.filter((p) => p.approved).length);
-  const target = $('peers');
-  target.replaceChildren();
-  if (!wechatPeers.length) empty(target, '扫码登录后，让同学发来第一条微信消息。');
-  for (const peer of wechatPeers) {
-    const row = el('div', undefined, 'row'),
-      heading = el('div', undefined, 'row-title');
-    heading.append(
-      el('span', peer.address),
-      button(peer.approved ? '暂停回复' : '允许使用', async () => {
-        await api('/api/peers/' + enc(peer.id), 'PUT', { approved: !peer.approved });
-        await loadPeers();
-      }),
-    );
-    const personaSelect = document.createElement('select');
-    personaSelect.dataset.personaFor = peer.id;
-    personaSelect.setAttribute('aria-label', '人格选择：' + peer.address);
-    personaSelect.onchange = () =>
-      perform(async () => {
-        await api('/api/peers/' + enc(peer.id) + '/persona', 'PUT', {
-          personaId: personaSelect.value,
-        });
-        personaState.bindings[peer.id] = personaSelect.value;
-        show('该联系人的人格已更新。');
-      }, personaSelect);
-    if (personaState.list.length) fillPersonaSelect(personaSelect, peer.persona_id ?? '');
-    row.append(heading, personaSelect);
-    target.append(row);
+
+const openDropdowns = new Set();
+function createDropdown({ options = [], value = '', onChange, ariaLabel = '', placeholder = '请选择' }) {
+  const root = el('div', undefined, 'dropdown');
+  const toggle = el('button', undefined, 'dropdown-toggle');
+  toggle.type = 'button';
+  toggle.setAttribute('aria-haspopup', 'listbox');
+  toggle.setAttribute('aria-expanded', 'false');
+  if (ariaLabel) toggle.setAttribute('aria-label', ariaLabel);
+  const label = el('span', undefined, 'dropdown-label');
+  toggle.append(label, el('span', undefined, 'dropdown-caret'));
+  const menu = el('div', undefined, 'dropdown-menu');
+  menu.setAttribute('role', 'listbox');
+  menu.hidden = true;
+  root.append(toggle, menu);
+  let current = value;
+  let list = options;
+
+  function renderLabel() {
+    const found = list.find((o) => o.value === current);
+    label.textContent = found ? found.label : placeholder;
+    toggle.classList.toggle('placeholder', !found);
   }
-  // The preview peer drives 试聊, so it needs persona binding too — the old UI
-  // could only ever test the default persona.
-  const previewPeer = peers.find((p) => p.id === 'preview:default');
-  if (previewPeer) {
-    const row = el('div', undefined, 'row'),
-      heading = el('div', undefined, 'row-title');
-    heading.append(el('span', '本地试聊'));
-    const personaSelect = document.createElement('select');
-    personaSelect.dataset.personaFor = previewPeer.id;
-    personaSelect.setAttribute('aria-label', '人格选择：本地试聊');
-    personaSelect.onchange = () =>
-      perform(async () => {
-        await api('/api/peers/' + enc(previewPeer.id) + '/persona', 'PUT', {
-          personaId: personaSelect.value,
-        });
-        personaState.bindings[previewPeer.id] = personaSelect.value;
-        show('试聊人格已更新，下一次对话生效。');
-      }, personaSelect);
-    if (personaState.list.length) fillPersonaSelect(personaSelect, previewPeer.persona_id ?? '');
-    row.append(heading, personaSelect);
-    target.append(row);
-  }
-  for (const id of ['chat-peer', 'journal-peer']) {
-    const select = $(id),
-      selected = select.value;
-    select.replaceChildren();
-    const preview = el('option', '本地试聊');
-    preview.value = 'preview:default';
-    select.append(preview);
-    for (const peer of peers.filter((p) => p.id !== 'preview:default')) {
-      const option = el('option', peer.address);
-      option.value = peer.id;
-      select.append(option);
+  function renderMenu() {
+    menu.replaceChildren();
+    for (const opt of list) {
+      const item = el('button', undefined, 'dropdown-option' + (opt.value === current ? ' selected' : ''));
+      item.type = 'button';
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', String(opt.value === current));
+      item.textContent = opt.label;
+      item.title = opt.label;
+      item.onclick = () => {
+        setValue(opt.value, true);
+        close();
+        toggle.focus();
+      };
+      menu.append(item);
     }
-    if ([...select.options].some((o) => o.value === selected)) select.value = selected;
+    if (!list.length) menu.append(el('p', '暂无选项', 'dropdown-empty'));
   }
+  function setValue(next, fire) {
+    const changed = next !== current;
+    current = next;
+    renderLabel();
+    if (!menu.hidden) renderMenu();
+    if (fire && changed) onChange?.(current);
+  }
+  function open() {
+    for (const d of openDropdowns) d.close();
+    renderMenu();
+    menu.hidden = false;
+    root.classList.add('open');
+    toggle.setAttribute('aria-expanded', 'true');
+    openDropdowns.add(api);
+  }
+  function close() {
+    menu.hidden = true;
+    root.classList.remove('open');
+    toggle.setAttribute('aria-expanded', 'false');
+    openDropdowns.delete(api);
+  }
+  function focusCurrent() {
+    const items = [...menu.querySelectorAll('.dropdown-option')];
+    (items.find((i) => i.classList.contains('selected')) ?? items[0])?.focus();
+  }
+  toggle.onclick = () => (menu.hidden ? open() : close());
+  toggle.addEventListener('keydown', (event) => {
+    if (menu.hidden && ['ArrowDown', 'ArrowUp', 'Enter', ' '].includes(event.key)) {
+      event.preventDefault();
+      open();
+      focusCurrent();
+    }
+  });
+  menu.addEventListener('keydown', (event) => {
+    const items = [...menu.querySelectorAll('.dropdown-option')];
+    const index = items.indexOf(document.activeElement);
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      items[Math.min(items.length - 1, index + 1)]?.focus();
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      items[Math.max(0, index - 1)]?.focus();
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      items[0]?.focus();
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      items.at(-1)?.focus();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      close();
+      toggle.focus();
+    } else if (event.key === 'Tab') close();
+  });
+  document.addEventListener('click', (event) => {
+    if (openDropdowns.has(api) && !root.contains(event.target)) close();
+  });
+  renderLabel();
+  const api = {
+    root,
+    get value() {
+      return current;
+    },
+    set value(next) {
+      setValue(next, false);
+    },
+    setOptions(nextOptions, nextValue) {
+      list = nextOptions;
+      if (nextValue !== undefined) current = nextValue;
+      renderLabel();
+      if (!menu.hidden) renderMenu();
+    },
+    close,
+  };
+  return api;
 }
-async function status() {
+
+async function api(path, method = 'GET', body) {
+  const response = await fetch(path, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error('服务返回异常');
+  }
+  if (response.status === 401 && authenticated) {
+    authenticated = false;
+    $('dashboard').hidden = true;
+    $('login').hidden = false;
+    $('connection-text').textContent = '管理空间';
+    $('connection').classList.remove('online');
+  }
+  if (!response.ok) throw new Error(result.error || '请求失败');
+  return result;
+}
+
+function clockTime(ts) {
+  return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function relTime(ts) {
+  const date = new Date(ts);
+  const now = Date.now();
+  if (now - ts < 60_000) return '刚刚';
+  if (now - ts < 3_600_000) return Math.floor((now - ts) / 60_000) + ' 分钟前';
+  const today = new Date();
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  if (sameDay(date, today)) return clockTime(ts);
+  const yesterday = new Date(today.getTime() - 86_400_000);
+  if (sameDay(date, yesterday)) return '昨天 ' + clockTime(ts);
+  const sameYear = date.getFullYear() === today.getFullYear();
+  const monthDay = date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  return sameYear ? monthDay + ' ' + clockTime(ts) : date.toLocaleDateString('zh-CN');
+}
+
+function dayLabel(ts) {
+  const date = new Date(ts);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return '今天';
+  if (date.toDateString() === new Date(today.getTime() - 86_400_000).toDateString()) return '昨天';
+  const sameYear = date.getFullYear() === today.getFullYear();
+  return date.toLocaleDateString(
+    'zh-CN',
+    sameYear ? { month: 'long', day: 'numeric', weekday: 'short' } : { year: 'numeric', month: 'long', day: 'numeric' },
+  );
+}
+
+function openDrawer(id) {
+  closeDrawers();
+  $(id).hidden = false;
+  const backdrop = $(id);
+  backdrop.onclick = (event) => {
+    if (event.target === backdrop) backdrop.hidden = true;
+  };
+}
+
+function closeDrawers() {
+  for (const id of ['drawer-connection', 'drawer-issues']) $(id).hidden = true;
+}
+
+document.querySelectorAll('[data-drawer]').forEach((b) => {
+  b.onclick = () => {
+    openDrawer(b.dataset.drawer);
+    if (b.dataset.drawer === 'drawer-connection') perform(loadPeers);
+    perform(loadStatus);
+  };
+});
+document.querySelectorAll('[data-close]').forEach((b) => {
+  b.onclick = () => b.closest('.drawer-backdrop').hidden = true;
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeDrawers();
+});
+
+async function loadStatus() {
   const state = await api('/api/status');
   if (!authenticated) return;
-  $('connection').textContent = state.wechat.status === '已连接' ? '微信已连接' : '微信未连接';
-  $('connection').classList.toggle('online', state.wechat.status === '已连接');
+  const online = state.wechat.status === '已连接';
+  $('connection-text').textContent = online ? '微信已连接' : '微信未连接';
+  $('connection').classList.toggle('online', online);
   $('wechat-state').textContent = state.wechat.status;
-  $('overview-model').textContent = state.config.model;
-  $('overview-calls').textContent = formatNumber(state.usage.reduce((sum, u) => sum + u.calls, 0));
   $('wechat-error').textContent =
-    state.wechat.error || (!state.config.hasApiKey ? '请先在“调试与设置”中配置模型密钥。' : '');
+    state.wechat.error || (!state.config.hasApiKey ? '请先在「设置」里配置模型密钥。' : '');
   if (state.wechat.qrData) {
     if (lastQr !== state.wechat.qrData) {
       $('qr').src = state.wechat.qrData;
@@ -193,27 +323,34 @@ async function status() {
     }
     $('qr').hidden = false;
   } else $('qr').hidden = true;
+
+  const issueCount = state.issues.tasks.length + state.issues.deliveries.length;
+  const bell = $('issues-count');
+  bell.textContent = issueCount > 99 ? '99+' : String(issueCount);
+  bell.hidden = issueCount === 0;
+
   const issues = $('issues');
   issues.replaceChildren();
   for (const task of state.issues.tasks) {
-    const row = el('div', undefined, 'row');
+    const row = el('div', undefined, 'card');
     row.append(
       el('p', task.address + ' · ' + task.kind + '：' + task.error),
       button('重试任务', async () => {
         await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
-        await status();
+        await loadStatus();
       }),
     );
     issues.append(row);
   }
   for (const delivery of state.issues.deliveries) {
-    const row = el('div', undefined, 'row');
+    const row = el('div', undefined, 'card');
     row.append(
-      el('p', delivery.address + ' · ' + new Date(delivery.created_at).toLocaleString(), 'hint'),
+      el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
       el('p', delivery.content),
       el(
         'p',
         (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
+        'hint',
       ),
     );
     const actions = el('div', undefined, 'actions');
@@ -225,30 +362,27 @@ async function status() {
       actions.append(
         button(label, async () => {
           if (action === 'retry') {
-            show('请先确认微信中没有收到这条消息，再选择重新发送。', true);
+            show('请先确认微信里没有收到这条消息，再选择重新发送。', true);
             return;
           }
           await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
-          await status();
+          await loadStatus();
         }),
       );
     row.append(actions);
     issues.append(row);
   }
-  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。');
-  // A restart mid-send leaves deliveries "uncertain" and the peer silently
-  // stops replying until an admin resolves it — surface that loudly.
+  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。一切正常。');
+
   const stuckPeers = new Set(state.issues.deliveries.map((d) => d.peer_id));
-  $('issues').classList.toggle('attention', stuckPeers.size > 0);
   const states = $('peer-states');
   states.replaceChildren();
   for (const peer of state.states ?? []) {
     const row = el('div', undefined, 'row'),
       title = el('div', undefined, 'row-title');
     title.append(el('span', peer.address));
-    if (stuckPeers.has(peer.peerId))
-      title.append(el('span', '发送待确认，暂停回复', 'badge alert'));
-    const badges = el('div', undefined, 'actions');
+    if (stuckPeers.has(peer.peerId)) title.append(el('span', '发送待确认，暂停回复', 'badge alert'));
+    const badges = el('div', undefined, 'badge-row');
     if (peer.mood) {
       const parts = [];
       if (peer.mood.valence >= 0.3) parts.push('心情不错');
@@ -259,275 +393,328 @@ async function status() {
       if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
       if (peer.mood.reason) badges.append(el('span', peer.mood.reason, 'badge'));
     }
-    if (peer.dueLoops) badges.append(el('span', `惦记 ${peer.dueLoops} 件事`, 'badge'));
+    if (peer.dueLoops) badges.append(el('span', '惦记 ' + peer.dueLoops + ' 件事', 'badge'));
     if (peer.lastProactiveAt)
-      badges.append(
-        el(
-          'span',
-          '上次问候 ' +
-            new Date(peer.lastProactiveAt).toLocaleString('zh-CN', {
-              month: 'numeric',
-              day: 'numeric',
-              hour: '2-digit',
-              minute: '2-digit',
-            }),
-          'badge',
-        ),
-      );
+      badges.append(el('span', '上次问候 ' + relTime(peer.lastProactiveAt), 'badge'));
     if (!peer.approved) badges.append(el('span', '未允许', 'badge'));
     row.append(title, badges);
     if (!badges.childNodes.length) row.append(el('p', '状态平静，暂无惦记的事。', 'hint'));
     states.append(row);
   }
   if (!states.childNodes.length) empty(states, '还没有联系人的状态可以显示。');
+  renderChatBadges(stuckPeers, state.states ?? []);
+
   $('usage').replaceChildren(
     ...state.usage.map((u) => {
       const card = el('div', undefined, 'usage-card');
       card.append(
         el('strong', purposeName(u.purpose)),
-        el('span', `${formatNumber(u.calls)} 次`, 'usage-count'),
+        el('span', formatNumber(u.calls) + ' 次', 'usage-count'),
         el(
           'p',
-          `输入 ${formatNumber(u.input_tokens)} · 输出 ${formatNumber(u.output_tokens)} token\n平均 ${(u.average_ms / 1000).toFixed(2)} 秒`,
+          '输入 ' + formatNumber(u.input_tokens) + ' · 输出 ' + formatNumber(u.output_tokens) + ' token\n平均 ' + (u.average_ms / 1000).toFixed(2) + ' 秒',
         ),
       );
       return card;
     }),
   );
-  if (!state.usage.length) empty($('usage'), '开始对话后会记录模型调用与耗时。');
+  if (!state.usage.length) empty($('usage'), '开始对话后，这里会记录模型调用与耗时。');
   $('recent-usage').replaceChildren(
     ...state.recentUsage.map((u) => {
       const row = el('div', undefined, 'recent-call');
       const heading = el('div');
-      const time = el(
-        'time',
-        new Date(u.created_at).toLocaleString('zh-CN', {
-          month: 'numeric',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      );
+      const time = el('time', relTime(u.created_at));
       time.dateTime = new Date(u.created_at).toISOString();
       heading.append(el('strong', purposeName(u.purpose)), time);
-      const detail = el(
-        'p',
-        `入 ${formatNumber(u.input_tokens)} · 出 ${formatNumber(u.output_tokens)} · ${(u.duration_ms / 1000).toFixed(1)} 秒`,
+      row.append(
+        heading,
+        el('p', '入 ' + formatNumber(u.input_tokens) + ' · 出 ' + formatNumber(u.output_tokens) + ' · ' + (u.duration_ms / 1000).toFixed(1) + ' 秒'),
+        el('p', u.address || '已删除的对话', 'recent-address'),
       );
-      const address = el('p', u.address || '已删除的对话', 'recent-address');
-      address.title = u.address || '';
-      row.append(heading, detail, address);
       return row;
     }),
   );
   if (!state.recentUsage.length) empty($('recent-usage'), '试聊一次后，这里会显示实际用量。');
+  return state;
 }
-async function loadSettings() {
-  applySettings(await api('/api/config'));
+
+function renderChatBadges(stuckPeers, states) {
+  const box = $('chat-badges');
+  box.replaceChildren();
+  const state = states.find((s) => s.peerId === currentPeer);
+  if (!state) return;
+  if (stuckPeers.has(currentPeer)) box.append(el('span', '发送待确认，暂停回复', 'badge alert'));
+  if (state.mood) {
+    const parts = [];
+    if (state.mood.valence >= 0.3) parts.push('心情不错');
+    else if (state.mood.valence <= -0.3) parts.push('心情低落');
+    else if (state.mood.valence <= -0.12) parts.push('情绪平平');
+    if (state.mood.energy <= -0.3) parts.push('有点累');
+    else if (state.mood.energy >= 0.3) parts.push('精力足');
+    if (parts.length) box.append(el('span', parts.join(' · '), 'badge'));
+  }
+  if (state.dueLoops) box.append(el('span', '惦记 ' + state.dueLoops + ' 件事', 'badge'));
+  if (!state.approved) box.append(el('span', '未允许', 'badge'));
 }
-function applySettings(c) {
-  for (const key of [...textSettings, ...numberSettings]) $(key).value = c[key];
-  $('temperature').value = c.temperature ?? '';
-  for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) $(key).checked = c[key];
-  $('apiKey').placeholder = c.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
-  $('tavilyKey').placeholder = c.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
-  $('embeddingApiKey').placeholder = c.hasEmbeddingApiKey
-    ? '已配置，留空保持原值'
-    : '独立填写，不回退到上方模型密钥';
-  $('apiKey').value = '';
-  $('tavilyKey').value = '';
-  $('embeddingApiKey').value = '';
-  updateBudget();
-}
-function updateBudget() {
-  const windowTokens = $('contextWindowTokens').valueAsNumber;
-  const input = $('inputBudgetTokens').valueAsNumber;
-  const output = $('maxOutputTokens').valueAsNumber;
-  const used = input + output + 1024;
-  const remaining = windowTokens - used;
-  const complete = [windowTokens, input, output].every(Number.isFinite);
-  const overBudget = complete && remaining < 0;
-  $('budget-input').textContent = formatNumber(input);
-  $('budget-output').textContent = formatNumber(output);
-  $('budget-free').textContent = formatNumber(remaining);
-  $('context-meter').max = windowTokens > 0 ? windowTokens : 1;
-  $('context-meter').value = Number.isFinite(used) ? Math.max(0, used) : 0;
-  $('context-meter').setAttribute(
-    'aria-valuetext',
-    complete
-      ? `已分配 ${formatNumber(used)}，窗口 ${formatNumber(windowTokens)} token`
-      : '请填写上下文参数',
-  );
-  $('inputBudgetTokens').setCustomValidity(
-    overBudget ? '输入预算、输出上限和 1024 token 余量之和不能超过窗口。' : '',
-  );
-  $('turnTimeoutSeconds').setCustomValidity(
-    $('turnTimeoutSeconds').valueAsNumber < $('requestTimeoutSeconds').valueAsNumber
-      ? '整轮处理超时不能短于单次请求超时。'
-      : '',
-  );
-  $('temperature').max = $('format').value === 'anthropic' ? '1' : '2';
-  $('budget-note').textContent = !complete
-    ? '填写窗口、输入预算和输出上限，即可查看可用空间。'
-    : overBudget
-      ? `超出窗口 ${formatNumber(-remaining)} token，请减少输入或输出预算。`
-      : '文本和图片按估算计入预算；实际用量以模型返回值为准。';
-  $('context-meter').closest('.budget-card').classList.toggle('invalid', overBudget);
-}
-function countPersona() {
-  $('persona-count').textContent =
-    `${formatNumber($('persona-content').value.length)} / 12,000 字符 · 保存后下次生成生效`;
-}
-let personaState = { list: [], defaultId: '', bindings: {} },
-  personaSelected = '';
-async function loadPersonas(selectId) {
-  personaState = await api('/api/personas');
-  const target = $('persona-list');
+
+async function loadPeers() {
+  peers = await api('/api/peers');
+  const wechatPeers = peers.filter((p) => p.channel === 'wechat');
+  const previewPeer = peers.find((p) => p.id === 'preview:default');
+  const signature = peers
+    .map((p) => [p.id, p.address, p.approved, p.persona_id ?? ''].join(':'))
+    .join('|');
+  const changed = signature !== peersSnapshot;
+  peersSnapshot = signature;
+  if (changed) renderChatPeerList(previewPeer);
+  const target = $('peers');
+  if (!changed && target.childNodes.length) {
+    refreshJournalPeerSelect(wechatPeers);
+    return;
+  }
+  personaSelects.clear();
+  const hadFocus = target.contains(document.activeElement);
   target.replaceChildren();
-  if (!personaState.list.length) empty(target, '还没有人格。');
-  for (const persona of personaState.list) {
+  if (!wechatPeers.length) empty(target, '扫码登录后，让朋友发来第一条微信消息。');
+  for (const peer of wechatPeers) {
     const row = el('div', undefined, 'row'),
-      heading = el('div', undefined, 'row-title'),
-      actions = el('div', undefined, 'actions');
-    const label = el('span', persona.name + (persona.id === personaState.defaultId ? ' · 默认' : ''));
-    if (persona.id === personaSelected) label.style.fontWeight = '600';
-    heading.append(label);
-    if (persona.id !== personaState.defaultId)
-      actions.append(
-        button('设为默认', async () => {
-          await api('/api/personas/' + enc(persona.id) + '/default', 'PUT');
-          await loadPersonas(persona.id);
-          show('默认人格已更新。');
-        }),
-      );
-    actions.append(
-      button('编辑', () => selectPersona(persona.id)),
-      confirmButton('删除', '确认删除？', async () => {
-        await api('/api/personas/' + enc(persona.id), 'DELETE');
-        if (personaSelected === persona.id) personaSelected = '';
-        await loadPersonas();
-        show('人格已删除。');
+      heading = el('div', undefined, 'row-title');
+    heading.append(
+      el('span', peer.address),
+      el('span', peer.approved ? '回复中' : '未允许', 'badge'),
+      button(peer.approved ? '暂停回复' : '允许使用', async () => {
+        await api('/api/peers/' + enc(peer.id), 'PUT', { approved: !peer.approved });
+        await loadPeers();
+        await loadStatus();
       }),
     );
-    row.append(heading, actions);
+    row.append(heading, buildPersonaSelect(peer));
     target.append(row);
   }
-  if (selectId) selectPersona(selectId);
-  else if (!personaSelected && personaState.list.length)
-    selectPersona(personaState.defaultId || personaState.list[0].id);
-}
-function selectPersona(id) {
-  const persona = personaState.list.find((p) => p.id === id);
-  if (!persona) return;
-  personaSelected = id;
-  $('persona-edit-title').textContent = '编辑：' + persona.name;
-  $('persona-name').value = persona.name;
-  $('persona-content').value = persona.content;
-  countPersona();
-  loadPersonasBound();
-}
-function loadPersonasBound() {
-  document
-    .querySelectorAll('select[data-persona-for]')
-    .forEach((select) => fillPersonaSelect(select, personaState.bindings[select.dataset.personaFor] || ''));
-}
-function fillPersonaSelect(select, boundId) {
-  const current = select.value;
-  select.replaceChildren();
-  const auto = el('option', '默认人格（' + (personaState.list.find((p) => p.id === personaState.defaultId)?.name ?? '') + '）');
-  auto.value = '';
-  select.append(auto);
-  for (const persona of personaState.list) {
-    const option = el('option', persona.name);
-    option.value = persona.id;
-    select.append(option);
+  if (previewPeer) {
+    const row = el('div', undefined, 'row'),
+      heading = el('div', undefined, 'row-title');
+    heading.append(el('span', '本地试聊'));
+    row.append(heading, buildPersonaSelect(previewPeer));
+    target.append(row);
   }
-  select.value = personaState.list.some((p) => p.id === boundId) ? boundId : '';
-  if (![...select.options].some((o) => o.value === select.value)) select.value = '';
-  if (current && [...select.options].some((o) => o.value === current) && boundId === undefined)
-    select.value = current;
+  if (hadFocus) target.querySelector('button, [aria-haspopup], input')?.focus();
+  refreshJournalPeerSelect(wechatPeers);
 }
-$('persona-new').onclick = () => {
-  const form = $('persona-create');
-  form.hidden = !form.hidden;
-  if (!form.hidden) $('persona-create-name').focus();
-};
-$('persona-create-cancel').onclick = () => {
-  $('persona-create').hidden = true;
-  $('persona-create-name').value = '';
-};
-$('persona-create').onsubmit = (e) => {
-  e.preventDefault();
-  perform(async () => {
-    const entry = await api('/api/personas', 'POST', {
-      name: $('persona-create-name').value,
-      content: (personaState.list.find((p) => p.id === personaSelected)?.content) || '（在这里写下她是谁）',
-    });
-    $('persona-create').hidden = true;
-    $('persona-create-name').value = '';
-    await loadPersonas(entry.id);
-    show('已创建，编辑内容后保存。');
-  }, e.submitter);
-};
-$('persona-name').oninput = countPersona;
+
+function refreshJournalPeerSelect(wechatPeers) {
+  const options = [
+    { value: 'preview:default', label: '本地试聊' },
+    ...wechatPeers.map((p) => ({ value: p.id, label: p.address })),
+  ];
+  const current = journalDropdown.value;
+  journalDropdown.setOptions(options, options.some((o) => o.value === current) ? current : 'preview:default');
+}
+
+function renderChatPeerList(previewPeer) {
+  const list = $('chat-peer-list');
+  list.replaceChildren();
+  const items = [];
+  if (previewPeer) items.push({ id: 'preview:default', address: '本地试聊', dot: 'preview' });
+  for (const peer of peers.filter((p) => p.channel === 'wechat'))
+    items.push({ id: peer.id, address: peer.address, dot: peer.approved ? 'ok' : '' });
+  for (const item of items) {
+    const node = el('button', undefined, 'peer-item' + (item.id === currentPeer ? ' selected' : ''));
+    node.type = 'button';
+    node.append(el('span', undefined, 'peer-dot ' + item.dot), el('span', item.address));
+    node.onclick = () => {
+      if (currentPeer === item.id) return;
+      currentPeer = item.id;
+      chatSnapshot = '';
+      waitingReply = false;
+      renderChatPeerList(previewPeer);
+      perform(loadChat);
+    };
+    list.append(node);
+  }
+}
+
+function buildPersonaSelect(peer) {
+  const dropdown = createDropdown({
+    options: personaOptions(),
+    value: personaState.list.some((p) => p.id === peer.persona_id) ? peer.persona_id : '',
+    ariaLabel: '人格选择：' + peer.address,
+    placeholder: '默认人格',
+    onChange: (value) =>
+      perform(async () => {
+        await api('/api/peers/' + enc(peer.id) + '/persona', 'PUT', { personaId: value });
+        personaState.bindings[peer.id] = value;
+        show(peer.id === 'preview:default' ? '试聊人格已更新，下一次对话生效。' : '该联系人的人格已更新。');
+      }),
+  });
+  personaSelects.set(peer.id, dropdown);
+  return dropdown.root;
+}
+
+function personaOptions() {
+  const defaultPersona = personaState.list.find((p) => p.id === personaState.defaultId);
+  return [
+    { value: '', label: '默认（' + (defaultPersona?.name ?? '未设置') + '）' },
+    ...personaState.list
+      .filter((p) => p.id !== personaState.defaultId)
+      .map((p) => ({ value: p.id, label: p.name })),
+  ];
+}
+
+function refreshPersonaSelects() {
+  for (const [peerId, dropdown] of personaSelects) {
+    const bound = personaState.bindings[peerId] ?? '';
+    dropdown.setOptions(
+      personaOptions(),
+      personaState.list.some((p) => p.id === bound) ? bound : '',
+    );
+  }
+}
+
+async function refreshStickerMap() {
+  const stickers = await api('/api/stickers');
+  stickerMap = new Map(stickers.map((s) => [s.description, s.slug]));
+  return stickers;
+}
+
+function stickerToken(part) {
+  const match = part.match(/^\[表情：([^\]]+)\]$/);
+  if (!match || !stickerMap.has(match[1])) return null;
+  const img = document.createElement('img');
+  img.src = '/api/stickers/' + enc(stickerMap.get(match[1])) + '/image';
+  img.alt = match[1];
+  img.loading = 'lazy';
+  return img;
+}
+
+function renderMessageContent(content) {
+  const whole = content.match(/^\[表情：([^\]]+)\]$/);
+  if (whole && stickerMap.has(whole[1])) {
+    const img = stickerToken(content);
+    img.className = 'sticker-img';
+    return img;
+  }
+  const span = el('span');
+  for (const part of content.split(/(\[表情：[^\]]+\])/g)) {
+    if (!part) continue;
+    const img = stickerToken(part);
+    if (img) {
+      img.className = 'sticker-inline';
+      span.append(img);
+    } else span.append(document.createTextNode(part));
+  }
+  return span;
+}
+
 async function loadChat() {
-  const peer = $('chat-peer').value || 'preview:default';
-  const history = await api('/api/peers/' + enc(peer) + '/history'),
-    container = $('messages');
-  if (peer !== ($('chat-peer').value || 'preview:default')) return;
+  const peer = currentPeer;
+  const history = await api('/api/peers/' + enc(peer) + '/history');
+  if (peer !== currentPeer) return;
   const snapshot = JSON.stringify([peer, history]);
   if (snapshot === chatSnapshot) return;
   chatSnapshot = snapshot;
+  const container = $('messages');
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
   container.replaceChildren();
-  if (!history.length) empty(container, '这里还没有对话。');
+  if (!history.length) empty(container, '这里还没有对话。发条消息，或等她先开口。');
+  let lastDay = '';
+  let assistantCount = 0;
   for (const message of history) {
-    const bubble = el('div', undefined, 'bubble ' + message.role);
-    bubble.append(
-      el(
-        'div',
-        (message.role === 'user' ? '对方' : '亚托莉') +
-          ' · ' +
-          new Date(message.created_at).toLocaleString(),
-        'bubble-meta',
-      ),
-      el('div', message.content),
+    const day = dayLabel(message.created_at);
+    if (day !== lastDay) {
+      container.append(el('div', day, 'date-sep'));
+      lastDay = day;
+    }
+    if (message.role === 'assistant') assistantCount++;
+    const mine = message.role === 'user';
+    const msg = el('div', undefined, 'msg ' + (mine ? 'mine' : 'her'));
+    const meta = el('div', undefined, 'bubble-meta');
+    meta.append(
+      el('span', mine ? '对方' : '亚托莉'),
+      el('time', relTime(message.created_at)),
     );
-    for (const media of message.media)
-      if (media.description) bubble.append(el('p', media.description, 'hint'));
-    bubble.append(
-      confirmButton('删除', '确认删除？', async () => {
+    const del = el('button', '删除', 'bubble-del');
+    del.type = 'button';
+    del.setAttribute('aria-label', '删除这条消息');
+    del.onclick = () =>
+      perform(async () => {
         await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
+        chatSnapshot = '';
         await loadChat();
-      }),
-    );
-    container.append(bubble);
+      }, del);
+    meta.append(del);
+    const bubble = el('div', undefined, 'bubble');
+    bubble.append(renderMessageContent(message.content));
+    msg.append(meta, bubble);
+    for (const media of message.media)
+      if (media.description) msg.append(el('p', '图片：' + media.description, 'media-note'));
+    container.append(msg);
+  }
+  waitingBaseline = assistantCount;
+  if (waitingReply) {
+    if (assistantCount > waitingBaseline) {
+      waitingReply = false;
+    } else {
+      const typing = el('div', undefined, 'typing');
+      const dots = el('span', undefined, 'typing-dots');
+      dots.append(el('i'), el('i'), el('i'));
+      typing.append(dots, '她正在输入……');
+      container.append(typing);
+    }
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
-  // A reply arrived (assistant bubble added since the send) → clear waiting.
-  if (waitingReply && history.some((m) => m.role === 'assistant')) {
-    waitingReply = false;
-  } else if (waitingReply) {
-    container.append(el('div', '亚托莉正在输入……', 'typing'));
-    container.scrollTop = container.scrollHeight;
-  }
-  $('chat-form').hidden = peer !== 'preview:default';
-  $('chat-hint').textContent =
-    peer === 'preview:default'
-      ? '本地试聊不会发送到微信。'
-      : '这里查看微信记录，直接在微信中与她交谈即可。';
+  const isPreview = peer === 'preview:default';
+  $('chat-form').hidden = !isPreview;
+  $('chat-title').textContent = peers.find((p) => p.id === peer)?.address || (isPreview ? '本地试聊' : peer);
+  $('chat-sub').textContent = isPreview ? '本地试聊 · 人格生效中' : '微信联系人';
+  $('chat-hint').textContent = isPreview
+    ? '这里的对话不会发送到微信，用来试试她的反应。'
+    : '这里查看微信记录；要交谈，直接在微信里发消息即可。';
+  $('chat-input').placeholder = isPreview ? '说点什么……' : '在微信里与她交谈';
 }
+
+const chatInput = $('chat-input');
+chatInput.addEventListener('input', () => {
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 160) + 'px';
+});
+chatInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    $('chat-form').requestSubmit();
+  }
+});
+$('chat-form').onsubmit = (event) => {
+  event.preventDefault();
+  const content = chatInput.value.trim();
+  if (!content) return;
+  perform(async () => {
+    const result = await api('/api/chat', 'POST', {
+      content,
+      eventId: crypto.randomUUID(),
+    });
+    lastTask = result.taskId;
+    waitingReply = true;
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+    chatSnapshot = '';
+    await loadChat();
+    chatInput.focus();
+  }, $('chat-form').querySelector('button[type="submit"]'));
+};
+
 async function loadJournal() {
-  const peer = $('journal-peer').value || 'preview:default';
+  const peer = journalDropdown.value || 'preview:default';
   const [diaries, memories, loops] = await Promise.all([
     api('/api/peers/' + enc(peer) + '/diaries'),
     api('/api/peers/' + enc(peer) + '/memories'),
     api('/api/peers/' + enc(peer) + '/loops'),
   ]);
-  if (peer !== ($('journal-peer').value || 'preview:default')) return;
+  if (peer !== (journalDropdown.value || 'preview:default')) return;
   const snapshot = JSON.stringify([peer, diaries, memories, loops]);
   if (snapshot === journalSnapshot) return;
   journalSnapshot = snapshot;
+
   const journal = $('diaries');
   journal.replaceChildren();
   let day = '';
@@ -540,9 +727,10 @@ async function loadJournal() {
     row.append(el('div', section.content, 'entry'));
     const actions = el('div', undefined, 'actions');
     actions.append(
-      button(`查看 ${section.sources.length} 条依据`, () => showSources(peer, section.sources)),
+      button('查看 ' + section.sources.length + ' 条依据', () => showSources(peer, section.sources)),
       confirmButton('删除这一段', '确认删除？', async () => {
         await api('/api/peers/' + enc(peer) + '/records/' + enc(section.id), 'DELETE');
+        journalSnapshot = '';
         await loadJournal();
       }),
     );
@@ -550,15 +738,15 @@ async function loadJournal() {
     journal.append(row);
   }
   if (!diaries.length) empty(journal, '有新的经历后，她会在设定的时间写日记。');
+
   const memory = $('memories');
   memory.replaceChildren();
   for (const item of memories) {
     const row = el('div', undefined, 'row');
-    row.append(
-      el('span', item.kind === 'stated' ? '对话中确认' : '主观理解', 'badge'),
-      ...(item.pinned ? [el('span', '已置顶', 'badge')] : []),
-      el('p', item.content),
-    );
+    const badges = el('div', undefined, 'badge-row');
+    badges.append(el('span', item.kind === 'stated' ? '对话中确认' : '主观理解', 'badge'));
+    if (item.pinned) badges.append(el('span', '已置顶', 'badge'));
+    row.append(badges, el('p', item.content));
     const actions = el('div', undefined, 'actions');
     actions.append(
       button('查看依据', () => showSources(peer, item.sources)),
@@ -566,50 +754,52 @@ async function loadJournal() {
         await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id) + '/pinned', 'PUT', {
           pinned: !item.pinned,
         });
+        journalSnapshot = '';
         await loadJournal();
       }),
     );
-    // Inline correction: the old prompt() dialog couldn't show the full text
-    // and fought the mobile keyboard.
-    const correct = button('更正', () => {
-      editor.hidden = !editor.hidden;
-      if (!editor.hidden) {
-        editor.querySelector('textarea').value = item.content;
-        editor.querySelector('textarea').focus();
-      }
-    });
-    actions.append(correct);
     const editor = el('form', undefined, 'memory-correction');
     editor.hidden = true;
-    editor.append(
-      el('label', '更正为正确信息', 'sr-only'),
-      Object.assign(document.createElement('textarea'), {
-        rows: 3,
-        maxLength: 3000,
-        required: true,
-        textContent: item.content,
-      }),
-      el('div', undefined, 'actions'),
-    );
-    const editorActions = editor.querySelector('.actions');
+    const textarea = document.createElement('textarea');
+    textarea.rows = 3;
+    textarea.maxLength = 3000;
+    textarea.required = true;
+    textarea.value = item.content;
+    const editorActions = el('div', undefined, 'actions');
     editorActions.append(
-      button('取消', () => (editor.hidden = true), 'ghost small'),
+      button('取消', () => (editor.hidden = true)),
       button('保存更正', async () => {
-        const content = editor.querySelector('textarea').value.trim();
+        const content = textarea.value.trim();
         if (!content) return;
         await api('/api/peers/' + enc(peer) + '/memories/' + enc(item.id), 'PUT', { content });
+        journalSnapshot = '';
         await loadJournal();
       }),
     );
-    const del = confirmButton('删除', '确认删除？', async () => {
-      await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
-      await loadJournal();
-    });
-    actions.append(del);
+    editor.append(
+      el('label', '更正为正确信息', 'hint'),
+      textarea,
+      editorActions,
+    );
+    actions.append(
+      button('更正', () => {
+        editor.hidden = !editor.hidden;
+        if (!editor.hidden) {
+          textarea.value = item.content;
+          textarea.focus();
+        }
+      }),
+      confirmButton('删除', '确认删除？', async () => {
+        await api('/api/peers/' + enc(peer) + '/records/' + enc(item.id), 'DELETE');
+        journalSnapshot = '';
+        await loadJournal();
+      }),
+    );
     row.append(actions, editor);
     memory.append(row);
   }
   if (!memories.length) empty(memory, '重要的偏好、约定和认识会留在这里。');
+
   const loopBox = $('loops');
   loopBox.replaceChildren();
   for (const loop of loops) {
@@ -622,21 +812,41 @@ async function loadJournal() {
         : loop.status === 'resolved'
           ? '已了结'
           : '已过期';
-    row.append(el('span', badge, 'badge'), el('p', loop.content));
+    const badges = el('div', undefined, 'badge-row');
+    badges.append(el('span', badge, 'badge'));
+    if (loop.dueText) badges.append(el('span', loop.dueText, 'badge'));
+    row.append(badges, el('p', loop.content));
     const actions = el('div', undefined, 'actions');
     actions.append(
       loop.status === 'open'
         ? button('了结', async () => {
             await api('/api/peers/' + enc(peer) + '/loops/' + enc(loop.id) + '/resolve', 'POST');
+            journalSnapshot = '';
             await loadJournal();
           })
-        : el('span', new Date(loop.resolved_at || loop.created_at).toLocaleString(), 'hint'),
+        : el('span', relTime(loop.resolved_at || loop.created_at), 'hint'),
     );
     row.append(actions);
     loopBox.append(row);
   }
-  if (!loops.length) empty(loopBox, '对方提到的具体安排（如“明天面试”）会出现在这里，到点她会主动问起。');
+  if (!loops.length)
+    empty(loopBox, '对方提到的具体安排（比如「明天面试」）会出现在这里，到点她会主动问起。');
 }
+
+document.querySelectorAll('.subtab').forEach((tab) => {
+  tab.onclick = () => {
+    journalSub = tab.dataset.sub;
+    document.querySelectorAll('.subtab').forEach((t) => {
+      const selected = t === tab;
+      t.classList.toggle('selected', selected);
+      t.setAttribute('aria-selected', String(selected));
+    });
+    $('journal-diaries-wrap').hidden = journalSub !== 'diaries';
+    $('journal-memories-wrap').hidden = journalSub !== 'memories';
+    $('journal-loops-wrap').hidden = journalSub !== 'loops';
+  };
+});
+
 async function showSources(peer, ids) {
   const records = await api('/api/peers/' + enc(peer) + '/sources?ids=' + enc(ids.join(',')));
   const dialog = el('dialog');
@@ -646,7 +856,7 @@ async function showSources(peer, ids) {
     const row = el('div', undefined, 'row');
     const name = record.kind === 'message' ? (record.role === 'user' ? '对方' : '亚托莉') : '日记';
     row.append(
-      el('p', name + ' · ' + new Date(record.created_at).toLocaleString(), 'hint'),
+      el('p', name + ' · ' + relTime(record.created_at), 'hint'),
       el('p', record.content, 'entry'),
     );
     if (record.sources?.length)
@@ -659,15 +869,115 @@ async function showSources(peer, ids) {
   document.body.append(dialog);
   dialog.showModal();
 }
+
+$('write-diary').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/peers/' + enc(journalDropdown.value) + '/diary', 'POST');
+    show(result.taskId ? '已安排整理，稍后会显示新的日记。' : '目前没有尚未整理的经历。');
+  }, $('write-diary'));
+
+async function loadPersonas(selectId) {
+  personaState = await api('/api/personas');
+  const target = $('persona-list');
+  target.replaceChildren();
+  if (!personaState.list.length) empty(target, '还没有人格。');
+  for (const persona of personaState.list) {
+    const item = el(
+      'button',
+      undefined,
+      'persona-item' + (persona.id === personaSelected ? ' selected' : ''),
+    );
+    item.type = 'button';
+    const name = el('span', undefined, 'name');
+    name.textContent = persona.name;
+    if (persona.id === personaState.defaultId) name.append(el('span', ' 默认', 'tag'));
+    item.append(name);
+    item.onclick = () => {
+      personaSelected = persona.id;
+      loadPersonas(persona.id);
+    };
+    target.append(item);
+  }
+  if (selectId) selectPersona(selectId);
+  else if (!personaSelected && personaState.list.length)
+    selectPersona(personaState.defaultId || personaState.list[0].id);
+}
+
+function selectPersona(id) {
+  const persona = personaState.list.find((p) => p.id === id);
+  if (!persona) return;
+  personaSelected = id;
+  $('persona-edit-title').textContent = '编辑：' + persona.name;
+  $('persona-name').value = persona.name;
+  $('persona-content').value = persona.content;
+  $('persona-greeting').value = persona.greeting ?? '';
+  countPersona();
+  refreshPersonaSelects();
+}
+
+function countPersona() {
+  $('persona-count').textContent =
+    formatNumber($('persona-content').value.length) + ' / 12,000 字符 · 保存后下次生成生效';
+}
+
+$('persona-new').onclick = () => {
+  const form = $('persona-create');
+  form.hidden = !form.hidden;
+  if (!form.hidden) $('persona-create-name').focus();
+};
+$('persona-create-cancel').onclick = () => {
+  $('persona-create').hidden = true;
+  $('persona-create-name').value = '';
+  presetDropdown?.setOptions(
+    [{ value: '', label: '空白（自己写）' }, ...personaPresets.map((p) => ({ value: p.id, label: `${p.name} · ${p.description}` }))],
+    '',
+  );
+};
+$('persona-create').onsubmit = (event) => {
+  event.preventDefault();
+  perform(async () => {
+    const preset = personaPresets.find((p) => p.id === presetDropdown?.value);
+    const entry = await api('/api/personas', 'POST', {
+      name: $('persona-create-name').value,
+      content: preset?.content || '（在这里写下她是谁）',
+    });
+    $('persona-create').hidden = true;
+    $('persona-create-name').value = '';
+    presetDropdown?.setOptions(
+      [{ value: '', label: '空白（自己写）' }, ...personaPresets.map((p) => ({ value: p.id, label: `${p.name} · ${p.description}` }))],
+      '',
+    );
+    personaSelected = entry.id;
+    await loadPersonas(entry.id);
+    show(preset ? `已从模板"${preset.name}"创建，可以继续编辑。` : '已创建，编辑内容后保存。');
+  }, event.submitter);
+};
+$('persona-name').oninput = countPersona;
+$('persona-content').oninput = countPersona;
+$('persona-form').onsubmit = (event) => {
+  event.preventDefault();
+  perform(async () => {
+    if (!personaSelected) throw new Error('请先选择要编辑的人格');
+    await api('/api/personas/' + enc(personaSelected), 'PUT', {
+      name: $('persona-name').value,
+      content: $('persona-content').value,
+      greeting: $('persona-greeting').value,
+    });
+    await loadPersonas(personaSelected);
+    show('人物设定已保存，下次生成时使用。');
+  }, event.submitter);
+};
+
 async function loadStickers() {
-  const stickers = await api('/api/stickers'),
-    container = $('sticker-list');
+  const stickers = await refreshStickerMap();
+  const container = $('sticker-list');
   container.replaceChildren();
   for (const sticker of stickers) {
     const card = el('article', undefined, 'sticker-card'),
       img = document.createElement('img');
     img.src = '/api/stickers/' + enc(sticker.slug) + '/image';
     img.alt = sticker.description;
+    img.loading = 'lazy';
     card.append(
       img,
       el('strong', sticker.slug),
@@ -682,247 +992,11 @@ async function loadStickers() {
     );
     container.append(card);
   }
+  if (!stickers.length) empty(container, '目录还是空的。上传一张图片，教她认识第一个表情。');
 }
-async function enter() {
-  await api('/api/config');
-  authenticated = true;
-  $('login').hidden = true;
-  $('dashboard').hidden = false;
-  $('logout').hidden = false;
-  $('notice').hidden = true;
-  // Personas first: peer rows render persona selects from that state.
-  await loadPersonas();
-  await Promise.all([status(), loadPeers(), loadSettings()]);
-  await selectTab(currentTab);
-}
-async function selectTab(tab) {
-  currentTab = tab;
-  document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== tab));
-  document.querySelectorAll('[data-tab]').forEach((b) => {
-    const selected = b.dataset.tab === tab;
-    b.classList.toggle('selected', selected);
-    b.setAttribute('aria-selected', String(selected));
-    b.tabIndex = selected ? 0 : -1;
-  });
-  if (tab === 'chat') await loadChat();
-  if (tab === 'journal') await loadJournal();
-  if (tab === 'stickers') await loadStickers();
-  if (tab === 'persona') await loadPersonas(personaSelected);
-}
-document
-  .querySelectorAll('[data-tab]')
-  .forEach((b) => (b.onclick = () => perform(() => selectTab(b.dataset.tab))));
-document.querySelectorAll('[data-open]').forEach((b) => {
-  b.onclick = () =>
-    perform(async () => {
-      await selectTab(b.dataset.open);
-      $('tab-' + b.dataset.open).focus({ preventScroll: true });
-      window.scrollTo({ top: 0, behavior: 'instant' });
-    });
-});
-const tablist = document.querySelector('[role="tablist"]');
-const mobileNav = window.matchMedia('(max-width: 960px)');
-function orientTabs() {
-  tablist.setAttribute('aria-orientation', mobileNav.matches ? 'horizontal' : 'vertical');
-}
-orientTabs();
-mobileNav.addEventListener('change', orientTabs);
-tablist.onkeydown = (event) => {
-  const tabs = [...tablist.querySelectorAll('[data-tab]')];
-  const index = tabs.indexOf(document.activeElement);
-  if (index < 0) return;
-  const previous = mobileNav.matches ? 'ArrowLeft' : 'ArrowUp';
-  const next = mobileNav.matches ? 'ArrowRight' : 'ArrowDown';
-  let target;
-  if (event.key === previous) target = tabs[(index + tabs.length - 1) % tabs.length];
-  if (event.key === next) target = tabs[(index + 1) % tabs.length];
-  if (event.key === 'Home') target = tabs[0];
-  if (event.key === 'End') target = tabs.at(-1);
-  if (!target) return;
+
+$('sticker-form').onsubmit = (event) => {
   event.preventDefault();
-  target.focus();
-  perform(() => selectTab(target.dataset.tab));
-};
-$('login-form').onsubmit = (e) => {
-  e.preventDefault();
-  perform(async () => {
-    await api('/api/login', 'POST', { password: $('password').value });
-    $('password').value = '';
-    await enter();
-  }, e.submitter);
-};
-$('logout').onclick = () =>
-  perform(async () => {
-    await api('/api/logout', 'POST');
-    authenticated = false;
-    $('dashboard').hidden = true;
-    $('login').hidden = false;
-    $('logout').hidden = true;
-    $('connection').textContent = '管理空间';
-    $('connection').classList.remove('online');
-    $('notice').hidden = true;
-    $('password').focus();
-  });
-$('wechat-login').onclick = () =>
-  perform(async () => {
-    await api('/api/wechat/login', 'POST');
-    await status();
-  });
-$('wechat-logout').onclick = () =>
-  perform(async () => {
-    await api('/api/wechat/logout', 'POST');
-    await status();
-  });
-$('backup').onclick = () =>
-  perform(async () => {
-    const result = await api('/api/backup', 'POST');
-    show(`已备份 ${result.messages} 条消息，位置：${result.directory}`);
-  }, $('backup'));
-$('chat-peer').onchange = () => perform(loadChat);
-$('journal-peer').onchange = () => perform(loadJournal);
-$('chat-form').onsubmit = (e) => {
-  e.preventDefault();
-  perform(async () => {
-    const result = await api('/api/chat', 'POST', {
-      content: $('chat-input').value,
-      eventId: crypto.randomUUID(),
-    });
-    lastTask = result.taskId;
-    $('chat-input').value = '';
-    // Waiting state: the poll picks up the reply; loadChat shows a typing
-    // line until an assistant bubble lands, then the flag clears.
-    waitingReply = true;
-    await loadChat();
-  }, e.submitter);
-};
-$('write-diary').onclick = () =>
-  perform(async () => {
-    const result = await api('/api/peers/' + enc($('journal-peer').value) + '/diary', 'POST');
-    show(result.taskId ? '已安排整理，稍后会显示新的日记。' : '目前没有尚未整理的经历。');
-  });
-$('persona-form').onsubmit = (e) => {
-  e.preventDefault();
-  perform(async () => {
-    if (!personaSelected) throw new Error('请先选择要编辑的人格');
-    await api('/api/personas/' + enc(personaSelected), 'PUT', {
-      name: $('persona-name').value,
-      content: $('persona-content').value,
-    });
-    await loadPersonas(personaSelected);
-    show('人物设定已保存，下次生成时使用。');
-  }, e.submitter);
-};
-$('persona-content').oninput = countPersona;
-$('fetch-models').onclick = () =>
-  perform(async () => {
-    const list = await api('/api/models');
-    let panel = $('model-suggestions');
-    if (!panel) {
-      panel = document.createElement('div');
-      panel.id = 'model-suggestions';
-      panel.className = 'model-suggestions';
-      panel.hidden = true;
-      panel.innerHTML =
-        '<div class="model-suggestions-head">' +
-        '<input id="model-filter" type="search" placeholder="筛选模型名…" />' +
-        '<button type="button" class="ghost small" id="model-filter-close">收起</button>' +
-        '</div>' +
-        '<div class="model-suggestions-list" id="model-suggestions-list"></div>';
-      $('model').closest('label').after(panel);
-      $('model-filter').oninput = () => renderModelSuggestions();
-      $('model-filter-close').onclick = () => {
-        panel.hidden = true;
-      };
-    }
-    panel.dataset.models = JSON.stringify(list.models);
-    renderModelSuggestions();
-    panel.hidden = false;
-    show(`已拉取 ${list.models.length} 个模型，点击即可填入；也可在输入框直接手输。`);
-  }, $('fetch-models'));
-function renderModelSuggestions() {
-  const panel = $('model-suggestions');
-  if (!panel) return;
-  const models = JSON.parse(panel.dataset.models || '[]');
-  const q = ($('model-filter').value || '').trim().toLowerCase();
-  const filtered = q ? models.filter((m) => m.toLowerCase().includes(q)) : models;
-  const listBox = $('model-suggestions-list');
-  listBox.replaceChildren(
-    ...filtered.map((m) => {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'model-suggestion-item' + (m === $('model').value ? ' current' : '');
-      item.textContent = m;
-      item.title = m;
-      item.onclick = () => {
-        $('model').value = m;
-        panel.hidden = true;
-      };
-      return item;
-    }),
-  );
-  if (!filtered.length) {
-    const empty = document.createElement('div');
-    empty.className = 'model-suggestion-empty';
-    empty.textContent = '没有匹配的模型';
-    listBox.append(empty);
-  }
-}
-$('test-llm').onclick = () =>
-  perform(async () => {
-    const result = await api('/api/test-llm', 'POST');
-    show(`模型连通正常：${result.model}（${result.format}）· 延迟 ${result.latencyMs} ms`);
-  }, $('test-llm'));
-$('test-embedding').onclick = () =>
-  perform(async () => {
-    const result = await api('/api/test-embedding', 'POST');
-    show(
-      `向量连通正常：${result.model} · 维度 ${result.dims} · 延迟 ${result.latencyMs} ms`,
-    );
-  }, $('test-embedding'));
-for (const [id, field] of [
-  ['clear-api-key', 'clearApiKey'],
-  ['clear-tavily-key', 'clearTavilyKey'],
-  ['clear-embedding-key', 'clearEmbeddingApiKey'],
-])
-  $(id).onclick = () =>
-    perform(async () => {
-      const saved = await api('/api/config', 'PUT', { [field]: true });
-      applySettings(saved);
-      show('密钥已清除，对应服务在重新填写前不可用。');
-    }, $(id));
-function settingsChanged() {
-  settingsVersion++;
-  $('settings-saved').textContent = '有尚未保存的修改。';
-  updateBudget();
-}
-$('settings-form').oninput = settingsChanged;
-$('settings-form').onchange = settingsChanged;
-$('settings-form').onsubmit = (e) => {
-  e.preventDefault();
-  updateBudget();
-  if (!e.target.reportValidity()) return;
-  perform(async () => {
-    const version = settingsVersion;
-    const body = {};
-    for (const key of [...textSettings, 'apiKey', 'tavilyKey', 'embeddingApiKey']) body[key] = $(key).value;
-    for (const key of numberSettings) body[key] = $(key).valueAsNumber;
-    body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) body[key] = $(key).checked;
-    const saved = await api('/api/config', 'PUT', body);
-    if (version === settingsVersion) {
-      applySettings(saved);
-      $('settings-saved').textContent = '已保存 · ' + new Date().toLocaleTimeString('zh-CN');
-    }
-    show(
-      version === settingsVersion
-        ? '参数已保存，下一次生成时使用。'
-        : '已保存刚才提交的参数；新修改仍需保存。',
-    );
-    await status();
-  }, e.submitter);
-};
-$('sticker-form').onsubmit = (e) => {
-  e.preventDefault();
   perform(async () => {
     const file = $('sticker-file').files[0];
     if (!file || file.size > 3 * 1024 * 1024) throw new Error('请选择 3 MB 以内的图片');
@@ -941,38 +1015,330 @@ $('sticker-form').onsubmit = (e) => {
         .filter(Boolean),
       base64,
     });
-    e.target.reset();
+    event.target.reset();
     await loadStickers();
     show('表情已加入目录。');
-  }, e.submitter);
+  }, event.submitter);
 };
-let journalPoll = 0;
+
+async function loadSettings() {
+  applySettings(await api('/api/config'));
+}
+
+function applySettings(config) {
+  for (const key of [...textSettings, ...numberSettings]) $(key).value = config[key];
+  formatDropdown.value = config.format;
+  $('temperature').value = config.temperature ?? '';
+  for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) $(key).checked = config[key];
+  $('apiKey').placeholder = config.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
+  $('tavilyKey').placeholder = config.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
+  $('embeddingApiKey').placeholder = config.hasEmbeddingApiKey
+    ? '已配置，留空保持原值'
+    : '独立填写，不回退到上方模型密钥';
+  $('apiKey').value = '';
+  $('tavilyKey').value = '';
+  $('embeddingApiKey').value = '';
+  updateBudget();
+}
+
+function updateBudget() {
+  const windowTokens = $('contextWindowTokens').valueAsNumber;
+  const input = $('inputBudgetTokens').valueAsNumber;
+  const output = $('maxOutputTokens').valueAsNumber;
+  const used = input + output + 1024;
+  const remaining = windowTokens - used;
+  const complete = [windowTokens, input, output].every(Number.isFinite);
+  const overBudget = complete && remaining < 0;
+  $('budget-input').textContent = formatNumber(input);
+  $('budget-output').textContent = formatNumber(output);
+  $('budget-free').textContent = formatNumber(remaining);
+  $('context-meter').max = windowTokens > 0 ? windowTokens : 1;
+  $('context-meter').value = Number.isFinite(used) ? Math.max(0, used) : 0;
+  $('context-meter').setAttribute(
+    'aria-valuetext',
+    complete ? '已分配 ' + formatNumber(used) + '，窗口 ' + formatNumber(windowTokens) + ' token' : '请填写上下文参数',
+  );
+  $('inputBudgetTokens').setCustomValidity(
+    overBudget ? '输入预算、输出上限和 1024 token 余量之和不能超过窗口。' : '',
+  );
+  $('turnTimeoutSeconds').setCustomValidity(
+    $('turnTimeoutSeconds').valueAsNumber < $('requestTimeoutSeconds').valueAsNumber
+      ? '整轮处理超时不能短于单次请求超时。'
+      : '',
+  );
+  $('temperature').max = formatDropdown.value === 'anthropic' ? '1' : '2';
+  $('budget-note').textContent = !complete
+    ? '填写窗口、输入预算和输出上限，即可查看可用空间。'
+    : overBudget
+      ? '超出窗口 ' + formatNumber(-remaining) + ' token，请减少输入或输出预算。'
+      : '文本和图片按估算计入预算；实际用量以模型返回值为准。';
+  $('context-meter').closest('.budget-card').classList.toggle('invalid', overBudget);
+}
+
+$('fetch-models').onclick = () =>
+  perform(async () => {
+    const list = await api('/api/models');
+    let panel = $('model-suggestions');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'model-suggestions';
+      panel.className = 'model-suggestions';
+      panel.hidden = true;
+      panel.innerHTML =
+        '<div class="model-suggestions-head">' +
+        '<input id="model-filter" type="search" placeholder="筛选模型名…" />' +
+        '<button type="button" class="btn ghost small" id="model-filter-close">收起</button>' +
+        '</div>' +
+        '<div class="model-suggestions-list" id="model-suggestions-list"></div>';
+      $('model').closest('.field-with-action').after(panel);
+      $('model-filter').oninput = () => renderModelSuggestions();
+      $('model-filter-close').onclick = () => {
+        panel.hidden = true;
+      };
+    }
+    panel.dataset.models = JSON.stringify(list.models);
+    renderModelSuggestions();
+    panel.hidden = false;
+    show('已拉取 ' + list.models.length + ' 个模型，点击即可填入。');
+  }, $('fetch-models'));
+
+function renderModelSuggestions() {
+  const panel = $('model-suggestions');
+  if (!panel) return;
+  const models = JSON.parse(panel.dataset.models || '[]');
+  const query = ($('model-filter').value || '').trim().toLowerCase();
+  const filtered = query ? models.filter((m) => m.toLowerCase().includes(query)) : models;
+  $('model-suggestions-list').replaceChildren(
+    ...filtered.map((m) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'model-suggestion-item' + (m === $('model').value ? ' current' : '');
+      item.textContent = m;
+      item.title = m;
+      item.onclick = () => {
+        $('model').value = m;
+        panel.hidden = true;
+      };
+      return item;
+    }),
+  );
+  if (!filtered.length) {
+    const none = document.createElement('div');
+    none.className = 'model-suggestion-empty';
+    none.textContent = '没有匹配的模型';
+    $('model-suggestions-list').append(none);
+  }
+}
+
+$('test-llm').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/test-llm', 'POST');
+    show('模型连通正常：' + result.model + '（' + result.format + '）· 延迟 ' + result.latencyMs + ' ms');
+  }, $('test-llm'));
+$('test-embedding').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/test-embedding', 'POST');
+    show('向量连通正常：' + result.model + ' · 维度 ' + result.dims + ' · 延迟 ' + result.latencyMs + ' ms');
+  }, $('test-embedding'));
+
+for (const [id, field] of [
+  ['clear-api-key', 'clearApiKey'],
+  ['clear-tavily-key', 'clearTavilyKey'],
+  ['clear-embedding-key', 'clearEmbeddingApiKey'],
+])
+  $(id).onclick = () =>
+    perform(async () => {
+      const saved = await api('/api/config', 'PUT', { [field]: true });
+      applySettings(saved);
+      show('密钥已清除，对应服务在重新填写前不可用。');
+    }, $(id));
+
+function settingsChanged() {
+  settingsVersion++;
+  $('settings-saved').textContent = '有尚未保存的修改。';
+  updateBudget();
+}
+$('settings-form').oninput = settingsChanged;
+$('settings-form').onchange = settingsChanged;
+$('settings-form').onsubmit = (event) => {
+  event.preventDefault();
+  updateBudget();
+  if (!event.target.reportValidity()) return;
+  perform(async () => {
+    const version = settingsVersion;
+    const body = {};
+    for (const key of [...textSettings, 'apiKey', 'tavilyKey', 'embeddingApiKey']) body[key] = $(key).value;
+    body.format = formatDropdown.value;
+    for (const key of numberSettings) body[key] = $(key).valueAsNumber;
+    body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) body[key] = $(key).checked;
+    const saved = await api('/api/config', 'PUT', body);
+    if (version === settingsVersion) {
+      applySettings(saved);
+      $('settings-saved').textContent = '已保存 · ' + new Date().toLocaleTimeString('zh-CN');
+    }
+    show(
+      version === settingsVersion
+        ? '参数已保存，下一次生成时使用。'
+        : '已保存刚才提交的参数；新修改仍需保存。',
+    );
+    await loadStatus();
+  }, event.submitter);
+};
+
+$('backup').onclick = () =>
+  perform(async () => {
+    const result = await api('/api/backup', 'POST');
+    show('已备份 ' + result.messages + ' 条消息，位置：' + result.directory);
+  }, $('backup'));
+
+$('wechat-login').onclick = () =>
+  perform(async () => {
+    await api('/api/wechat/login', 'POST');
+    await loadStatus();
+  }, $('wechat-login'));
+$('wechat-logout').onclick = () =>
+  perform(async () => {
+    await api('/api/wechat/logout', 'POST');
+    await loadStatus();
+  }, $('wechat-logout'));
+
+$('login-form').onsubmit = (event) => {
+  event.preventDefault();
+  perform(async () => {
+    await api('/api/login', 'POST', { password: $('password').value });
+    $('password').value = '';
+    await enter();
+  }, event.submitter);
+};
+$('logout').onclick = () =>
+  perform(async () => {
+    await api('/api/logout', 'POST');
+    authenticated = false;
+    $('dashboard').hidden = true;
+    $('login').hidden = false;
+    $('connection-text').textContent = '管理空间';
+    $('connection').classList.remove('online');
+    $('notice').hidden = true;
+    $('password').focus();
+  });
+
+async function selectTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== tab));
+  document.querySelectorAll('[data-tab]').forEach((b) => {
+    const selected = b.dataset.tab === tab;
+    b.classList.toggle('selected', selected);
+    b.setAttribute('aria-selected', String(selected));
+    b.tabIndex = selected ? 0 : -1;
+  });
+  if (tab === 'chat') await loadChat();
+  if (tab === 'journal') await loadJournal();
+  if (tab === 'stickers') await loadStickers();
+  if (tab === 'persona') await loadPersonas(personaSelected);
+  if (tab === 'settings') await loadStatus();
+}
+
+const nav = $('nav');
+const mobileNav = window.matchMedia('(max-width: 960px)');
+function orientNav() {
+  nav.setAttribute('aria-orientation', mobileNav.matches ? 'horizontal' : 'vertical');
+}
+orientNav();
+mobileNav.addEventListener('change', orientNav);
+nav.addEventListener('keydown', (event) => {
+  const tabs = [...nav.querySelectorAll('[data-tab]')];
+  const index = tabs.indexOf(document.activeElement);
+  if (index < 0) return;
+  const previous = mobileNav.matches ? 'ArrowLeft' : 'ArrowUp';
+  const next = mobileNav.matches ? 'ArrowRight' : 'ArrowDown';
+  let target;
+  if (event.key === previous) target = tabs[(index + tabs.length - 1) % tabs.length];
+  if (event.key === next) target = tabs[(index + 1) % tabs.length];
+  if (event.key === 'Home') target = tabs[0];
+  if (event.key === 'End') target = tabs.at(-1);
+  if (!target) return;
+  event.preventDefault();
+  target.focus();
+  perform(() => selectTab(target.dataset.tab));
+});
+document.querySelectorAll('[data-tab]').forEach((b) => {
+  b.onclick = () => perform(() => selectTab(b.dataset.tab));
+});
+
+formatDropdown = createDropdown({
+  options: [
+    { value: 'openai', label: 'openai' },
+    { value: 'anthropic', label: 'anthropic' },
+  ],
+  value: 'openai',
+  ariaLabel: '接口格式',
+});
+$('format').append(formatDropdown.root);
+journalDropdown = createDropdown({
+  options: [{ value: 'preview:default', label: '本地试聊' }],
+  value: 'preview:default',
+  ariaLabel: '选择联系人',
+  onChange: () => {
+    journalSnapshot = '';
+    perform(loadJournal);
+  },
+});
+$('journal-peer').append(journalDropdown.root);
+
+async function loadPersonaPresets() {
+  personaPresets = await api('/api/persona-presets');
+  const options = [
+    { value: '', label: '空白（自己写）' },
+    ...personaPresets.map((p) => ({ value: p.id, label: `${p.name} · ${p.description}` })),
+  ];
+  if (!presetDropdown) {
+    presetDropdown = createDropdown({
+      options,
+      value: '',
+      ariaLabel: '人格模板',
+      placeholder: '空白（自己写）',
+    });
+    $('persona-preset-host').append(presetDropdown.root);
+  } else presetDropdown.setOptions(options, presetDropdown.value);
+}
+
+async function enter() {
+  await api('/api/config');
+  authenticated = true;
+  $('login').hidden = true;
+  $('dashboard').hidden = false;
+  $('notice').hidden = true;
+  await Promise.all([loadPersonas(), loadPersonaPresets()]);
+  await Promise.all([refreshStickerMap(), loadPeers(), loadSettings()]);
+  await loadStatus();
+  await selectTab(currentTab);
+}
+
 setInterval(async () => {
   if (!authenticated || document.hidden || polling) return;
   polling = true;
   try {
     await perform(async () => {
-      await status();
-      if (currentTab === 'overview') await loadPeers();
-      if (currentTab === 'chat') {
-        await loadChat();
-        if (lastTask) {
-          const task = await api('/api/tasks/' + enc(lastTask));
-          if (task.state === 'failed') {
-            show(task.error + '，可在“连接与运行”中重试。', true);
-            lastTask = null;
-          } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
-        }
+      const state = await loadStatus();
+      if (lastTask) {
+        const task = await api('/api/tasks/' + enc(lastTask));
+        if (task.state === 'failed') {
+          show(task.error + '，可在右上角铃铛里重试。', true);
+          lastTask = null;
+        } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
       }
-      // Journal content changes at diary-writing pace, not chat pace; polling
-      // three full listings every 2.5s wasted real CPU once histories grew.
+      if (currentTab === 'chat') await loadChat();
       if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
         journalPoll = Date.now();
         await loadJournal();
       }
+      if ($('drawer-connection').hidden === false) await loadPeers();
+      return state;
     });
   } finally {
     polling = false;
   }
 }, 2500);
+
 enter().catch(() => {});

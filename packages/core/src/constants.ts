@@ -49,12 +49,19 @@ export const SILENCE_HOURS_THRESHOLD = 4;
 
 /** Proactive contact jitter: attempts get a random delay inside this window. */
 export const PROACTIVE_JITTER_MINUTES = 20;
-/** Proactive brake: after this many unanswered pings, pause for days. */
-export const PROACTIVE_IGNORE_LIMIT = 2;
-export const PROACTIVE_IGNORE_COOLDOWN_DAYS = 3;
-/** Open loops: expire silently after this many days past due. */
-export const OPEN_LOOP_EXPIRE_DAYS = 7;
+/** Shared brake/expire knobs live in @atri/db; re-exported for one source of truth. */
+export {
+  OPEN_LOOP_EXPIRE_DAYS,
+  PROACTIVE_IGNORE_LIMIT,
+  PROACTIVE_IGNORE_COOLDOWN_DAYS,
+} from '@atri/db';
 export const OPEN_LOOP_PROMPT_MAX = 5;
+/**
+ * New-memory cosine similarity above which the closest active memory is
+ * auto-superseded: restatements of a known fact in fresh wording replace the
+ * old row instead of duplicating it.
+ */
+export const SIMILARITY_SUPERSEDE = 0.9;
 /** Rhythm hint: minimum hourly messages before a bucket counts as habitual. */
 export const RHYTHM_MIN_BUCKET = 3;
 /** How many busiest hours to describe when a user has no clear routine. */

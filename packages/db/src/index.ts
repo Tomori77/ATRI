@@ -5,6 +5,20 @@ import { dirname } from 'node:path';
 import { cosineSimilarity } from '@atri/llm';
 export { createBackup, restoreBackup } from './backup.js';
 
+const hourFormatters = new Map<string, Intl.DateTimeFormat>();
+export function hourFormatter(timeZone: string): Intl.DateTimeFormat {
+  let formatter = hourFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      hourCycle: 'h23',
+    });
+    hourFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
 export type TaskKind = 'chat' | 'notes' | 'diary' | 'proactive';
 export type SourceKind = 'message' | 'memory' | 'diary';
 export interface Peer {
@@ -740,13 +754,12 @@ export class Store {
   markMemoriesUsed(peer: string, ids: string[], now = Date.now()) {
     const unique = [...new Set(ids)];
     if (!unique.length) return;
-    const update = this.sql.prepare(
-      'UPDATE memories SET hits=hits+1, last_hit_at=? WHERE peer_id=? AND id=? AND status=?',
-    );
-    this.transaction(() => {
-      for (const id of unique)
-        update.run(now, peer, id, 'active');
-    });
+    const placeholders = unique.map(() => '?').join(',');
+    this.sql
+      .prepare(
+        `UPDATE memories SET hits=hits+1, last_hit_at=? WHERE peer_id=? AND id IN (${placeholders}) AND status=?`,
+      )
+      .run(now, peer, ...unique, 'active');
     this.memoryCache.delete(peer);
   }
   private writeMemory(peer: string, update: MemoryUpdate, now: number) {
@@ -1245,13 +1258,7 @@ export class Store {
     now = Date.now(),
     timeZone = 'Asia/Shanghai',
   ) {
-    const hour = Number(
-      new Intl.DateTimeFormat('en-GB', {
-        timeZone,
-        hour: '2-digit',
-        hourCycle: 'h23',
-      }).format(new Date(exchange.userAt)),
-    );
+    const hour = Number(hourFormatter(timeZone).format(new Date(exchange.userAt)));
     const clamp = (v: number) => Math.max(-1, Math.min(1, v));
     let valence = 0,
       energy = 0,
@@ -1280,11 +1287,7 @@ export class Store {
         "SELECT created_at FROM messages WHERE peer_id=? AND role='user' AND status='received' AND created_at>=?",
       )
       .all(peer, since);
-    const formatter = new Intl.DateTimeFormat('en-GB', {
-      timeZone,
-      hour: '2-digit',
-      hourCycle: 'h23',
-    });
+    const formatter = hourFormatter(timeZone);
     for (const row of rows) buckets[Number(formatter.format(new Date(Number(row.created_at))))]++;
     return buckets;
   }
