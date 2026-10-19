@@ -1167,38 +1167,46 @@ svg {
   gap: 10px;
 }
 
-.settings-columns {
+.settings-layout-page {
+  max-width: none;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: minmax(0, 1fr);
   gap: 18px;
-  align-items: start;
-}
-
-.settings-aside {
-  position: sticky;
-  top: 0;
-  max-height: calc(100vh - 40px);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  min-width: 0;
-}
-
-@media (max-width: 1160px) {
-  .settings-columns {
-    grid-template-columns: 1fr;
-  }
-  .settings-aside {
-    position: static;
-    max-height: none;
-    overflow-y: visible;
-  }
+  height: 100%;
+  min-height: 0;
 }
 
 .settings-stack {
   max-width: none;
   min-width: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.settings-aside {
+  align-self: stretch;
+  height: 100%;
+  max-height: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding-right: 4px;
+}
+
+@media (max-width: 1160px) {
+  .settings-layout-page {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    height: auto;
+  }
+  .settings-stack,
+  .settings-aside {
+    overflow-y: visible;
+    height: auto;
+  }
 }
 
 .budget-card {
