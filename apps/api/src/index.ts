@@ -19,6 +19,7 @@ const embeddings = new EmbeddingClient(() => settings.embedding());
 // directory behind an empty tmpfs, and the working directory has to survive that.
 const sandbox = new Sandbox(resolve(dataDir, '..', 'sandbox'), {
   enabled: () => settings.config().sandboxEnabled,
+  network: () => settings.config().sandboxNetwork,
   sizeLimitBytes: () => settings.config().sandboxSizeMb * 1024 * 1024,
   // Address space cap only; nsjail needs no cgroup access for rlimits, and a
   // cgroup-backed limit would require --cgroupns=host on the host, which would

@@ -1048,8 +1048,14 @@ function applySettings(config) {
   for (const key of [...textSettings, ...numberSettings]) $(key).value = config[key];
   formatDropdown.value = config.format;
   $('temperature').value = config.temperature ?? '';
-  for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled'])
-    $(key).checked = config[key];
+  for (const key of [
+  'vision',
+  'proactiveEnabled',
+  'embeddingEnabled',
+  'sandboxEnabled',
+  'sandboxNetwork',
+])
+  $(key).checked = config[key];
   $('apiKey').placeholder = config.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
   $('tavilyKey').placeholder = config.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('embeddingApiKey').placeholder = config.hasEmbeddingApiKey
@@ -1163,19 +1169,14 @@ $('test-embedding').onclick = () =>
 
 function renderSandbox(state) {
   const kb = (state.usage.bytes / 1024).toFixed(1);
-  const limit = state.sizeLimitBytes
-    ? state.sizeLimitBytes / 1024 / 1024 + ' MB'
-    : '不限制';
+  const limit = state.sizeLimitBytes ? state.sizeLimitBytes / 1024 / 1024 + ' MB' : '不限制';
   const mem = state.memoryLimitMb ? state.memoryLimitMb + ' MB' : '不限制';
   $('sandbox-status').textContent =
-    (state.enabled ? '沙箱已开启' : '沙箱已关闭') +
-    ' · 目录 ' + state.root +
+    (state.enabled ? '已开启' : '已关闭') +
     ' · ' + state.usage.files + ' 个文件 / ' + kb + ' KB' +
-    ' · 磁盘上限 ' + limit +
-    ' · 单命令内存 ' + mem;
-  if (state.isolation)
-    $('sandbox-isolation').textContent =
-      '隔离：' + state.isolation.note + '　网络：' + state.isolation.network;
+    ' · 上限 ' + limit +
+    ' · 内存 ' + mem +
+    ' · ' + (state.isolation ? state.isolation.network : '');
 }
 $('refresh-sandbox').onclick = () =>
   perform(async () => renderSandbox(await api('/api/sandbox')), $('refresh-sandbox'));
@@ -1216,8 +1217,14 @@ $('settings-form').onsubmit = (event) => {
     body.format = formatDropdown.value;
     for (const key of numberSettings) body[key] = $(key).valueAsNumber;
     body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled'])
-      body[key] = $(key).checked;
+    for (const key of [
+  'vision',
+  'proactiveEnabled',
+  'embeddingEnabled',
+  'sandboxEnabled',
+  'sandboxNetwork',
+])
+  body[key] = $(key).checked;
     const saved = await api('/api/config', 'PUT', body);
     if (version === settingsVersion) {
       applySettings(saved);

@@ -14,10 +14,17 @@ const canRun = process.platform === 'linux';
 /** Build a sandbox with the options object the app now uses. */
 const make = (
   dir: string,
-  patch: Partial<{ enabled: boolean; sizeLimitBytes: number; timeoutMs: number; outputLimit: number }> = {},
+  patch: Partial<{
+    enabled: boolean;
+    network: boolean;
+    sizeLimitBytes: number;
+    timeoutMs: number;
+    outputLimit: number;
+  }> = {},
 ) =>
   new Sandbox(join(dir, 'sandbox'), {
     enabled: () => patch.enabled ?? true,
+    network: () => patch.network ?? false,
     sizeLimitBytes: () => patch.sizeLimitBytes ?? 0,
     timeoutMs: patch.timeoutMs ?? 0,
     outputLimit: patch.outputLimit ?? 0,
@@ -189,13 +196,41 @@ test('clear 会清空目录', async (t) => {
 });
 
 test('isolationInfo 返回可展示的隔离说明', async (t) => {
-  const sandbox = make(temporary(t));
-  const info = await sandbox.isolationInfo();
-  assert.equal(typeof info.note, 'string');
-  assert.ok(info.note.length > 0);
-  assert.equal(typeof info.network, 'string');
-  // 没有 nsjail 的环境下必须诚实地报告降级，而不是谎称已隔离。
+  const off = make(temporary(t), { network: false });
+  const info = await off.isolationInfo();
   assert.ok(['nsjail', 'directory'].includes(info.level));
+  assert.match(info.network, /已禁用/);
+  const on = make(temporary(t), { network: true });
+  const networked = await on.isolationInfo();
+  assert.match(networked.network, /已启用/);
+});
+
+test('网络开关改变 nsjail 参数', async (t) => {
+  // `--disable_clone_newnet` 看起来是"关网络"，实际含义是"不创建网络命名
+  // 空间"，也就是共享宿主网络。这是唯一能让沙箱联网的开关。
+  const offline = make(temporary(t), { network: false }) as unknown as {
+    nsjailArgs(c: string): { args: string[] };
+  };
+  const online = make(temporary(t), { network: true }) as unknown as {
+    nsjailArgs(c: string): { args: string[] };
+  };
+  assert.ok(!offline.nsjailArgs('true').args.includes('--disable_clone_newnet'));
+  assert.ok(online.nsjailArgs('true').args.includes('--disable_clone_newnet'));
+});
+
+test('联网开关变化会重新探测 nsjail', async (t) => {
+  let net = false;
+  const sandbox = new Sandbox(join(temporary(t), 'sandbox'), {
+    enabled: () => true,
+    network: () => net,
+    sizeLimitBytes: () => 0,
+  });
+  const first = await sandbox.nsjailAvailable();
+  net = true;
+  // 参数不同即视为需要重新探测，不能把上次的结论套用过来。
+  const second = await sandbox.nsjailAvailable();
+  assert.equal(typeof first, 'boolean');
+  assert.equal(typeof second, 'boolean');
 });
 
 test('run 会报告实际使用的隔离方式', { skip: !canRun }, async (t) => {

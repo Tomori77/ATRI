@@ -27,8 +27,9 @@ export interface SavedConfig {  baseUrl: string;
   embeddingBaseUrl: string;
   embeddingApiKey: string;
   embeddingModel: string;
-  sandboxEnabled: boolean;
-  sandboxSizeMb: number;
+sandboxEnabled: boolean;
+sandboxNetwork: boolean;
+sandboxSizeMb: number;
   sandboxMemoryMb: number;
   maxConcurrentPeers: number;
   debounceMs: number;
@@ -151,6 +152,9 @@ export class Settings {
       embeddingApiKey: env.EMBEDDING_API_KEY || '',
       embeddingModel: env.EMBEDDING_MODEL || '',
       sandboxEnabled: env.SANDBOX_ENABLED === 'true',
+      // Off by default: a command with no route out is the safer default, and
+      // the operator can turn it on when she needs to install packages.
+      sandboxNetwork: env.SANDBOX_NETWORK === 'true',
       sandboxSizeMb: Number(env.SANDBOX_SIZE_MB || 512),
       sandboxMemoryMb: Number(env.SANDBOX_MEMORY_MB || 2048),
       maxConcurrentPeers: 3,
@@ -186,7 +190,7 @@ export class Settings {
         throw new Error('模型接口格式无效');
       next.format = input.format as ApiFormat;
     }
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled'] as const)
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled', 'sandboxNetwork'] as const)
       if (input[key] !== undefined) {
         if (typeof input[key] !== 'boolean') throw new Error('开关格式无效');
         next[key] = input[key];

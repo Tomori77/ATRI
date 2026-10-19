@@ -119,8 +119,8 @@ export const SANDBOX_TOOLS: ToolDefinition[] = [
   {
     name: 'run_command',
     description:
-      '在一个独立的工作目录里执行一条 shell 命令（Linux 基础命令、python3、node 均可）。' +
-      '没有时间限制也没有输出长度限制，可以放心跑长时间的编译、数据处理、训练脚本。' +
+      '在一个独立的工作目录里执行一条 shell 命令（Linux 基础命令、node 均可）。' +
+      '没有时间限制也没有输出长度限制，可以放心跑长时间的编译、数据处理脚本。' +
       '每次调用都是独立的一次执行，上一次留下的文件会保留在同一个目录里。',
     parameters: object({ command: { type: 'string', maxLength: 4000 } }, ['command']),
   },

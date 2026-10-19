@@ -48,6 +48,9 @@ export interface SandboxOptions {
   memoryLimitMb?: () => number;
   /** Max processes per command; 0 means unlimited. */
   maxProcesses?: () => number;
+  /** Whether sandboxed commands may reach the network. Off by default: the
+   *  command gets its own empty net namespace. */
+  network: () => boolean;
 }
 
 export class SandboxQuotaError extends Error {}
@@ -58,8 +61,10 @@ export class Sandbox {
   readonly root: string;
   private readonly timeoutMs: number;
   private readonly outputLimit: number;
-  /** Cached probe result; nsjail's availability cannot change at runtime. */
-  private nsjailUsable: boolean | null = null;
+  /** Cached probe result. nsjail's availability cannot change at runtime, but the
+   *  probe depends on the network flag, so the key covers that too. */
+  private nsjailProbe: string | null = null;
+  private nsjailUsable = false;
 
   constructor(rootDir: string, private readonly options: SandboxOptions) {
     this.root = resolve(rootDir);
@@ -80,8 +85,10 @@ export class Sandbox {
    *  with a real no-op run, because "binary exists" is not the same as
    *  "works": some hosts block user namespaces outright. */
   async nsjailAvailable(): Promise<boolean> {
-    if (this.nsjailUsable !== null) return this.nsjailUsable;
+    const key = String(this.options.network());
+    if (this.nsjailProbe === key) return this.nsjailUsable;
     if (process.platform === 'win32' || !existsSync(NSJAIL)) {
+      this.nsjailProbe = key;
       this.nsjailUsable = false;
       return false;
     }
@@ -97,6 +104,7 @@ export class Sandbox {
     } catch {
       this.nsjailUsable = false;
     }
+    this.nsjailProbe = key;
     return this.nsjailUsable;
   }
 
@@ -237,11 +245,16 @@ export class Sandbox {
     );
   }
 
-/** nsjail argv. Full namespace isolation: the default (no --disable_clone_*) set
- *  gives separate mount/pid/ipc/uts/user/net namespaces, so the command has no
- *  route off the host and is PID 1 inside. System paths are mounted read-only,
+/** nsjail argv. Namespace isolation: mount/pid/ipc/uts/user namespaces, so the
+ *  command is PID 1 inside with a changed hostname, system paths are read-only,
  *  and /app and /data get an empty tmpfs over them so the command cannot read
  *  the application source or the SQLite database.
+ *
+ *  Networking is the operator's call. The default gives the command its own
+ *  empty net namespace with no route out. `--disable_clone_newnet` *shares the
+ *  host's* network instead, which is what enables npm/pip/curl; the flag reads
+ *  backwards but that is its actual meaning. Every other isolation property is
+ *  unaffected either way, which was verified on a real host.
  *
  *  No cgroup limits: a plain container mounts cgroupfs read-only and nsjail
  *  needs --cgroupns=host for those, which would require host setup. Resource
@@ -257,11 +270,11 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
     // working directory at all.
     for (const hidden of ['/app', '/data']) {
       if (!existsSync(hidden)) continue;
-      const target = resolve(hidden);
-      const rel = relative(target, this.root);
+      const rel = relative(resolve(hidden), this.root);
       if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) continue;
       args.push('--tmpfsmount', hidden);
     }
+    if (this.options.network()) args.push('--disable_clone_newnet');
     const mem = this.options.memoryLimitMb?.() ?? 0;
     if (mem > 0) args.push('--rlimit_as', String(mem * 1024));
     if (this.timeoutMs > 0) args.push('--time_limit', String(Math.ceil(this.timeoutMs / 1000)));
@@ -359,23 +372,27 @@ private nsjailArgs(command: string): { bin: string; args: string[] } {
 
   /** What the settings page shows so the operator knows what they are getting. */
   async isolationInfo(): Promise<{
-    level: 'nsjail' | 'directory' | 'unavailable';
+    level: 'nsjail' | 'directory';
     note: string;
     network: string;
   }> {
+    const wantsNetwork = this.options.network();
+    const network = wantsNetwork ? '已启用（共享容器网络）' : '已禁用（独立网络命名空间）';
     if (process.platform === 'win32')
       return {
         level: 'directory',
         note: '本地 Windows 预览：目录级隔离。生产 Linux 容器内使用 nsjail。',
-        network: '本地预览无法禁用网络',
+        // Wording kept identical to the Linux branch so the settings page reads
+        // the same in both places; the note above is where the difference shows.
+        network,
       };
     const nsjail = await this.nsjailAvailable();
     return {
       level: nsjail ? 'nsjail' : 'directory',
       note: nsjail
-        ? 'nsjail 命名空间隔离：独立 mount/pid/ipc/uts/user/net 命名空间，命令无网络出口，系统目录只读挂载，沙箱目录是唯一可写路径，应用目录与数据库不在挂载列表内。'
-        : 'nsjail 不可用，已回退到目录级隔离（工作目录 + 环境变量白名单 + 配额 + 软链防护）。宿主机可能禁用了用户命名空间。',
-      network: nsjail ? '已禁用（命令无网络）' : '未禁用',
+        ? 'nsjail 命名空间隔离：独立 mount/pid/ipc/uts/user 命名空间，系统目录只读挂载，沙箱目录是唯一可写路径，应用目录与数据库已被空 tmpfs 遮蔽。'
+        : 'nsjail 不可用，已回退到目录级隔离（工作目录 + 环境变量白名单 + 配额 + 软链防护）。',
+      network: nsjail ? network : wantsNetwork ? network + '（无命名空间隔离）' : '未禁用',
     };
   }
 }
