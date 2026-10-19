@@ -3,6 +3,14 @@ services:
     build: .
     image: atri-wechat:local
     restart: unless-stopped
+    # nsjail ships inside the image and builds the sandbox's namespaces itself,
+    # which requires CAP_SYS_ADMIN plus a usable mount namespace. Verified on a
+    # real host: cap_add alone is not enough (AppArmor still blocks the mount
+    # tree), so privileged is the only config that works without touching the
+    # host. What the model can reach stays narrow: its own net/mount/pid/user
+    # namespaces, no network route out, read-only system directories, and no
+    # view of /app or /data.
+    privileged: true
     env_file: .env
     environment:
       DATA_DIR: /data

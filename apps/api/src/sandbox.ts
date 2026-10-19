@@ -86,8 +86,11 @@ export class Sandbox {
       return false;
     }
     try {
-      // `--true` exits immediately; if namespaces were unavailable this throws.
-      await exec(NSJAIL, ['--quiet', '--', '/bin/true'], { timeout: 10000 });
+      // Probe with the same flags the real runs use. A bare `-- /bin/true` would
+      // pass even when the mount tree cannot be built, which is exactly the
+      // failure mode this has to catch.
+      const { args } = this.nsjailArgs('true');
+      await exec(NSJAIL, args, { timeout: 15000 });
       this.nsjailUsable = true;
     } catch {
       this.nsjailUsable = false;
@@ -232,40 +235,25 @@ export class Sandbox {
     );
   }
 
-  /** nsjail argv. Namespaces come from the user namespace created inside, so no
-   *  cgroup flags are used: those need a writable host cgroup mount, which would
-   *  break the "just docker compose up" promise. Resource bounds come from
-   *  rlimits instead, which need no privilege at all.
-   *
-   *  `--disable_clone_newnet` keeps the command off the network entirely.
-   *  `/usr` and `/lib` are read-only bind mounts so binaries can actually run;
-   *  the sandbox directory is the only writable path. */
-  private nsjailArgs(command: string): { bin: string; args: string[] } {
-    const args = [
-      '--quiet',
-      '--chroot',
-      '/',
-      '--cwd',
-      this.root,
-      '--bindmount',
-      this.root,
-      '--bindmount_ro',
-      '/usr',
-      '--bindmount_ro',
-      '/lib',
-      '--bindmount_ro',
-      '/lib64',
-      '--bindmount_ro',
-      '/bin',
-      '--bindmount_ro',
-      '/sbin',
-      // No network: the command gets a namespace with nothing outside it.
-      '--disable_clone_newnet',
-    ];
+/** nsjail argv. Full namespace isolation: the default (no --disable_clone_*) set
+ *  gives separate mount/pid/ipc/uts/user/net namespaces, so the command has no
+ *  route off the host and is PID 1 inside. System paths are mounted read-only,
+ *  and /app and /data get an empty tmpfs over them so the command cannot read
+ *  the application source or the SQLite database.
+ *
+ *  No cgroup limits: a plain container mounts cgroupfs read-only and nsjail
+ *  needs --cgroupns=host for those, which would require host setup. Resource
+ *  bounds come from rlimits instead, which need no extra privilege.
+ */
+private nsjailArgs(command: string): { bin: string; args: string[] } {
+    const args = ['--really_quiet', '--chroot', '/', '--cwd', this.root, '--bindmount', this.root];
+    for (const dir of ['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc'])
+      if (existsSync(dir)) args.push('--bindmount_ro', dir);
+    // Blank out the app and its data volume: a bind mount would still expose
+    // them, and an empty tmpfs means "not there" from inside the jail.
+    for (const hidden of ['/app', '/data']) args.push('--tmpfsmount', hidden);
     const mem = this.options.memoryLimitMb?.() ?? 0;
     if (mem > 0) args.push('--rlimit_as', String(mem * 1024));
-    const procs = this.options.maxProcesses?.() ?? 0;
-    if (procs > 0) args.push('--rlimit_nofile', String(Math.max(256, procs * 64)));
     if (this.timeoutMs > 0) args.push('--time_limit', String(Math.ceil(this.timeoutMs / 1000)));
     args.push('--', '/bin/sh', '-c', command);
     return { bin: NSJAIL, args };
@@ -375,7 +363,7 @@ export class Sandbox {
     return {
       level: nsjail ? 'nsjail' : 'directory',
       note: nsjail
-        ? 'nsjail 命名空间隔离：独立 mount/pid/ipc/uts/user 命名空间，无网络，只读挂载系统目录，沙箱目录为唯一可写路径。'
+        ? 'nsjail 命名空间隔离：独立 mount/pid/ipc/uts/user/net 命名空间，命令无网络出口，系统目录只读挂载，沙箱目录是唯一可写路径，应用目录与数据库不在挂载列表内。'
         : 'nsjail 不可用，已回退到目录级隔离（工作目录 + 环境变量白名单 + 配额 + 软链防护）。宿主机可能禁用了用户命名空间。',
       network: nsjail ? '已禁用（命令无网络）' : '未禁用',
     };
