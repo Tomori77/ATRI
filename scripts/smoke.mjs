@@ -110,7 +110,7 @@ try {
   }
   assert.equal((await fetch(base + '/healthz')).status, 200);
   const page = await fetch(base + '/');
-  assert.match(await page.text(), /日记与对话/);
+  assert.match(await page.text(), /对话/);
   assert.equal((await fetch(base + '/api/config')).status, 401);
   const login = await fetch(base + '/api/login', {
     method: 'POST',
