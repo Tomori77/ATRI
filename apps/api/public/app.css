@@ -303,14 +303,28 @@ svg {
 }
 
 /* Non-chat views read as a centered column instead of hugging the nav side.
-   The chat view manages its own two-pane layout and is excluded below. */
+   The chat view manages its own two-pane layout and is excluded below.
+   width:fit-content keeps inline-flex elements (subtabs) centerable — auto
+   margins alone do nothing on inline-level boxes. */
 .view[data-panel='journal'] > *,
 .view[data-panel='persona'] > *,
 .view[data-panel='stickers'] > *,
 .view[data-panel='settings'] > * {
+  width: fit-content;
   max-width: 980px;
   margin-left: auto;
   margin-right: auto;
+}
+
+/* fit-content would shrink full-width forms/cards to their content; these
+   must span the whole centered column. */
+.view[data-panel='journal'] > .stack,
+.view[data-panel='persona'] > .persona-layout,
+.view[data-panel='stickers'] > .card,
+.view[data-panel='stickers'] > .sticker-grid,
+.view[data-panel='settings'] > .settings-columns,
+.view[data-panel='settings'] > .actions {
+  width: auto;
 }
 
 /* ---------- 通用组件 ---------- */
@@ -1038,6 +1052,12 @@ svg {
   border-radius: 12px;
   padding: 4px;
   margin-bottom: 16px;
+}
+
+/* Inside the centered journal column the tab strip follows the text flow
+   instead of stretching; the fit-content rule above keeps it centerable. */
+.view[data-panel='journal'] > .subtabs {
+  width: fit-content;
 }
 
 .subtab {
