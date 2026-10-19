@@ -1149,9 +1149,12 @@ svg {
 
 .settings-layout-page {
   max-width: none;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 18px;
+  height: 100%;
+  min-height: 0;
 }
 
 .settings-head-row {
@@ -1165,16 +1168,6 @@ svg {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.settings-layout-page {
-  max-width: none;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: minmax(0, 1fr);
-  gap: 18px;
-  height: 100%;
-  min-height: 0;
 }
 
 .settings-stack {
@@ -1196,11 +1189,32 @@ svg {
   padding-right: 4px;
 }
 
+/* The settings panel hosts its own two-pane scrolling: keep .view from
+   producing a page-level scrollbar that would move both columns. */
+.view[data-panel='settings'] {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.view[data-panel='settings'] #settings-form {
+  flex: 1;
+  min-height: 0;
+}
+
 @media (max-width: 1160px) {
   .settings-layout-page {
     grid-template-columns: 1fr;
     grid-template-rows: none;
     height: auto;
+  }
+  .view[data-panel='settings'] {
+    overflow-y: auto;
+    display: block;
+  }
+  .view[data-panel='settings'] #settings-form {
+    flex: none;
+    min-height: 0;
   }
   .settings-stack,
   .settings-aside {
