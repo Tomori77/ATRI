@@ -432,6 +432,12 @@ async function loadStatus() {
   const online = state.wechat.status === '已连接';
   $('connection-text').textContent = online ? '微信已连接' : '微信未连接';
   $('connection').classList.toggle('online', online);
+  // Primary action follows state: while connected, logout is the destructive
+  // primary and re-login recedes; disconnected, login is the way forward.
+  $('wechat-login').classList.toggle('primary', !online);
+  $('wechat-login').classList.toggle('ghost', online);
+  $('wechat-logout').classList.toggle('primary', online);
+  $('wechat-logout').classList.toggle('ghost', !online);
   $('wechat-state').textContent = state.wechat.status;
   $('wechat-error').textContent =
     state.wechat.error || (!state.config.hasApiKey ? '请先在「设置」里配置模型密钥。' : '');
@@ -564,22 +570,36 @@ async function loadPeers() {
   target.replaceChildren();
   if (!wechatPeers.length) empty(target, '扫码登录后，让朋友发来第一条微信消息。');
   for (const peer of wechatPeers) {
-    const row = el('div', undefined, 'row'),
-      heading = el('div', undefined, 'row-title');
+    const row = el('div', undefined, 'row peer-row'),
+      // ID on its own line (it wraps), status badge + toggle below: mixing a
+      // 40-char opaque ID with buttons in one flex row is what stretched the
+      // card sideways.
+      heading = el('div', undefined, 'row-title peer-name');
     heading.append(
       el('span', peer.address),
       el('span', peer.approved ? '回复中' : '未允许', 'badge'),
-      button(peer.approved ? '暂停回复' : '允许使用', async () => {
-        await api('/api/peers/' + enc(peer.id), 'PUT', { approved: !peer.approved });
-        await loadPeers();
-        await loadStatus();
-      }),
     );
-    row.append(heading, buildPersonaSelect(peer));
+    row.append(
+      heading,
+      // Pausing a peer silences her until re-approved; arm-to-confirm keeps a
+      // mis-tap next to the persona dropdown from doing that silently.
+      peer.approved
+        ? confirmButton('暂停回复', '确认暂停？', async () => {
+            await api('/api/peers/' + enc(peer.id), 'PUT', { approved: false });
+            await loadPeers();
+            await loadStatus();
+          })
+        : button('允许使用', async () => {
+            await api('/api/peers/' + enc(peer.id), 'PUT', { approved: true });
+            await loadPeers();
+            await loadStatus();
+          }),
+      buildPersonaSelect(peer),
+    );
     target.append(row);
   }
   if (previewPeer) {
-    const row = el('div', undefined, 'row'),
+    const row = el('div', undefined, 'row peer-row'),
       heading = el('div', undefined, 'row-title');
     heading.append(el('span', '本地试聊'));
     row.append(heading, buildPersonaSelect(previewPeer));
