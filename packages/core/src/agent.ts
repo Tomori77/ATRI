@@ -736,7 +736,23 @@ export class Agent {
       const completion = call.result;
       if (completion.calls.length) {
         if (!tools.length) throw new Error('模型在工具预算耗尽后仍要求调用工具');
-        messages.push(completion.continuation);
+        // Thinking models ship thousands of reasoning tokens per round (GLM
+        // counts them in output and the gateway ignores max_tokens for them).
+        // Neither the provider (it would recount them) nor our estimate —
+        // which prices CJK at 2 tokens/char, roughly double GLM's real
+        // tokenizer — should ever see them again.
+        const cont = completion.continuation;
+        if (cont.raw && typeof cont.raw === 'object' && !Array.isArray(cont.raw)) {
+          const raw = cont.raw as Record<string, unknown>;
+          delete raw.reasoning_content;
+          delete raw.reasoning;
+          if (typeof raw.content === 'string')
+            raw.content = trimToTokens(
+              raw.content,
+              Math.max(512, Math.floor(this.o.contextTokens() / 8)),
+            );
+        }
+        messages.push(cont);
         toolRounds++;
         for (const call of completion.calls) {
           let result: unknown;
@@ -785,6 +801,21 @@ export class Agent {
           this.o.timeZone(),
         );
       } catch (error) {
+        // The pre-call budget check in call() throws this before any request
+        // goes out. Shrinking is legitimate here: the estimate prices CJK at
+        // ~2 tokens/char, roughly double what GLM actually counts. Drop the
+        // previous round's assistant message first, else the oldest turn;
+        // keep at least system + latest user. call() re-checks every round.
+        if (error instanceof Error && /输入超过当前上下文预算/.test(error.message) && messages.length > 2) {
+          let dropIndex = 1;
+          for (let i = 1; i < messages.length - 1; i++)
+            if (messages[i]!.role === 'assistant') {
+              dropIndex = i;
+              break;
+            }
+          messages.splice(dropIndex, 1);
+          continue;
+        }
         if (repaired || attempt === MAX_REPLY_ATTEMPTS - 1) throw error;
         repaired = true;
         messages.push({ role: 'assistant', content: completion.text.slice(0, 8000) });
