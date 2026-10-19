@@ -978,7 +978,13 @@ $('persona-form').onsubmit = (event) => {
 };
 
 async function loadStickers() {
-  const stickers = await refreshStickerMap();
+  const [stickers, moodData, usage] = await Promise.all([
+    refreshStickerMap(),
+    api('/api/sticker-moods'),
+    api('/api/sticker-usage'),
+  ]);
+  stickerMoodState = moodData;
+  stickerUsageState = usage;
   const container = $('sticker-list');
   container.replaceChildren();
   for (const sticker of stickers) {
@@ -1002,7 +1008,120 @@ async function loadStickers() {
     container.append(card);
   }
   if (!stickers.length) empty(container, '目录还是空的。上传一张图片，教她认识第一个表情。');
+  renderMoodList();
+  renderStickerIntensityList(stickers);
+  renderStickerUsage();
 }
+let stickerMoodState = { presets: [], custom: [] },
+  stickerUsageState = {};
+function allMoods() {
+  return [...stickerMoodState.presets, ...stickerMoodState.custom];
+}
+function renderMoodList() {
+  const target = $('mood-list');
+  target.replaceChildren();
+  for (const mood of allMoods()) {
+    const row = el('div', undefined, 'row');
+    const heading = el('div', undefined, 'row-title');
+    heading.append(el('span', mood.name), el('span', mood.id, 'hint'));
+    row.append(heading);
+    if (stickerMoodState.custom.some((m) => m.id === mood.id))
+      row.append(
+        confirmButton('删除', '确认删除？', async () => {
+          await api('/api/sticker-moods/' + enc(mood.id), 'DELETE');
+          await loadStickers();
+        }),
+      );
+    target.append(row);
+  }
+  if (!allMoods().length) empty(target, '还没有情绪。');
+}
+function renderStickerIntensityList(stickers) {
+  const target = $('sticker-intensity-list');
+  target.replaceChildren();
+  const moods = allMoods();
+  if (!moods.length) {
+    empty(target, '先添加情绪，再为表情归类。');
+    return;
+  }
+  for (const sticker of stickers) {
+    const row = el('div', undefined, 'row');
+    const heading = el('div', undefined, 'row-title');
+    heading.append(el('span', sticker.slug), el('span', sticker.description, 'hint'));
+    const box = el('div', undefined, 'actions');
+    for (const mood of moods) {
+      const label = document.createElement('label');
+      label.className = 'check';
+      const current = sticker.intensity?.[mood.id] ?? 0;
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = current > 0;
+      const level = document.createElement('select');
+      for (const [value, name] of [[1, '轻度'], [2, '中度'], [3, '较强'], [4, '强烈']]) {
+        const option = el('option', name);
+        option.value = value;
+        level.append(option);
+      }
+      level.value = current || 2;
+      level.hidden = !current;
+      check.onchange = () => {
+        level.hidden = !check.checked;
+      };
+      label.append(check, el('span', mood.name), level);
+      box.append(label);
+    }
+    const save = confirmButton('保存', '确认保存？', async () => {
+      const intensity = {};
+      for (const label of box.querySelectorAll('label')) {
+        const check = label.querySelector('input[type=checkbox]');
+        const level = label.querySelector('select');
+        if (check.checked) intensity[allMoods()[[...box.querySelectorAll('label')].indexOf(label)].id] = Number(level.value);
+      }
+      await api('/api/stickers/' + enc(sticker.slug) + '/intensity', 'PUT', { intensity });
+      show('「' + sticker.slug + '」的归类已保存。');
+    });
+    save.type = 'button';
+    box.append(save);
+    row.append(heading, box);
+    target.append(row);
+  }
+}
+function renderStickerUsage() {
+  const target = $('sticker-usage');
+  target.replaceChildren();
+  const peers = Object.entries(stickerUsageState);
+  if (!peers.length) {
+    empty(target, '还没有使用记录。');
+    return;
+  }
+  for (const [peerId, stats] of peers) {
+    const row = el('div', undefined, 'row');
+    const heading = el('div', undefined, 'row-title');
+    heading.append(el('span', peerId));
+    row.append(heading);
+    const lines = Object.entries(stats)
+      .sort((a, b) => b[1].count - a[1].count)
+      .map(([slug, s]) => `${slug} × ${s.count}`);
+    row.append(el('p', lines.join(' · '), 'hint'));
+    row.append(
+      confirmButton('清零', '确认清零？', async () => {
+        await api('/api/sticker-usage/' + enc(peerId), 'DELETE');
+        await loadStickers();
+        show('该联系人的表情统计已清零。');
+      }),
+    );
+    target.append(row);
+  }
+}
+$('mood-form').onsubmit = (event) => {
+  event.preventDefault();
+  perform(async () => {
+    await api('/api/sticker-moods', 'POST', { name: $('mood-name').value });
+    event.target.reset();
+    await loadStickers();
+    show('情绪已添加。');
+  }, event.submitter);
+};
 
 $('sticker-form').onsubmit = (event) => {
   event.preventDefault();

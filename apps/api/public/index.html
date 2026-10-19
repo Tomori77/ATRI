@@ -224,6 +224,25 @@
               <button class="btn primary" type="submit">加入目录</button>
             </div>
           </form>
+          <section class="card">
+            <h2>情绪库</h2>
+            <p class="hint">表情按情绪与强度（1-4 档）归类，模型先选情绪再选强度。未归类的表情进入「其他」。</p>
+            <div id="mood-list" class="stack-tight"></div>
+            <form id="mood-form" class="actions">
+              <input id="mood-name" maxlength="20" required placeholder="新情绪名称，例如：吃醋" />
+              <button class="btn ghost" type="submit">添加情绪</button>
+            </form>
+          </section>
+          <section class="card">
+            <h2>表情归类与强度</h2>
+            <p class="hint">为每张表情勾选所属情绪并选择强度档位（1 轻度 → 4 强烈），可同时属于多个情绪。</p>
+            <div id="sticker-intensity-list" class="stack-tight"></div>
+          </section>
+          <section class="card">
+            <h2>表情使用统计</h2>
+            <p class="hint">按联系人统计每张表情的发送次数，模型提示词会优先展示低频表情。</p>
+            <div id="sticker-usage" class="stack-tight"></div>
+          </section>
           <div id="sticker-list" class="sticker-grid"></div>
         </section>
 

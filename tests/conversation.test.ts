@@ -148,6 +148,7 @@ test('较新的成功回应覆盖旧的失败任务，避免再次回复过时�
   fail = false;
   f.runtime.accept('p1', 'new', '新的问题');
   await f.runtime.drain();
+  console.log('ISSUE:', JSON.stringify(f.store.issues().tasks).slice(0, 600));
   assert.equal(f.store.issues().tasks.length, 0);
   assert.equal(f.delivered.length, 1);
 });
@@ -177,7 +178,7 @@ test('有限上下文优先保留本轮原话，笔记与自动召回按预算�
   const latest = '这是本轮要回应的话。' + '细节'.repeat(2500);
   f.runtime.accept('p1', 'latest', latest);
   await f.runtime.drain();
-  assert.equal(f.store.issues().tasks.length, 0);
+assert.equal(f.store.issues().tasks.length, 0);
   const messages = f.model.calls[0].messages;
   assert.ok(messages.at(-1)!.content.includes(latest));
   assert.ok(estimateRequestTokens(messages, f.model.calls[0].tools) <= f.config.contextTokens);

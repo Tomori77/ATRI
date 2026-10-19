@@ -131,6 +131,9 @@ export interface ReplyPart {
   text?: string;
   slug?: string;
   description?: string;
+  /** Model-selected mood id and intensity level for sticker analytics. */
+  emotion?: string;
+  intensity?: number;
 }
 export interface Delivery {
   id: string;
@@ -787,6 +790,32 @@ export class Store {
       )
       .run(now, peer, ...unique, 'active');
     this.memoryCache.delete(peer);
+  }
+  /** Per-peer sticker usage counters, kept apart from sticker metadata. */
+  stickerUsage(peer: string): Record<string, { count: number; lastAt: number }> {
+    return this.getSetting<Record<string, { count: number; lastAt: number }>>(
+      `sticker-usage:${peer}`,
+      {},
+    );
+  }
+  markStickersUsed(peer: string, slugs: string[], now = Date.now()) {
+    const unique = [...new Set(slugs)];
+    if (!unique.length) return;
+    const stats = this.stickerUsage(peer);
+    for (const slug of unique) {
+      const entry = stats[slug];
+      stats[slug] = { count: (entry?.count ?? 0) + 1, lastAt: now };
+    }
+    this.setSetting(`sticker-usage:${peer}`, stats);
+  }
+  resetStickerUsage(peer: string, slug?: string) {
+    if (!slug) {
+      this.removeSetting(`sticker-usage:${peer}`);
+      return;
+    }
+    const stats = this.stickerUsage(peer);
+    delete stats[slug];
+    this.setSetting(`sticker-usage:${peer}`, stats);
   }
   private writeMemory(peer: string, update: MemoryUpdate, now: number) {
     // Every write path bumps peers.version, but the bump lands before or after

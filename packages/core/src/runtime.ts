@@ -301,6 +301,10 @@ export class Runtime {
                 this.store.markMemoriesUsed(peerId, reply.pickedMemoryIds);
               if (reply.moodPulse)
                 this.store.pulseMood(peerId, { ...reply.moodPulse }, Date.now());
+              const usedStickers = reply.parts
+                .filter((p) => p.type === 'sticker' && p.slug)
+                .map((p) => p.slug!);
+              if (usedStickers.length) this.store.markStickersUsed(peerId, usedStickers);
               for (const description of reply.descriptions) {
                 const msg = this.store.getMessage(peerId, description.messageId);
                 if (msg) {

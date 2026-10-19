@@ -145,8 +145,22 @@ function normalizeTextParts(
     }
     if (m && typeof m === 'object' && 'type' in m && m.type === 'sticker' && 'slug' in m) {
       const sticker = stickers.find((s) => s.slug === m.slug);
-      if (sticker)
-        return [{ type: 'sticker', slug: sticker.slug, description: sticker.description }];
+      if (sticker) {
+        const raw = m as Record<string, unknown>;
+        return [
+          {
+            type: 'sticker',
+            slug: sticker.slug,
+            description: sticker.description,
+            ...(typeof raw.emotion === 'string' && raw.emotion
+              ? { emotion: raw.emotion.slice(0, 40) }
+              : {}),
+            ...(typeof raw.intensity === 'number' && Number.isFinite(raw.intensity)
+              ? { intensity: Math.max(1, Math.min(4, Math.round(raw.intensity))) }
+              : {}),
+          },
+        ];
+      }
     }
     return [];
   });

@@ -2,6 +2,7 @@ import { resolve, join } from 'node:path';
 import { Store } from '@atri/db';
 import { HttpModel, EmbeddingClient } from '@atri/llm';
 import { Runtime, TavilyWeb } from '@atri/core';
+import { MOOD_PRESETS } from '@atri/core';
 import { Settings } from './config.js';
 import { Stickers } from './stickers.js';
 import { WeChatBridge } from './wechat.js';
@@ -34,6 +35,8 @@ const runtime = new Runtime({
   prompt: (name) => settings.prompt(name),
   personaFor: (peerId) => settings.personaContentFor(peerId),
   stickers: () => stickers.list(),
+  stickerMoods: () => [...MOOD_PRESETS, ...store.getSetting<{ id: string; name: string }[]>('sticker:moods', [])],
+  stickerUsage: (peerId) => store.stickerUsage(peerId),
   web: new TavilyWeb(() => settings.config().tavilyKey),
   timeZone: () => settings.config().timeZone,
   contextTokens: () => settings.runtime().contextTokens,

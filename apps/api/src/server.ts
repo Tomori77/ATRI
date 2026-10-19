@@ -7,6 +7,7 @@ import type { Store } from '@atri/db';
 import { createBackup } from '@atri/db';
 import { EmbeddingClient } from '@atri/llm';
 import type { Runtime } from '@atri/core';
+import { MOOD_PRESETS } from '@atri/core';
 import { sniffMediaMime } from '@atri/ilink';
 import type { Settings } from './config.js';
 import { PERSONA_PRESETS } from './config.js';
@@ -460,6 +461,60 @@ export function createServer(o: ServerOptions) {
   });
   app.post<{ Params: { slug: string } }>('/api/stickers/:slug/enable', (request) => {
     o.stickers.enable(request.params.slug);
+    return { ok: true };
+  });
+  app.put<{ Params: { slug: string }; Body: { intensity?: Record<string, number> } }>(
+    '/api/stickers/:slug/intensity',
+    (request) => {
+      const intensity = request.body?.intensity;
+      if (!intensity || typeof intensity !== 'object' || Array.isArray(intensity))
+        throw new Error('强度数据无效');
+      const clean: Record<string, number> = {};
+      for (const [moodId, level] of Object.entries(intensity)) {
+        if (typeof level !== 'number' || !Number.isInteger(level) || level < 1 || level > 4)
+          throw new Error('强度需要 1-4 的整数');
+        clean[moodId] = level;
+      }
+      o.stickers.setIntensity(request.params.slug, clean);
+      return { ok: true };
+    },
+  );
+  app.get('/api/sticker-moods', () => ({
+    presets: MOOD_PRESETS,
+    custom: o.store.getSetting<{ id: string; name: string }[]>('sticker:moods', []),
+  }));
+  app.post<{ Body: { name: string } }>('/api/sticker-moods', (request) => {
+    const name = text(request.body.name, 20);
+    const list = o.store.getSetting<{ id: string; name: string }[]>('sticker:moods', []);
+    const id = 'm' + randomBytes(4).toString('base64url');
+    if ([...MOOD_PRESETS, ...list].some((m) => m.name === name))
+      throw new Error('同名情绪已存在');
+    list.push({ id, name });
+    o.store.setSetting('sticker:moods', list);
+    return { id, name };
+  });
+  app.delete<{ Params: { id: string } }>('/api/sticker-moods/:id', (request) => {
+    if (MOOD_PRESETS.some((m) => m.id === request.params.id))
+      throw new Error('预设情绪不可删除，可编辑表情归属');
+    o.store.setSetting(
+      'sticker:moods',
+      o.store
+        .getSetting<{ id: string; name: string }[]>('sticker:moods', [])
+        .filter((m) => m.id !== request.params.id),
+    );
+    return { ok: true };
+  });
+  app.get('/api/sticker-usage', () => {
+    const result: Record<string, Record<string, { count: number; lastAt: number }>> = {};
+    for (const peer of o.store.peers()) {
+      const stats = o.store.stickerUsage(peer.id);
+      if (Object.keys(stats).length) result[peer.id] = stats;
+    }
+    return result;
+  });
+  app.delete<{ Params: { peer: string } }>('/api/sticker-usage/:peer', (request) => {
+    if (!o.store.peer(request.params.peer)) throw new Error('联系人不存在');
+    o.store.resetStickerUsage(request.params.peer);
     return { ok: true };
   });
   return app;

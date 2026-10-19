@@ -3,24 +3,32 @@ import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, join, sep } from 'node:path';
 import type { Store } from '@atri/db';
 import type { Sticker } from '@atri/core';
+import type { CatalogSticker, StickerIntensity } from '@atri/core';
 import { sniffMediaMime, isVisionMime } from '@atri/ilink';
 
 export class Stickers {
-  private builtins?: Sticker[];
+  private builtins?: CatalogSticker[];
   constructor(
     readonly root: string,
     readonly dataDir: string,
     private readonly store: Store,
   ) {}
-  private catalog(): Sticker[] {
+  private catalog(): CatalogSticker[] {
     this.builtins ??= JSON.parse(
       readFileSync(join(this.root, 'assets', 'stickers', 'catalog.json'), 'utf8'),
-    ) as Sticker[];
-    return this.builtins;
+    ) as CatalogSticker[];
+    // Hand-tuned intensity from the admin UI overrides file defaults.
+    const overrides = this.store.getSetting<Record<string, StickerIntensity>>(
+      'stickers:intensity',
+      {},
+    );
+    return this.builtins.map((s) =>
+      overrides[s.slug] ? { ...s, intensity: overrides[s.slug] } : s,
+    );
   }
-  list(includeDisabled = false): (Sticker & { disabled: boolean })[] {
+  list(includeDisabled = false): (CatalogSticker & { disabled: boolean })[] {
     const disabled = new Set(this.store.getSetting<string[]>('stickers:disabled', []));
-    return [...this.catalog(), ...this.store.getSetting<Sticker[]>('stickers:custom', [])]
+    return [...this.catalog(), ...this.store.getSetting<CatalogSticker[]>('stickers:custom', [])]
       .map((s) => ({ ...s, disabled: disabled.has(s.slug) }))
       .filter((s) => includeDisabled || !s.disabled);
   }
@@ -36,14 +44,25 @@ export class Stickers {
     if (bytes.length > 5 * 1024 * 1024) throw new Error('表情文件过大');
     return bytes;
   }
+  /** Save per-mood intensity levels (1-4) for a sticker; empty object clears
+   *  the override so tags-based auto classification applies again. */
+  setIntensity(slug: string, intensity: StickerIntensity) {
+    if (!this.list(true).some((s) => s.slug === slug)) throw new Error('表情不存在');
+    const overrides = this.store.getSetting<Record<string, StickerIntensity>>(
+      'stickers:intensity',
+      {},
+    );
+    if (Object.keys(intensity).length) overrides[slug] = intensity;
+    else delete overrides[slug];
+    this.store.setSetting('stickers:intensity', overrides);
+  }
   add(input: { slug: string; description: string; tags: string[]; base64: string }) {
     if (
       !/^[a-z0-9_-]{1,40}$/.test(input.slug) ||
       this.list(true).some((s) => s.slug === input.slug)
     )
       throw new Error('表情 slug 无效或已经存在');
-    if (this.list().length >= 32) throw new Error('最多启用 32 个表情，请先停用不常用的素材');
-    if (!input.description.trim() || input.description.length > 200)
+        if (!input.description.trim() || input.description.length > 200)
       throw new Error('请填写不超过 200 字的表情含义');
     const bytes = Buffer.from(input.base64, 'base64'),
       mime = sniffMediaMime(bytes);
@@ -70,7 +89,6 @@ export class Stickers {
     const item = this.list(true).find((s) => s.slug === slug);
     if (!item) throw new Error('表情不存在');
     if (!item.disabled) return;
-    if (this.list().length >= 32) throw new Error('最多启用 32 个表情，请先停用不常用的素材');
     this.store.setSetting(
       'stickers:disabled',
       this.store.getSetting<string[]>('stickers:disabled', []).filter((s) => s !== slug),

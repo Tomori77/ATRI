@@ -17,6 +17,8 @@ import {
   type Sticker,
   type ParsedReply,
 } from './reply.js';
+import type { CatalogSticker, StickerMood } from './stickerMoods.js';
+import { ensureIntensity } from './stickerMoods.js';
 import type { WebTools } from './web.js';
 import {
   RECALL_QUERY_MESSAGES,
@@ -49,7 +51,10 @@ export interface AgentOptions {
   prompt: (name: PromptName) => string;
   /** Persona text for a given peer; falls back to prompt('persona') when absent. */
   personaFor?: (peerId: string) => string;
-  stickers: () => Sticker[];
+  stickers: () => CatalogSticker[];
+  /** Mood presets + per-peer usage counters for sticker selection. */
+  stickerMoods?: () => StickerMood[];
+  stickerUsage?: (peerId: string) => Record<string, { count: number; lastAt: number }>;
   web: WebTools;
   timeZone: () => string;
   contextTokens: () => number;
@@ -150,7 +155,49 @@ export function renderTimeGap(now: number, lastAt: number, timeZone: string): st
 export interface RecentStickerUse {
   slug: string;
   at: number;
-}/** Extract recently sent stickers from assistant history for anti-repetition. */
+}/** Render the sticker catalog grouped by mood and intensity level, ordered by
+ *  per-peer usage (least used first) so the model naturally spreads usage. */
+export function renderStickerCatalog(
+  stickers: CatalogSticker[],
+  moods: StickerMood[],
+  usage: Record<string, { count: number; lastAt: number }> = {},
+): string {
+  const byMood = new Map<string, { slug: string; label: string; level: number; count: number }[]>();
+  const ungrouped: { slug: string; label: string; count: number }[] = [];
+  for (const sticker of stickers) {
+    const intensity = ensureIntensity(sticker);
+    const label = `${sticker.slug}（${sticker.description}）`;
+    let placed = false;
+    for (const [moodId, level] of Object.entries(intensity)) {
+      if (!moods.some((m) => m.id === moodId)) continue;
+      if (!byMood.has(moodId)) byMood.set(moodId, []);
+      byMood.get(moodId)!.push({ slug: sticker.slug, label, level, count: usage[sticker.slug]?.count ?? 0 });
+      placed = true;
+    }
+    if (!placed) ungrouped.push({ slug: sticker.slug, label, count: usage[sticker.slug]?.count ?? 0 });
+  }
+  const lines: string[] = [];
+  for (const [moodId, entries] of byMood) {
+    const name = moods.find((m) => m.id === moodId)?.name ?? moodId;
+    const sorted = [...entries].sort((a, b) => a.level - b.level || a.count - b.count);
+    const byLevel = new Map<number, string[]>();
+    for (const e of sorted) {
+      if (!byLevel.has(e.level)) byLevel.set(e.level, []);
+      byLevel.get(e.level)!.push(e.label);
+    }
+    const parts = [...byLevel.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([level, labels]) => `${['轻度', '中度', '较强', '强烈'][level - 1] ?? level + '档'}：${labels.join('、')}`);
+    lines.push(`【${name}】\n${parts.join('\n')}`);
+  }
+  if (ungrouped.length) {
+    const sorted = [...ungrouped].sort((a, b) => a.count - b.count);
+    lines.push(`【其他】\n${sorted.map((s) => s.label).join('、')}`);
+  }
+  return lines.join('\n');
+}
+
+/** Extract recently sent stickers from assistant history for anti-repetition. */
 export function recentStickerUse(history: Message[]): RecentStickerUse[] {
   const uses: RecentStickerUse[] = [];
   for (const m of history) {
@@ -163,6 +210,28 @@ export function recentStickerUse(history: Message[]): RecentStickerUse[] {
   return uses.slice(-STICKER_RECENT_SHOWN);
 }
 /** Mood as felt prose, never numbers — the model reads a state, not a gauge. */
+/** Mood -> sticker library affinity, as a soft prose hint. */
+export function renderMoodStickerHint(
+  mood: { valence: number; energy: number },
+  moods: StickerMood[],
+): string {
+  if (!moods.length) return '';
+  const nameOf = (id: string) => moods.find((m) => m.id === id)?.name ?? id;
+  const parts: string[] = [];
+  if (mood.valence >= 0.3) {
+    parts.push(`${nameOf('happy')}、${nameOf('celebrate')}类更合适，可选 2-4 档`);
+  } else if (mood.valence <= -0.3) {
+    parts.push(
+      `${nameOf('aggrieved')}、${nameOf('sad')}类更贴近当前状态，强度 1-3 档；${nameOf('happy')}类 4 档过于亢奋，避免`,
+    );
+  }
+  if (mood.energy <= -0.3) {
+    parts.push(`${nameOf('night')}、${nameOf('lazy')}类贴合现在的疲惫感`);
+  } else if (mood.energy >= 0.3) {
+    parts.push('精力充足，活泼的表情可以放心用');
+  }
+  return parts.length ? `表情选择倾向：${parts.join('；')}。这只是倾向，不是硬性规则。` : '';
+}
 export function renderMood(
   mood: { valence: number; energy: number; reason?: string; at: number },
   now: number,
@@ -355,11 +424,13 @@ export class Agent {
       .map((m) => m.id);
     const recentStickers = recentStickerUse(history);
     const stickers = rotateStickers(this.o.stickers(), recentStickers, now);
+    const stickerMoods = this.o.stickerMoods?.() ?? [];
+    const usage = this.o.stickerUsage?.(peer.id) ?? {};
     const lastUser = [...history].reverse().find((m) => m.role === 'user');
     const timeLine = lastUser
       ? renderTimeGap(now, lastUser.created_at, this.o.timeZone())
       : `现在是${momentFormatter(this.o.timeZone()).format(new Date(now))}`;
-    const stickerLines = stickers.map(({ slug, description }) => `${slug}：${description}`);
+    const stickerCatalog = renderStickerCatalog(stickers, stickerMoods, usage);
     const mood = store.mood(peer.id);
     const rhythm = store.activityRhythm(peer.id, this.o.timeZone());
     const currentHour = Number(hourFormatter(this.o.timeZone()).format(new Date(now)));
@@ -372,8 +443,12 @@ export class Agent {
     const stable = [
       this.o.personaFor?.(peer.id) ?? this.o.prompt('persona'),
       this.o.prompt('chat'),
-      `可用表情目录（slug：含义）：\n${stickerLines.join('\n')}`,
-      '注意：历史消息里的 [表情：…] 只是过往发送的记录展示；本轮发送表情必须使用 JSON 的 {"type":"sticker","slug":"目录中的slug"} 对象，绝不能把 [表情：…] 写进文字。',
+      stickerMoods.length
+        ? `表情按情绪与强度分档：先选情绪，再按浓度选档位，从该库选 slug：\n${stickerCatalog}`
+        : `可用表情目录（slug：含义）：\n${stickerCatalog}`,
+      stickerMoods.length
+        ? '发送表情附 emotion 与 intensity 字段；同轮不重复，不与上轮相同，优先低频。'
+        : '注意：历史消息里的 [表情：…] 只是过往发送的记录展示；本轮发送表情必须使用 JSON 的 {"type":"sticker","slug":"目录中的slug"} 对象，绝不能把 [表情：…] 写进文字。',
       '回复长度参照对方：对方一句话，就别回一大段；对方认真长谈，才展开讲。',
     ]
       .filter(Boolean)
@@ -382,6 +457,7 @@ export class Agent {
       timeLine,
       `本次模式：${task.kind === 'proactive' ? '主动联系，可跳过' : '回应用户消息'}`,
       renderMood(mood, now, this.o.timeZone()),
+      renderMoodStickerHint(mood, stickerMoods),
       renderRhythm(rhythm, currentHour),
       renderOpenLoops(openLoops, now, this.o.timeZone()),
       recentStickers.length
