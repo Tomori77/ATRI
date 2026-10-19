@@ -1147,8 +1147,45 @@ svg {
 
 /* ---------- 设置 ---------- */
 
+.settings-layout-page {
+  max-width: 1280px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-save-top {
+  margin-bottom: 2px;
+}
+
+.settings-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 18px;
+  align-items: start;
+}
+
+.settings-aside {
+  position: sticky;
+  top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+@media (max-width: 1160px) {
+  .settings-columns {
+    grid-template-columns: 1fr;
+  }
+  .settings-aside {
+    position: static;
+  }
+}
+
 .settings-stack {
-  max-width: 880px;
+  max-width: none;
+  min-width: 0;
 }
 
 .budget-card {

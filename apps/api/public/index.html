@@ -228,7 +228,13 @@
         </section>
 
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">
-          <form id="settings-form" class="settings-stack">
+          <form id="settings-form" class="settings-layout-page">
+            <div class="actions end settings-save-top">
+              <button class="btn primary" type="submit">保存全部设置</button>
+              <span id="settings-saved" class="hint"></span>
+            </div>
+            <div class="settings-columns">
+              <div class="settings-stack">
             <section class="card">
               <h2>模型服务</h2>
               <div class="grid-2">
@@ -382,19 +388,17 @@
               <h2>维护</h2>
               <div class="actions">
                 <button class="btn ghost" id="backup" type="button">立即备份数据库</button>
-                <span id="settings-saved" class="hint"></span>
               </div>
             </section>
-
-            <section class="card">
-              <h2>模型用量</h2>
-              <div id="usage" class="usage-grid"></div>
-              <h3>近期调用</h3>
-              <div id="recent-usage" class="recent-list"></div>
-            </section>
-
-            <div class="actions end">
-              <button class="btn primary" type="submit">保存全部设置</button>
+              </div>
+              <aside class="settings-aside">
+                <section class="card">
+                  <h2>模型用量</h2>
+                  <div id="usage" class="usage-grid"></div>
+                  <h3>近期调用</h3>
+                  <div id="recent-usage" class="recent-list"></div>
+                </section>
+              </aside>
             </div>
           </form>
         </section>
