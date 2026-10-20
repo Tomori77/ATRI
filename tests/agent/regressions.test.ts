@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Store, addYear } from '@atri/db';
 import { recentStickerUse, rotateStickers, renderMood } from '@atri/core';
 import { parseReply } from '@atri/core';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 // ---------- P0-1 表情窗口：提示词里的每一张都必须能被解析接受 ----------
 
@@ -120,20 +120,22 @@ test('P0-3 recentStickerUse 把描述解析成 slug，轮换过滤真正生效',
     })),
   ];
   const now = Date.now();
-  const rotated = rotateStickers(all, uses, now);
+  // Explicit window: this asserts the sink behaviour, not the current tuning.
+  const window = 24;
+  const rotated = rotateStickers(all, uses, now, window);
   const rotatedSlugs = new Set(rotated.map((s) => s.slug));
 
-  assert.equal(rotated.length, 32, '窗口应保持 32 张');
+  assert.equal(rotated.length, window, `窗口应保持 ${window} 张`);
   assert.ok(rotatedSlugs.has('cat053'), '最近用过的表情不应被移出窗口');
   assert.equal(
     rotated.filter((s) => s.slug !== 'cat053').length,
-    31,
+    window - 1,
     '为它保留位置后，其余位置仍应给未用过的表情',
   );
 
   // 轮换本身仍然是活的：换一个日子，窗口里的表情集合应该跟着移动，
   // 也就是目录尾部（这里 x30~x38）真的能被轮到。
-  const tomorrow = rotateStickers(all, uses, now + 86400000);
+  const tomorrow = rotateStickers(all, uses, now + 86400000, window);
   assert.notDeepEqual(
     tomorrow.map((s) => s.slug),
     rotated.map((s) => s.slug),
@@ -142,7 +144,7 @@ test('P0-3 recentStickerUse 把描述解析成 slug，轮换过滤真正生效',
 
   // 同一天必须稳定，否则提示词每次组装都在抖。
   assert.deepEqual(
-    rotateStickers(all, uses, now).map((s) => s.slug),
+    rotateStickers(all, uses, now, window).map((s) => s.slug),
     rotated.map((s) => s.slug),
     '同一天的轮换结果应稳定',
   );

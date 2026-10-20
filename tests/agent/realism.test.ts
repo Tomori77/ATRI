@@ -10,7 +10,7 @@ import {
 } from '@atri/core';
 import { parseOpenLoops, parseReply, resolveDue, parseMoodPulse } from '@atri/core';
 import { OPEN_LOOP_EXPIRE_DAYS, PROACTIVE_IGNORE_COOLDOWN_DAYS } from '@atri/db';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 const stickers: Sticker[] = [
   { slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' },

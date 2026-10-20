@@ -30,6 +30,13 @@ const text = (v: unknown, max = 12000) => {
     throw new Error(`文本需要 1–${max} 个字符`);
   return v.trim();
 };
+/** Same as text() but accepts '' — for optional fields where clearing the value
+ *  is a real intention ("no opening line"). */
+const optionalText = (v: unknown, max = 12000) => {
+  if (typeof v !== 'string' || v.length > max)
+    throw new Error(`文本需要在 ${max} 个字符以内`);
+  return v.trim();
+};
 export function createServer(o: ServerOptions) {
   const app = Fastify({ bodyLimit: 5 * 1024 * 1024, logger: false });
   const sessions = new Map<string, number>(),
@@ -157,23 +164,25 @@ export function createServer(o: ServerOptions) {
       issues: o.store.issues(),
       // Read-only view of "how is she doing": mood, next proactive window,
       // loops waiting. Previously this data was invisible in the admin UI.
-      states: (() => {
-        const vectors = o.store.embeddingStatus().count;
-        return o.store.peers().map((peer) => {
-          const mood = o.store.mood(peer.id);
-          const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
-          return {
-            peerId: peer.id,
-            address: peer.address,
-            approved: !!peer.approved,
-            mood: mood.at ? mood : undefined,
-            dueLoops: dueLoops.length,
-            lastUserAt: peer.last_user_at,
-            lastProactiveAt: peer.last_proactive_at,
-            vectors,
-          };
-        });
-      })(),
+      // `vectors` used to be computed here with a GROUP BY over the whole
+      // embeddings table on every poll (the UI polls /api/status every 2.5 s)
+      // and was never rendered; the vector count lives on /api/sandbox-adjacent
+      // debug endpoints instead.
+      states: o.store.peers().map((peer) => {
+        const mood = o.store.mood(peer.id);
+        const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
+        return {
+          peerId: peer.id,
+          address: peer.address,
+          approved: !!peer.approved,
+          mood: mood.at ? mood : undefined,
+          dueLoops: dueLoops.length,
+          // Drives "她多久没来了" in the UI, which is the one field here the
+          // operator actually needs to judge whether a peer is still alive.
+          lastUserAt: peer.last_user_at,
+          lastProactiveAt: peer.last_proactive_at,
+        };
+      }),
     };
   });
   app.post('/api/wechat/login', () => o.bridge.login());
@@ -239,7 +248,9 @@ export function createServer(o: ServerOptions) {
       return o.settings.personaUpdate(request.params.id, {
         ...(input.name !== undefined ? { name: text(input.name, 40) } : {}),
         ...(input.content !== undefined ? { content: text(input.content) } : {}),
-        ...(input.greeting !== undefined ? { greeting: text(input.greeting, 200) } : {}),
+        // Empty is a meaningful value here — "no opening line" — so this uses
+        // the permissive sanitiser rather than text(), which rejects ''.
+        ...(input.greeting !== undefined ? { greeting: optionalText(input.greeting, 200) } : {}),
       });
     },
   );
@@ -447,6 +458,18 @@ export function createServer(o: ServerOptions) {
     o.runtime.pump();
     return { ok: true };
   });
+  app.post<{ Params: { id: string } }>('/api/tasks/:id/dismiss', (request) => {
+    // Without this a task that exhausted its retries sat in issues() until
+    // pruneTasks aged it out, which kept the admin bell permanently non-zero.
+    // An operator who has read the error and decided it needs no action must be
+    // able to clear it — otherwise they learn to ignore the bell, and a real
+    // delivery failure scrolls past unnoticed.
+    const task = o.store.taskById(request.params.id);
+    if (!task || task.state !== 'failed') throw new Error('只有失败任务可以忽略');
+    o.store.finish(task.id, 'done');
+    o.runtime.pump();
+    return { ok: true };
+  });
   app.post<{ Params: { id: string }; Body: { action: string } }>(
     '/api/deliveries/:id',
     (request) => {
@@ -468,7 +491,16 @@ export function createServer(o: ServerOptions) {
       return { ok: true };
     },
   );
-  app.get('/api/stickers', () => o.stickers.list(true).map(({ file, ...s }) => s));
+  app.get('/api/stickers', () => {
+    // `custom` lets the UI offer the right verb: an upload can be deleted, a
+    // bundled sticker can only be switched off.
+    const custom = new Set(
+      o.store.getSetting<{ slug: string }[]>('stickers:custom', []).map((s) => s.slug),
+    );
+    return o.stickers
+      .list(true)
+      .map(({ file, ...s }) => ({ ...s, custom: custom.has(s.slug) }));
+  });
   app.get<{ Params: { slug: string } }>('/api/stickers/:slug/image', (request, reply) => {
     const bytes = o.stickers.bytes(request.params.slug);
     return reply
@@ -492,7 +524,15 @@ export function createServer(o: ServerOptions) {
     },
   );
   app.delete<{ Params: { slug: string } }>('/api/stickers/:slug', (request) => {
+    // DELETE has always meant "stop using this one", and the card's button says
+    // 停用 — so it must stay reversible. Deleting an upload (row + file) is a
+    // separate, irreversible action with its own route so the two can never be
+    // confused by a label mismatch.
     o.stickers.disable(request.params.slug);
+    return { ok: true };
+  });
+  app.delete<{ Params: { slug: string } }>('/api/stickers/:slug/file', (request) => {
+    o.stickers.remove(request.params.slug);
     return { ok: true };
   });
   app.post<{ Params: { slug: string } }>('/api/stickers/:slug/enable', (request) => {

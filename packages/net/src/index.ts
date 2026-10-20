@@ -22,13 +22,32 @@ function isPrivateV4(address: string): boolean {
   );
 }
 
+/** ::ffff:XXXX:XXXX — the hex spelling of an IPv4-mapped address. */
+const HEX_MAPPED = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/;
+/** ::ffff:1.2.3.4 — the dotted spelling of the same address. */
+const DOTTED_MAPPED = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/;
+
 function isPrivateV6(host: string): boolean {
   const h = host.toLowerCase();
   if (h === '::1' || h === '::' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd'))
     return true;
-  // IPv4-mapped IPv6 addresses (::ffff:10.0.0.1) must not slip through.
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(h);
-  return mapped ? isPrivateV4(mapped[1]!) : false;
+  // IPv4-mapped addresses must not slip through, in BOTH spellings. Only the
+  // dotted form was handled, so the same address written in hex fell through to
+  // `false`: `http://[::ffff:7f00:1]/` reached loopback and
+  // `http://[::ffff:a9fe:a9fe]/` reached cloud metadata, both classified as
+  // public. Accepting one spelling made the whole private-address gate opt-out
+  // by rewording the URL.
+  const dotted = DOTTED_MAPPED.exec(h);
+  if (dotted) return isPrivateV4(dotted[1]!);
+  const hex = HEX_MAPPED.exec(h);
+  if (hex) {
+    const value = ((parseInt(hex[1]!, 16) << 16) | parseInt(hex[2]!, 16)) >>> 0;
+    return isPrivateV4(
+      `${value >>> 24}.${(value >>> 16) & 255}.${(value >>> 8) & 255}.${value & 255}`,
+    );
+  }
+  // A bare "::ffff:<one group>" cannot express an IPv4 address; no decision.
+  return false;
 }
 
 /** True when the address is loopback, private, link-local or otherwise not public. */

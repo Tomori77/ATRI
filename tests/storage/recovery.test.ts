@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Store, createBackup, restoreBackup } from '@atri/db';
-import { fixture, temporary, cleanup } from './helpers.js';
+import { fixture, temporary, cleanup } from '../helpers.js';
 
 test('重启区分已确认发送与发送状态未知', (t) => {
   const f = fixture(t);

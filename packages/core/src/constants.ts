@@ -9,7 +9,23 @@ export const PROMPT_MEMORIES = 10;
 /** Per-item truncation for prompt materials. */
 export const RECALL_CONTENT_MAX_CHARS = 600;
 export const MEMORY_CONTENT_MAX_CHARS = 500;
-export const PROMPT_STICKERS = 32;
+/** Sticker window shown to the model. Kept below the 32-sticker catalog cap
+ *  (apps/api/src/stickers.ts) on purpose: with window === cap the rotation and
+ *  recent-use sink in rotateStickers never ran, so the tail of the catalog was
+ *  unreachable and a just-sent sticker stayed advertised as fresh. */
+export const PROMPT_STICKERS = 24;
+
+/** Prompt budget shares. `HISTORY_RESERVE_SHARE` is what stays free for the
+ *  recent turns; the three material shares are applied independently to what
+ *  the fixed system prompt leaves over. A single running `-=` chain let a long
+ *  topic note consume the whole allowance, which starved memories and recall to
+ *  zero turns on the default 24k input budget. */
+export const HISTORY_RESERVE_SHARE = 0.4;
+export const PROMPT_NOTES_SHARE = 0.4;
+export const PROMPT_MEMORY_SHARE = 0.35;
+export const PROMPT_RECALL_SHARE = 0.25;
+export const PROMPT_MEMORY_MAX_TOKENS = 3000;
+export const PROMPT_RECALL_MAX_TOKENS = 3000;
 
 /** Fraction of the input budget reserved for tools and the latest turns. */
 export const TOOL_RESERVE_MAX_TOKENS = 6000;
@@ -25,8 +41,7 @@ export const TOOL_RESULT_BUDGET_TOKENS = 6000;
 /** Cap on assistant bubbles and memory updates per reply. */
 export const MAX_REPLY_PARTS = 6;
 export const MAX_MEMORY_UPDATES = 6;
-export const MAX_IMAGE_DESCRIPTIONS = 4;
-/** Notes (topic summary) token cap inside prompts. */
+export const MAX_IMAGE_DESCRIPTIONS = 4;/** Notes (topic summary) token cap inside prompts. */
 export const NOTES_MAX_TOKENS = 1500;
 /** Notes trigger: recent window length and its share of the input budget. */
 export const NOTES_MIN_MESSAGES = 20;

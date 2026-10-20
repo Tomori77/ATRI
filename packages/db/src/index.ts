@@ -200,6 +200,9 @@ export const MOOD_ENERGY_HALFLIFE_HOURS = 4;
 export const MOOD_PULSE_SHARE = 0.2;
 /** Usage rollup: keep this many days of per-call rows, older ones aggregate. */
 export const USAGE_RETENTION_DAYS = 30;
+/** How long a delivery of unknown outcome keeps its peer's queue paused before
+ *  it stops blocking. The row stays in issues() for a manual decision. */
+export const UNCERTAIN_HOLD_MS = 10 * 60000;
 /** Hard character cap on stored topic notes. */
 export const NOTES_MAX_CHARS = 4000;
 
@@ -265,13 +268,13 @@ export class Store {
   constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.sql = new DatabaseSync(path);
-    if (Number(this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0) > 5) {
-      this.sql.close();
-      throw new Error('数据库来自更新版本，不能用当前程序打开');
-    }
     const openedAt = Number(
       this.sql.prepare('PRAGMA user_version').get()?.user_version ?? 0,
     );
+    if (openedAt > 6) {
+      this.sql.close();
+      throw new Error('数据库来自更新版本，不能用当前程序打开');
+    }
     this.sql.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS peers (
@@ -356,6 +359,20 @@ export class Store {
           'CREATE INDEX IF NOT EXISTS memory_embeddings_peer_model ON memory_embeddings(peer_id,model);',
       );
       this.sql.exec('PRAGMA user_version=5;');
+    }
+    if (openedAt < 6) {
+      // Every reply reads the active memory set, the trailing-two-week activity
+      // histogram, the uncertain-delivery gate and the issue lists. Without
+      // these the planner fell back to scanning the whole peer's rows and
+      // sorting in a temp B-tree.
+      this.sql.exec(
+        'CREATE INDEX IF NOT EXISTS memories_peer_status_created ON memories(peer_id,status,created_at DESC);\n' +
+          'CREATE INDEX IF NOT EXISTS messages_rhythm ON messages(peer_id,role,status,created_at);\n' +
+          'CREATE INDEX IF NOT EXISTS outbox_status_created ON outbox(status,created_at DESC);\n' +
+          'CREATE INDEX IF NOT EXISTS tasks_kind ON tasks(kind);\n' +
+          'CREATE INDEX IF NOT EXISTS diary_peer_status_day ON diary_sections(peer_id,status,day);',
+      );
+      this.sql.exec('PRAGMA user_version=6;');
     }
   }
   close() {
@@ -567,14 +584,24 @@ export class Store {
     const row = this.sql.prepare('SELECT * FROM tasks WHERE id=?').get(id);
     return row ? this.task(row) : undefined;
   }
+  /** Peers that have work and whose queue is safe to advance.
+   *
+   *  An unconfirmed delivery normally pauses its peer: sending the next bubble
+   *  on top of one that may or may not have arrived can invert the
+   *  conversation. But that pause used to be permanent — one network blip left
+   *  an 'uncertain' row behind, and from then on `readyPeers` never returned
+   *  that peer again, so a single hiccup silenced the contact forever with no
+   *  warning. The pause now expires: the row stays visible in issues() for the
+   *  operator to confirm or resend, but it stops blocking new traffic. */
   readyPeers(now = Date.now()): string[] {
+    const holdSince = now - UNCERTAIN_HOLD_MS;
     return this.sql
       .prepare(
         `SELECT DISTINCT p.id FROM peers p WHERE p.approved=1 AND
-      NOT EXISTS(SELECT 1 FROM outbox WHERE peer_id=p.id AND status IN ('uncertain','failed')) AND
+      NOT EXISTS(SELECT 1 FROM outbox WHERE peer_id=p.id AND (status='failed' OR (status='uncertain' AND created_at>=?))) AND
       (EXISTS(SELECT 1 FROM tasks WHERE peer_id=p.id AND state='queued' AND run_at<=?) OR EXISTS(SELECT 1 FROM outbox WHERE peer_id=p.id AND status='pending'))`,
       )
-      .all(now)
+      .all(holdSince, now)
       .map((r) => String(r.id));
   }
   claim(peer: string, now = Date.now()): Task | undefined {
@@ -724,16 +751,27 @@ export class Store {
    *  dedupe key can still reference them. Called from the scheduler tick. */
   pruneTasks(now = Date.now()): number {
     const cutoff = now - TASK_RETENTION_DAYS * 86400000;
-    // Outbox rows reference their task, so only tasks whose deliveries are all
-    // in a terminal state (or never had any) are safe to remove; the outbox
-    // itself keeps rows forever so the UI can still audit history.
     return this.transaction(() => {
+      // Every table with a foreign key into tasks must be excluded here, or the
+      // DELETE throws and the whole sweep rolls back. outbox and diary_sections
+      // are the two: outbox because delivered rows are audit history, and
+      // diary_sections because a diary's prose is permanent content that
+      // outlives the task that generated it. Missing the second one kept every
+      // install that had ever run a diary throwing "FOREIGN KEY constraint
+      // failed" every 60 seconds — the scheduler logged it and moved on, so
+      // neither tasks nor outbox was ever pruned again.
       const gone = this.sql
         .prepare(
           `DELETE FROM tasks WHERE state IN ('done','failed','superseded','interrupted')
            AND created_at < ?
-           AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.task_id=tasks.id AND outbox.status IN ('pending','sending','uncertain'))`,
+           AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.task_id=tasks.id)
+           AND NOT EXISTS(SELECT 1 FROM diary_sections WHERE diary_sections.task_id=tasks.id)`,
         )
+        .run(cutoff);
+      // Outbox rows are audit history, not operations state: drop the delivered
+      // ones past retention so the table stops growing without bound.
+      this.sql
+        .prepare("DELETE FROM outbox WHERE status='sent' AND created_at < ?")
         .run(cutoff);
       return Number(gone.changes);
     });
@@ -788,26 +826,61 @@ export class Store {
     };
   }
   sources(peer: string, ids: string[]): SearchHit[] {
-    const rows: SearchHit[] = [];
-    for (const id of [...new Set(ids)].slice(0, 40)) {
-      const row = this.sql
-        .prepare('SELECT id,kind,content,created_at FROM search_index WHERE peer_id=? AND id=?')
-        .get(peer, id);
-      if (row)
-        rows.push(
-          this.describeHit({
-            ...row,
-            created_at: Number(row.created_at),
-            score: 1,
-          } as unknown as SearchHit),
-        );
-    }
-    return rows;
+    const wanted = [...new Set(ids)].slice(0, 40);
+    if (!wanted.length) return [];
+    // One statement for the whole set. This used to run the index lookup and
+    // then call describeHit per row, which issued another prepare+get for each
+    // of up to 40 ids — so the "one round trip instead of 40 statements"
+    // comment below was true only for the first of the two queries. writeMemory
+    // runs this on every memory update and search() runs it per hit.
+    const marks = wanted.map(() => '?').join(',');
+    const rows = this.sql
+      .prepare(
+        `SELECT s.id AS id, s.kind AS kind, s.content AS content, s.created_at AS created_at,
+                m.role AS role,
+                mem.kind AS memory_kind, mem.sources AS memory_sources,
+                d.sources AS diary_sources
+         FROM search_index s
+         LEFT JOIN messages m ON m.id = s.id
+         LEFT JOIN memories mem ON mem.id = s.id
+         LEFT JOIN diary_sections d ON d.id = s.id
+         WHERE s.peer_id = ? AND s.id IN (${marks})`,
+      )
+      .all(peer, ...wanted);
+    const byId = new Map(rows.map((r) => [String(r.id), r]));
+    return wanted.flatMap<SearchHit>((id) => {
+      const row = byId.get(id);
+      if (!row) return [];
+      const base = {
+        id: String(row.id),
+        kind: String(row.kind) as SourceKind,
+        content: String(row.content),
+        created_at: Number(row.created_at),
+        score: 1,
+      };
+      if (base.kind === 'message')
+        return [{ ...base, role: row.role as Message['role'] }];
+      return [
+        {
+          ...base,
+          sources: parse<string[]>(
+            row[base.kind === 'memory' ? 'memory_sources' : 'diary_sources'],
+            [],
+          ),
+          ...(base.kind === 'memory'
+            ? { memory_kind: row.memory_kind as Memory['kind'] }
+            : {}),
+        },
+      ];
+    });
   }
   memories(peer: string): Memory[] {
     const version = Number(this.sql.prepare('SELECT version FROM peers WHERE id=?').get(peer)?.version ?? -1);
     const cached = this.memoryCache.get(peer);
-    if (cached && cached.version === version) return cached.memories;
+    // Copy on the way out: callers sort and splice what they get back, and
+    // handing them the cached array itself let one caller's in-place sort
+    // permanently corrupt every later read for this peer.
+    if (cached && cached.version === version) return cached.memories.slice();
     // Pinned rows are fetched separately: a lifetime of chat makes the newest
     // 500 a sliding window that would silently drop a pinned memory created
     // long ago, defeating "置顶的记忆永远会带在身边".
@@ -823,7 +896,7 @@ export class Store {
     // version bump covers every write path, so staleness is impossible.
     if (this.memoryCache.size > 64) this.memoryCache.clear();
     this.memoryCache.set(peer, { version, memories: rows });
-    return rows;
+    return rows.slice();
   }
   setMemoryPinned(peer: string, id: string, pinned: boolean) {
     const result = this.sql
@@ -877,7 +950,28 @@ export class Store {
       .run(now, peer, ...unique, 'active');
     this.memoryCache.delete(peer);
   }
-  private writeMemory(peer: string, update: MemoryUpdate, now: number) {
+  /** Apply `supersedes` for every write path. Split out because it used to live
+   *  only on the "new row inserted" branch: a restatement of known wording (the
+   *  duplicate branch) or a repeated (content, sources) pair (the UNIQUE hit)
+   *  returned early and silently dropped the supersedes list, leaving the
+   *  corrected fact and its replacement both active in the prompt. */
+  private supersede(peer: string, ids: string[], now: number) {
+    for (const previous of ids) {
+      // Invalidate rather than delete: the old row leaves default recall but
+      // keeps its text and the moment it stopped being true.
+      if (
+        this.sql
+          .prepare(
+            "UPDATE memories SET status='superseded',invalid_at=? WHERE peer_id=? AND id=? AND status='active'",
+          )
+          .run(now, peer, previous).changes
+      )
+        this.unindex(previous);
+    }
+  }
+  /** Persist one memory update; returns the surviving row id, or undefined when
+   *  the update was rejected (no valid sources, unsupported "stated"). */
+  private writeMemory(peer: string, update: MemoryUpdate, now: number): string | undefined {
     // Every write path bumps peers.version, but the bump lands before or after
     // this within the same transaction; drop the cache defensively per write.
     this.memoryCache.delete(peer);
@@ -898,13 +992,13 @@ export class Store {
     const statedOk =
       update.kind !== 'stated' ||
       keptIds.some((id) => {
-        const s = byId.get(id)!;
-        return s.kind === 'message' && (s.role === 'user' || s.role === 'system');
+        const s = byId.get(id);
+        return s && s.kind === 'message' && (s.role === 'user' || s.role === 'system');
       });
-    if (!update.content.trim() || !keptIds.length || !statedOk) return;
+    if (!update.content.trim() || !keptIds.length || !statedOk) return undefined;
     const ids = keptIds;
     const content = update.content.trim();
-    const sourceHash = hash(content + '\n' + ids.sort().join(','));
+    const sourceHash = hash(content + '\n' + [...ids].sort().join(','));
     // Identical wording from a different turn is the same fact; only extend
     // its evidence instead of storing a duplicate row.
     const duplicate = this.sql
@@ -917,11 +1011,12 @@ export class Store {
       this.sql
         .prepare('UPDATE memories SET sources=?,importance=MAX(importance,?) WHERE id=?')
         .run(JSON.stringify(merged), update.importance ?? 0.5, String(duplicate.id));
+      this.supersede(peer, update.supersedes ?? [], now);
       this.memoryCache.delete(peer);
-      return;
+      return String(duplicate.id);
     }
     const id = randomUUID();
-    const result = this.sql
+    const inserted = this.sql
       .prepare(
         'INSERT OR IGNORE INTO memories(id,peer_id,content,kind,sources,source_hash,importance,created_at) VALUES(?,?,?,?,?,?,?,?)',
       )
@@ -935,20 +1030,32 @@ export class Store {
         Math.max(0, Math.min(1, update.importance ?? 0.5)),
         now,
       );
-    if (!result.changes) return;
-    for (const previous of update.supersedes ?? []) {
-      // Invalidate rather than delete: the old row leaves default recall but
-      // keeps its text and the moment it stopped being true.
-      if (
+    if (!inserted.changes) {
+      // (content, sources) already exists — possibly a superseded row being
+      // restated. Revive it rather than dropping the write on the floor.
+      const existing = this.sql
+        .prepare('SELECT id FROM memories WHERE peer_id=? AND source_hash=?')
+        .get(peer, sourceHash) as Row | undefined;
+      if (existing) {
         this.sql
           .prepare(
-            "UPDATE memories SET status='superseded',invalid_at=? WHERE peer_id=? AND id=? AND status='active'",
+            "UPDATE memories SET status='active',invalid_at=0,sources=?,importance=MAX(importance,?) WHERE id=?",
           )
-          .run(now, peer, previous).changes
-      )
-        this.unindex(previous);
+          .run(
+            JSON.stringify(ids),
+            Math.max(0, Math.min(1, update.importance ?? 0.5)),
+            String(existing.id),
+          );
+        this.index(String(existing.id), peer, 'memory', content.slice(0, 800), now);
+        this.supersede(peer, update.supersedes ?? [], now);
+        this.memoryCache.delete(peer);
+        return String(existing.id);
+      }
+      return undefined;
     }
+    this.supersede(peer, update.supersedes ?? [], now);
     this.index(id, peer, 'memory', content.slice(0, 800), now);
+    return id;
   }
   addMemory(peer: string, update: MemoryUpdate, expectedVersion: number) {
     return this.transaction(() => {
@@ -976,20 +1083,19 @@ export class Store {
         at: Number(original.last_hit_at ?? 0),
         pinned: Number(original.pinned ?? 0),
       };
-      this.writeMemory(
+      // Use the id writeMemory actually produced. Looking the row up again by
+      // content matched an older, unrelated memory whenever the corrected text
+      // already existed, which copied this row's hits/pinned onto it (zeroing
+      // its real stats) while the wrong fact stayed active.
+      const written = this.writeMemory(
         peer,
         { content, kind: 'stated', sources: [msg.id], supersedes: [id] },
         Date.now(),
       );
-      const newest = this.sql
-        .prepare(
-          "SELECT id FROM memories WHERE peer_id=? AND content=? AND status='active' ORDER BY created_at DESC LIMIT 1",
-        )
-        .get(peer, content.slice(0, 800)) as Row | undefined;
-      if (newest)
-        this.sql
-          .prepare('UPDATE memories SET hits=?,last_hit_at=?,pinned=? WHERE id=?')
-          .run(carried.hits, carried.at, carried.pinned, String(newest.id));
+      if (!written) throw new Error('更正内容无法写入');
+      this.sql
+        .prepare('UPDATE memories SET hits=?,last_hit_at=?,pinned=? WHERE id=?')
+        .run(carried.hits, carried.at, carried.pinned, written);
       this.sql.prepare("UPDATE peers SET notes='',notes_until=0 WHERE id=?").run(peer);
     });
   }
@@ -1054,43 +1160,112 @@ export class Store {
   forget(peer: string, id: string) {
     this.transaction(() => {
       this.memoryCache.delete(peer);
-      const source = this.sources(peer, [id])[0];
-      if (!source) throw new Error('记录不存在');
-      if (source.kind === 'message')
+      // Resolve the target from the tables themselves, not from search_index:
+      // superseding a memory removes it from the index while keeping the row, so
+      // the old lookup threw "记录不存在" and a superseded fact with sensitive
+      // content could never be deleted.
+      const kind =
+        (this.sql
+          .prepare('SELECT kind FROM search_index WHERE peer_id=? AND id=?')
+          .get(peer, id)?.kind as SourceKind | undefined) ??
+        (this.sql
+          .prepare('SELECT 1 AS hit FROM messages WHERE peer_id=? AND id=?')
+          .get(peer, id)
+          ? 'message'
+          : this.sql
+                .prepare('SELECT 1 AS hit FROM memories WHERE peer_id=? AND id=?')
+                .get(peer, id)
+              ? 'memory'
+              : this.sql
+                    .prepare('SELECT 1 AS hit FROM diary_sections WHERE peer_id=? AND id=?')
+                    .get(peer, id)
+                  ? 'diary'
+                  : undefined);
+      if (!kind) throw new Error('记录不存在');
+      if (kind === 'message')
         this.sql
           .prepare(
             "UPDATE messages SET content='',media='[]',status='deleted' WHERE peer_id=? AND id=?",
           )
           .run(peer, id);
-      if (source.kind === 'memory')
+      // The outbox keeps a full JSON copy of the bubble that was sent; clearing
+      // only messages.content left the original plaintext readable there.
+      this.sql.prepare("UPDATE outbox SET part='{}' WHERE id=? AND peer_id=?").run(id, peer);
+      if (kind === 'memory')
         this.sql
-          .prepare("UPDATE memories SET content='',status='deleted' WHERE peer_id=? AND id=?")
+          .prepare(
+            "UPDATE memories SET content='',sources='[]',status='deleted' WHERE peer_id=? AND id=?",
+          )
+          .run(peer, id);
+      if (kind === 'diary')
+        this.sql
+          .prepare(
+            "UPDATE diary_sections SET content='',sources='[]',status='deleted' WHERE peer_id=? AND id=?",
+          )
           .run(peer, id);
       const invalid = new Set([id]);
-      // Invalidation must cover the entire history, independent of UI list limits.
-      const diaries = this.sql
-        .prepare("SELECT id,sources FROM diary_sections WHERE peer_id=? AND status='active'")
-        .all(peer)
-        .map((r) => ({ id: String(r.id), sources: parse<string[]>(r.sources, []) }));
-      for (const diary of diaries)
-        if (diary.id === id || diary.sources.some((s) => invalid.has(s))) {
-          invalid.add(diary.id);
+      // Invalidation must cover the entire history, independent of UI list
+      // limits — and it has to run to a fixed point: a dependency chain
+      // (memory → diary → memory) only propagates if the sweep repeats until
+      // nothing new is invalidated. A single pass missed every link whose row
+      // happened to be scanned before the row it depended on.
+      // Superseded and deleted rows participate too; otherwise a fact that was
+      // replaced earlier silently outlives its own source.
+      const load = (sql: string) =>
+        this.sql
+          .prepare(sql)
+          .all(peer)
+          .map((r) => ({ id: String(r.id), sources: parse<string[]>(r.sources, []) }));
+      // Read each table once. `load` used to sit inside the loop, so a chain of
+      // depth k re-selected and re-parsed every memory and diary row k times —
+      // thousands of rows JSON-parsed on the request thread, visible as the
+      // admin page freezing right after "delete". The fixed point itself only
+      // grows a set in memory, so the data never has to be re-read.
+      const diaries = load('SELECT id,sources FROM diary_sections WHERE peer_id=?');
+      const memories = load('SELECT id,sources FROM memories WHERE peer_id=?');
+      for (;;) {
+        let changed = false;
+        for (const diary of diaries)
+          if (
+            !invalid.has(diary.id) &&
+            (diary.id === id || diary.sources.some((s) => invalid.has(s)))
+          ) {
+            invalid.add(diary.id);
+            changed = true;
+          }
+        for (const mem of memories)
+          if (!invalid.has(mem.id) && mem.sources.some((s) => invalid.has(s))) {
+            invalid.add(mem.id);
+            changed = true;
+          }
+        if (!changed) break;
+      }
+      for (const sourceId of invalid) {
+        this.sql
+          .prepare(
+            "UPDATE diary_sections SET content='',sources='[]',status='deleted' WHERE peer_id=? AND id=? AND status<>'deleted'",
+          )
+          .run(peer, sourceId);
+        this.sql
+          .prepare(
+            "UPDATE memories SET content='',sources='[]',status='deleted' WHERE peer_id=? AND id=? AND status<>'deleted'",
+          )
+          .run(peer, sourceId);
+        this.unindex(sourceId);
+      }
+      // Open loops carry the plan in their own content column and would keep
+      // quoting a message that was just forgotten.
+      for (const loop of this.sql
+        .prepare('SELECT id,sources FROM open_loops WHERE peer_id=?')
+        .all(peer) as Row[]) {
+        const sources = parse<string[]>(loop.sources, []);
+        if (sources.some((s) => invalid.has(s)))
           this.sql
-            .prepare("UPDATE diary_sections SET content='',status='deleted' WHERE id=?")
-            .run(diary.id);
-        }
-      const memories = this.sql
-        .prepare("SELECT id,sources FROM memories WHERE peer_id=? AND status='active'")
-        .all(peer)
-        .map((r) => ({ id: String(r.id), sources: parse<string[]>(r.sources, []) }));
-      for (const mem of memories)
-        if (mem.sources.some((s) => invalid.has(s))) {
-          invalid.add(mem.id);
-          this.sql
-            .prepare("UPDATE memories SET content='',status='deleted' WHERE id=?")
-            .run(mem.id);
-        }
-      for (const sourceId of invalid) this.unindex(sourceId);
+            .prepare(
+              "UPDATE open_loops SET content='',sources='[]',status='expired' WHERE id=?",
+            )
+            .run(String(loop.id));
+      }
       this.dropEmbeddings(peer, [...invalid]);
       this.sql
         .prepare("UPDATE peers SET notes='',notes_until=0,version=version+1 WHERE id=?")
@@ -1207,6 +1382,11 @@ export class Store {
       }
     }
     const now = Date.now();
+    const norm = (v: Float32Array) => {
+      let n = 0;
+      for (let i = 0; i < v.length; i++) n += v[i]! * v[i]!;
+      return Math.sqrt(n);
+    };
     const scored = [...new Map(rows.map((r) => [r.id, r])).values()]
       .filter((r) => !kind || r.kind === kind)
       .map((r) => {
@@ -1228,6 +1408,10 @@ export class Store {
           created_at: Number(r.created_at),
           score: (base + kindBonus) * boost,
           vector,
+          // Cached once per candidate: MMR compares each candidate against every
+          // already-picked hit, and recomputing both norms inside that loop made
+          // a 20-hit MMR over 2000 x 1024-dim vectors take ~2.4 s per reply.
+          norm: vector ? norm(vector) : 0,
         };
       })
       .filter((r) => r.score > 0)
@@ -1237,6 +1421,11 @@ export class Store {
     const picked: typeof scored = [];
     const candidates = [...scored];
     const cap = Math.max(1, Math.min(limit, 20));
+    const dot = (a: Float32Array, b: Float32Array) => {
+      let sum = 0;
+      for (let i = 0; i < a.length; i++) sum += a[i]! * b[i]!;
+      return sum;
+    };
     while (picked.length < cap && candidates.length) {
       let best = 0,
         bestScore = -Infinity;
@@ -1244,8 +1433,11 @@ export class Store {
         const candidate = candidates[i]!;
         let penalty = 0;
         for (const chosen of picked) {
-          if (chosen.vector && candidate.vector)
-            penalty = Math.max(penalty, cosineSimilarity(chosen.vector, candidate.vector));
+          if (chosen.vector && candidate.vector && chosen.norm && candidate.norm)
+            penalty = Math.max(
+              penalty,
+              dot(chosen.vector, candidate.vector) / (chosen.norm * candidate.norm),
+            );
           else if (chosen.row.content === candidate.row.content) penalty = 1;
         }
         // λ=0.7: relevance still leads, redundancy only breaks near-ties.
@@ -1292,7 +1484,7 @@ export class Store {
       this.sql
         .prepare('UPDATE open_loops SET due_at=?,due_text=?,sources=? WHERE id=?')
         .run(input.dueAt, input.dueText ?? String(existing.due_text ?? ''), JSON.stringify(sources), String(existing.id));
-      return this.openLoops(peer).find((l) => l.id === String(existing.id))!;
+      return this.openLoopById(peer, String(existing.id));
     }
     const id = randomUUID();
     this.sql
@@ -1309,7 +1501,17 @@ export class Store {
         input.recurring === 'yearly' ? 'yearly' : '',
         now,
       );
-    return this.openLoops(peer).find((l) => l.id === id)!;
+    // Straight lookup, not openLoops(peer).find(...): that list is capped at
+    // LIMIT 100, so on a peer with more open loops than that the freshly
+    // inserted row was never in it and the non-null assertion threw.
+    return this.openLoopById(peer, id);
+  }
+  openLoopById(peer: string, id: string): OpenLoop {
+    const row = this.sql
+      .prepare('SELECT * FROM open_loops WHERE peer_id=? AND id=?')
+      .get(peer, id);
+    if (!row) throw new Error('开环记录不存在');
+    return { ...row, sources: parse(row.sources, []) } as unknown as OpenLoop;
   }
   /** The user answered about this arrangement: close it quietly. Recurring
    *  loops instead move to next year — a birthday never "resolves". Because a
@@ -1395,12 +1597,17 @@ export class Store {
     };
     const valence = delta.valence ?? 0;
     const energy = delta.energy ?? 0;
+    const nextValence = fold(current.valence, valence);
     this.setSetting(`mood:${peer}`, {
-      valence: fold(current.valence, valence),
+      valence: nextValence,
       energy: fold(current.energy, energy),
-      // A reason describes the pulse that just landed. Carrying the previous one
-      // forward produced contradictions like "心情不错 · 对方提到了不开心的事".
-      reason: delta.reason ?? '',
+      // A reason describes the pulse that just landed, so a pulse that brings
+      // one always replaces the text, and a valence flip drops the old text
+      // (otherwise "心情不错 · 对方提到了不开心的事" appears). A pulse that only
+      // nudges energy keeps it: the night rule fires on every late exchange
+      // with no reason of its own, and it used to erase whatever the model had
+      // just reported about the same conversation.
+      reason: delta.reason || (Math.sign(nextValence) !== Math.sign(current.valence) ? '' : current.reason),
       at: now,
     });
   }
@@ -1522,8 +1729,16 @@ export class Store {
         .all(cutoff) as Row[];
       if (stale.length) {
         const upsert = this.sql.prepare(
+          // average_ms must merge weighted by call count. Assigning
+          // excluded.average_ms made the archived mean the mean of the *last*
+          // rollup batch while calls/input/output kept accumulating, so the
+          // panel showed an average that contradicted its own call count.
           'INSERT INTO usage_daily(purpose,day,calls,input_tokens,output_tokens,average_ms) VALUES(?,?,?,?,?,?) ' +
-            'ON CONFLICT(purpose,day) DO UPDATE SET calls=calls+excluded.calls,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,average_ms=excluded.average_ms',
+            'ON CONFLICT(purpose,day) DO UPDATE SET ' +
+            'average_ms=ROUND((average_ms*calls + excluded.average_ms*excluded.calls)*1.0/(calls+excluded.calls)),' +
+            'calls=calls+excluded.calls,' +
+            'input_tokens=input_tokens+excluded.input_tokens,' +
+            'output_tokens=output_tokens+excluded.output_tokens',
         );
         for (const row of stale) {
           upsert.run(
@@ -1597,10 +1812,12 @@ export class Store {
       for (const item of items) this.setEmbedding(item.id, item.peer, item.kind, item.vector, item.model, now);
     });
   }
-  embeddings(peer: string): EmbeddingVector[] {
+  embeddings(peer: string, kind?: SourceKind): EmbeddingVector[] {
     return this.sql
-      .prepare('SELECT id,peer_id,kind,vector,dims,model FROM memory_embeddings WHERE peer_id=?')
-      .all(peer)
+      .prepare(
+        `SELECT id,peer_id,kind,vector,dims,model FROM memory_embeddings WHERE peer_id=?${kind ? ' AND kind=?' : ''}`,
+      )
+      .all(...(kind ? [peer, kind] : [peer]))
       .map((r) => ({
         id: String(r.id),
         peer_id: String(r.peer_id),

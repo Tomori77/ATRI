@@ -43,6 +43,7 @@ let authenticated = false,
   polling = false,
   issuesSnapshot = '',
   chatSnapshot = '',
+  chatAnnouncedCount = 0,
   journalSnapshot = '',
   peersSnapshot = '',
   journalSub = 'diaries',
@@ -62,6 +63,19 @@ function el(tag, text, className) {
   return node;
 }
 
+/** Stable random id that also works outside a secure context.
+ *  `crypto.randomUUID` only exists on HTTPS or localhost, so opening the admin
+ *  page over a LAN address (ATRI_BIND=0.0.0.0, phone on the same network) made
+ *  "send" throw an unhelpful TypeError and the trial chat unusable. */
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function button(label, handler, classes = 'ghost small') {
   const node = el('button', label, 'btn ' + classes);
   node.type = 'button';
@@ -69,11 +83,16 @@ function button(label, handler, classes = 'ghost small') {
   return node;
 }
 
-async function perform(action, node) {
+async function perform(action, node, { rethrow = false } = {}) {
   try {
     if (node) node.disabled = true;
     await action();
   } catch (error) {
+    // Polling needs to see the failure to drive its own backoff; callers that
+    // want the toast keep the default. Swallowing unconditionally made the
+    // poller's own retry counter unreachable, so a server hiccup re-showed the
+    // error toast on every tick and the toast timer was reset forever.
+    if (rethrow) throw error;
     show(error.message, true);
   } finally {
     if (node) node.disabled = false;
@@ -326,7 +345,7 @@ function openDrawer(id) {
   const backdrop = $(id);
   backdrop.hidden = false;
   backdrop.onclick = (event) => {
-    if (event.target === backdrop) backdrop.hidden = true;
+    if (event.target === backdrop) dismissDrawer(backdrop);
   };
   // Keyboard users used to land outside the dialog: focus its first control
   // and keep Tab cycling inside while it is open.
@@ -354,10 +373,21 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
-function closeDrawers() {
-  for (const id of ['drawer-connection', 'drawer-issues']) $(id).hidden = true;
-  // Return focus to whatever opened the drawer, or keyboards get lost behind it.
+// One dismiss path for every way a drawer can close. Backdrop clicks and the
+// close button used to set `hidden` directly, leaving lastDrawerOpener pointing
+// at a button inside a drawer that was already gone — so the next Escape press
+// anywhere in the app yanked focus back to that stale bell icon.
+function dismissDrawer(backdrop) {
+  if (!backdrop) return;
+  backdrop.hidden = true;
   if (lastDrawerOpener?.isConnected) lastDrawerOpener.focus();
+  lastDrawerOpener = null;
+}
+function closeDrawers() {
+  for (const id of ['drawer-connection', 'drawer-issues']) {
+    const backdrop = $(id);
+    if (!backdrop.hidden) dismissDrawer(backdrop);
+  }
   lastDrawerOpener = null;
 }
 
@@ -369,7 +399,7 @@ document.querySelectorAll('[data-drawer]').forEach((b) => {
   };
 });
 document.querySelectorAll('[data-close]').forEach((b) => {
-  b.onclick = () => b.closest('.drawer-backdrop').hidden = true;
+  b.onclick = () => dismissDrawer(b.closest('.drawer-backdrop'));
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawers();
@@ -380,13 +410,26 @@ function renderIssues(state) {
   issues.replaceChildren();
   for (const task of state.issues.tasks) {
     const row = el('div', undefined, 'card');
-    row.append(
-      el('p', task.address + ' · ' + task.kind + '：' + task.error),
+    const actions = el('div', undefined, 'actions');
+    actions.append(
       button('重试任务', async () => {
         await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
         issuesSnapshot = '';
         await loadStatus();
       }),
+      button(
+        '忽略',
+        async () => {
+          await api('/api/tasks/' + enc(task.id) + '/dismiss', 'POST');
+          issuesSnapshot = '';
+          await loadStatus();
+        },
+        'btn ghost',
+      ),
+    );
+    row.append(
+      el('p', task.address + ' · ' + task.kind + '：' + task.error, 'wrap'),
+      actions,
     );
     issues.append(row);
   }
@@ -394,7 +437,7 @@ function renderIssues(state) {
     const row = el('div', undefined, 'card');
     row.append(
       el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
-      el('p', delivery.content),
+      el('p', delivery.content, 'wrap'),
       el(
         'p',
         (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
@@ -633,6 +676,9 @@ function renderChatPeerList(previewPeer) {
       if (currentPeer === item.id) return;
       currentPeer = item.id;
       chatSnapshot = '';
+      // Reset the announce cursor too: carrying the previous contact's message
+      // count over would anounce a slice of the wrong conversation.
+      chatAnnouncedCount = 0;
       waitingReply = false;
       renderChatPeerList(previewPeer);
       perform(loadChat);
@@ -722,6 +768,10 @@ async function loadChat() {
   chatSnapshot = snapshot;
   const container = $('messages');
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+  // Announce only what is new. #messages used to carry aria-live itself, and
+  // this function rebuilds the whole list on every 2.5s poll — so one new reply
+  // made a screen reader re-read the entire conversation from the top.
+  const announced = chatAnnouncedCount;
   container.replaceChildren();
   if (!history.length) empty(container, '这里还没有对话。发条消息，或等她先开口。');
   let lastDay = '';
@@ -743,12 +793,32 @@ async function loadChat() {
     const del = el('button', '删除', 'bubble-del');
     del.type = 'button';
     del.setAttribute('aria-label', '删除这条消息');
-    del.onclick = () =>
-      perform(async () => {
+    // Arm-to-confirm, same as every other destructive action on the page. On
+    // touch the button is always visible (hover is unavailable), so a single
+    // stray tap permanently deleted a message with no way back.
+    let armed = false;
+    let armTimer = 0;
+    del.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        del.textContent = '确认删除？';
+        del.classList.add('armed');
+        armTimer = window.setTimeout(() => {
+          if (!del.isConnected) return;
+          armed = false;
+          del.textContent = '删除';
+          del.classList.remove('armed');
+        }, 3000);
+        return;
+      }
+      window.clearTimeout(armTimer);
+      armed = false;
+      await perform(async () => {
         await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
         chatSnapshot = '';
         await loadChat();
       }, del);
+    };
     meta.append(del);
     const bubble = el('div', undefined, 'bubble');
     bubble.append(renderMessageContent(message.content));
@@ -770,6 +840,16 @@ async function loadChat() {
     container.append(typing);
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
+  // Push just the tail into the live region.
+  const live = $('messages-live');
+  if (live) {
+    const fresh = history.slice(announced);
+    live.textContent = fresh
+      .filter((m) => m.role === 'assistant')
+      .map((m) => m.content)
+      .join(' ');
+    chatAnnouncedCount = history.length;
+  }
   const isPreview = peer === 'preview:default';
   $('chat-form').hidden = !isPreview;
   $('chat-title').textContent = peers.find((p) => p.id === peer)?.address || (isPreview ? '本地试聊' : peer);
@@ -798,7 +878,7 @@ $('chat-form').onsubmit = (event) => {
   perform(async () => {
     const result = await api('/api/chat', 'POST', {
       content,
-      eventId: crypto.randomUUID(),
+      eventId: uuid(),
     });
     lastTask = result.taskId;
     waitingReply = true;
@@ -1065,6 +1145,8 @@ $('persona-form').onsubmit = (event) => {
   event.preventDefault();
   perform(async () => {
     if (!personaSelected) throw new Error('请先选择要编辑的人格');
+    // "留空则不发送开场白" is the documented behaviour, and a new persona starts
+    // with an empty greeting — so the field must be sendable as ''.
     await api('/api/personas/' + enc(personaSelected), 'PUT', {
       name: $('persona-name').value,
       content: $('persona-content').value,
@@ -1089,13 +1171,28 @@ async function loadStickers() {
       img,
       el('strong', sticker.slug),
       el('p', sticker.description),
-      button(sticker.disabled ? '启用' : '停用', async () => {
-        await api(
-          '/api/stickers/' + enc(sticker.slug) + (sticker.disabled ? '/enable' : ''),
-          sticker.disabled ? 'POST' : 'DELETE',
-        );
-        await loadStickers();
-      }),
+      button(
+        sticker.disabled ? '启用' : '停用',
+        async () => {
+          await api(
+            '/api/stickers/' + enc(sticker.slug) + (sticker.disabled ? '/enable' : ''),
+            sticker.disabled ? 'POST' : 'DELETE',
+          );
+          await loadStickers();
+        },
+        'btn ghost small',
+      ),
+      // Deleting an upload removes the file for good, so it gets its own verb
+      // and its own confirmation instead of hiding behind 停用. Bundled stickers
+      // ship with the repo and have no delete affordance at all.
+      ...(sticker.custom
+        ? [
+            confirmButton('删除', '确认删除？', async () => {
+              await api('/api/stickers/' + enc(sticker.slug) + '/file', 'DELETE');
+              await loadStickers();
+            }),
+          ]
+        : []),
     );
     container.append(card);
   }
@@ -1151,6 +1248,20 @@ function applySettings(config) {
   'sandboxNetwork',
 ])
   $(key).checked = config[key];
+  // Ticked but inert is the confusing state: the switch only takes effect once a
+  // model name AND the separate key are present, and the key deliberately does
+  // not fall back to the chat key. Say so instead of leaving a checkbox that
+  // claims the feature is on while nothing is ever embedded.
+  const embeddingNotice = $('embedding-notice');
+  if (embeddingNotice) {
+    const requested = config.embeddingEnabled === true;
+    const active = config.embeddingActive === true;
+    embeddingNotice.hidden = !requested || active;
+    embeddingNotice.textContent =
+      requested && !active
+        ? '已勾选但尚未生效：向量检索需要同时填写向量模型名称和独立的向量密钥，缺一项就不会调用。'
+        : '';
+  }
   $('apiKey').placeholder = config.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
   $('tavilyKey').placeholder = config.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('embeddingApiKey').placeholder = config.hasEmbeddingApiKey
@@ -1275,13 +1386,28 @@ function renderSandbox(state) {
     ['内存上限', mem],
   ];
   if (state.isolation?.network) chips.push(['网络', state.isolation.network]);
+  // The backend already decides whether isolation is real or degraded; dropping
+  // the two fields left "已开启" as the only thing on screen. In the fallback
+  // path there is no namespace at all — /data (SQLite, API keys) is readable by
+  // any command and the network switch does nothing — so the operator must be
+  // told, not reassured.
+  const degraded = state.isolation?.level === 'directory';
+  if (state.isolation?.level)
+    chips.push(['隔离', degraded ? '目录级（已降级）' : 'nsjail 命名空间']);
   $('sandbox-status').replaceChildren(
     ...chips.map(([label, value]) => {
       const chip = el('span', undefined, 'status-chip');
+      if (degraded && label === '隔离') chip.classList.add('status-chip-warn');
       chip.append(el('span', label, 'status-chip-label'), el('span', value, 'status-chip-value'));
       return chip;
     }),
   );
+  const note = $('sandbox-note');
+  if (note) {
+    note.textContent = state.isolation?.note ?? '';
+    note.hidden = !state.isolation?.note;
+    note.classList.toggle('warn', degraded);
+  }
 }
 $('refresh-sandbox').onclick = () =>
   perform(async () => renderSandbox(await api('/api/sandbox')), $('refresh-sandbox'));
@@ -1307,9 +1433,17 @@ for (const [id, field] of [
       show('密钥已清除，对应服务在重新填写前不可用。');
     }, $(id));
 
+/** The single place that writes the save state, so the in-card hint and the
+ *  sticky status bar can never disagree. */
+function setSettingsStatus(text) {
+  $('settings-saved').textContent = text;
+  const bar = $('settings-status-text');
+  if (bar) bar.textContent = text;
+}
+
 function settingsChanged() {
   settingsVersion++;
-  $('settings-saved').textContent = '有尚未保存的修改。';
+  setSettingsStatus('有尚未保存的修改。');
   updateBudget();
 }
 $('settings-form').oninput = settingsChanged;
@@ -1336,7 +1470,7 @@ $('settings-form').onsubmit = (event) => {
     const saved = await api('/api/config', 'PUT', body);
     if (version === settingsVersion) {
       applySettings(saved);
-      $('settings-saved').textContent = '已保存 · ' + new Date().toLocaleTimeString('zh-CN');
+      setSettingsStatus('已保存 · ' + new Date().toLocaleTimeString('zh-CN'));
     }
     show(
       version === settingsVersion
@@ -1385,7 +1519,29 @@ $('logout').onclick = () =>
     $('password').focus();
   });
 
+/** True when the settings form holds edits that were never submitted. */
+function settingsDirty() {
+  return (
+    currentTab === 'settings' && $('settings-saved').textContent.startsWith('有尚未保存的修改')
+  );
+}
+
 async function selectTab(tab) {
+  // Switching tabs used to discard a half-edited settings form with no warning:
+  // the form only lives in the DOM, and applySettings() overwrites it from the
+  // server on the next visit. Ask before throwing the edits away.
+  if (tab !== currentTab && settingsDirty()) {
+    const leave = window.confirm('设置里有尚未保存的修改，离开将会丢失。确定要离开吗？');
+    if (!leave) {
+      document.querySelectorAll('[data-tab]').forEach((b) => {
+        const selected = b.dataset.tab === currentTab;
+        b.classList.toggle('selected', selected);
+        b.setAttribute('aria-selected', String(selected));
+        b.tabIndex = selected ? 0 : -1;
+      });
+      return;
+    }
+  }
   currentTab = tab;
   document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== tab));
   document.querySelectorAll('[data-tab]').forEach((b) => {
@@ -1496,24 +1652,31 @@ setInterval(async () => {
   }
   polling = true;
   try {
-    await perform(async () => {
-      const state = await loadStatus();
-      pollFailures = 0;
-      if (lastTask) {
-        const task = await api('/api/tasks/' + enc(lastTask));
-        if (task.state === 'failed') {
-          show(task.error + '，可在右上角铃铛里重试。', true);
-          lastTask = null;
-        } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
-      }
-      if (currentTab === 'chat') await loadChat();
-      if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
-        journalPoll = Date.now();
-        await loadJournal();
-      }
-      if ($('drawer-connection').hidden === false) await loadPeers();
-      return state;
-    });
+    // rethrow so this catch actually runs: perform() used to swallow the error,
+    // which made pollFailures unreachable and turned every hiccup into the
+    // repeated-toast bug the comment above describes.
+    await perform(
+      async () => {
+        const state = await loadStatus();
+        pollFailures = 0;
+        if (lastTask) {
+          const task = await api('/api/tasks/' + enc(lastTask));
+          if (task.state === 'failed') {
+            show(task.error + '，可在右上角铃铛里重试。', true);
+            lastTask = null;
+          } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
+        }
+        if (currentTab === 'chat') await loadChat();
+        if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
+          journalPoll = Date.now();
+          await loadJournal();
+        }
+        if ($('drawer-connection').hidden === false) await loadPeers();
+        return state;
+      },
+      null,
+      { rethrow: true },
+    );
   } catch {
     pollFailures++;
   } finally {

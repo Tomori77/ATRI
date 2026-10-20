@@ -4,7 +4,7 @@ import { Store, MEMORY_HALFLIFE_DAYS } from '@atri/db';
 import { recentStickerUse, renderTimeGap } from '@atri/core';
 import { parseReply, extractInlineStickers } from '@atri/core';
 import { cosineSimilarity } from '@atri/llm';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';

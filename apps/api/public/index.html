@@ -117,7 +117,8 @@
               </div>
               <div id="chat-badges" class="badge-row"></div>
             </header>
-            <div id="messages" class="messages" aria-live="polite"></div>
+            <div id="messages" class="messages"></div>
+            <div id="messages-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
             <form id="chat-form" class="composer" hidden>
               <textarea id="chat-input" rows="1" maxlength="4000" placeholder="说点什么……"></textarea>
               <button class="btn primary send" type="submit" aria-label="发送">
@@ -140,17 +141,17 @@
             <button class="btn ghost" id="write-diary" type="button">整理今天的日记</button>
           </div>
           <div class="subtabs" role="tablist" aria-label="记录分类">
-            <button class="subtab selected" data-sub="diaries" aria-selected="true">日记</button>
-            <button class="subtab" data-sub="memories" aria-selected="false">记忆</button>
-            <button class="subtab" data-sub="loops" aria-selected="false">惦记的事</button>
+            <button class="subtab selected" role="tab" id="subtab-diaries" aria-selected="true" aria-controls="journal-diaries-wrap" data-sub="diaries">日记</button>
+            <button class="subtab" role="tab" id="subtab-memories" aria-selected="false" aria-controls="journal-memories-wrap" data-sub="memories">记忆</button>
+            <button class="subtab" role="tab" id="subtab-loops" aria-selected="false" aria-controls="journal-loops-wrap" data-sub="loops">惦记的事</button>
           </div>
-          <div class="stack" id="journal-diaries-wrap">
+          <div class="stack" id="journal-diaries-wrap" role="tabpanel" aria-labelledby="subtab-diaries">
             <div id="diaries" class="journal-list"></div>
           </div>
-          <div class="stack" id="journal-memories-wrap" hidden>
+          <div class="stack" id="journal-memories-wrap" role="tabpanel" aria-labelledby="subtab-memories" hidden>
             <div id="memories" class="journal-list"></div>
           </div>
-          <div class="stack" id="journal-loops-wrap" hidden>
+          <div class="stack" id="journal-loops-wrap" role="tabpanel" aria-labelledby="subtab-loops" hidden>
             <div id="loops" class="journal-list"></div>
           </div>
         </section>
@@ -229,6 +230,10 @@
 
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">
           <form id="settings-form" class="settings-columns">
+            <div class="settings-statusbar">
+              <span>设置</span>
+              <span id="settings-status-text" class="hint"></span>
+            </div>
             <div class="settings-col">
             <section class="card">
               <h2>模型服务</h2>
@@ -282,6 +287,7 @@
                 <input id="embeddingEnabled" type="checkbox" />
                 <span>启用向量记忆检索</span>
               </label>
+              <p id="embedding-notice" class="hint alert-text" hidden></p>
               <div class="grid-2">
                 <label class="field">
                   <span>向量模型</span>
@@ -323,6 +329,7 @@
                 <input id="sandboxMemoryMb" type="number" min="0" max="262144" step="128" required />
               </label>
               <div id="sandbox-status" class="chip-row" role="status"></div>
+              <p id="sandbox-note" class="hint sandbox-note" hidden></p>
               <div class="actions sandbox-actions">
                 <button class="btn ghost" id="refresh-sandbox" type="button">刷新状态</button>
                 <button class="btn ghost danger" id="clear-sandbox" type="button">清空沙箱目录</button>
