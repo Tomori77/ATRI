@@ -437,6 +437,58 @@ export class Store {
   approve(id: string, approved: boolean) {
     this.sql.prepare('UPDATE peers SET approved=? WHERE id=?').run(approved ? 1 : 0, id);
   }
+  /** Hard-delete a peer and every record tied to it. Files on disk are
+   *  left for backup orphan pruning. */
+  deletePeer(id: string) {
+    this.transaction(() => {
+      // Child-first: outbox and diary_sections reference tasks(id), so tasks
+      // must go last; everything references peers(id), peers goes last of all.
+      const tables = [
+        'outbox',
+        'diary_sections',
+        'open_loops',
+        'messages',
+        'memories',
+        'memory_embeddings',
+        'search_index',
+        'usage',
+        'tasks',
+      ];
+      for (const table of tables)
+        this.sql.prepare(`DELETE FROM ${table} WHERE peer_id=?`).run(id);
+      this.memoryCache.delete(id);
+      for (const key of ['mood', 'diary_cursor'])
+        this.removeSetting(`${key}:${id}`);
+      this.removeSetting(`sticker-usage:${id}`);
+      this.sql.prepare('DELETE FROM peers WHERE id=?').run(id);
+    });
+  }
+  /** Per-peer sticker usage counters, kept apart from sticker metadata. */
+  stickerUsage(peer: string): Record<string, { count: number; lastAt: number }> {
+    return this.getSetting<Record<string, { count: number; lastAt: number }>>(
+      `sticker-usage:${peer}`,
+      {},
+    );
+  }
+  markStickersUsed(peer: string, slugs: string[], now = Date.now()) {
+    const unique = [...new Set(slugs)];
+    if (!unique.length) return;
+    const stats = this.stickerUsage(peer);
+    for (const slug of unique) {
+      const entry = stats[slug];
+      stats[slug] = { count: (entry?.count ?? 0) + 1, lastAt: now };
+    }
+    this.setSetting(`sticker-usage:${peer}`, stats);
+  }
+  resetStickerUsage(peer: string, slug?: string) {
+    if (!slug) {
+      this.removeSetting(`sticker-usage:${peer}`);
+      return;
+    }
+    const stats = this.stickerUsage(peer);
+    delete stats[slug];
+    this.setSetting(`sticker-usage:${peer}`, stats);
+  }
   setPeerPersona(id: string, personaId: string) {
     this.sql
       .prepare('UPDATE peers SET persona_id=? WHERE id=?')

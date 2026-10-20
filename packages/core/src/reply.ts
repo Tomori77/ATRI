@@ -182,10 +182,23 @@ function normalizeTextParts(
         const slug = m.slug;
         if (typeof slug !== 'string') return [];
         const sticker = stickers.find((s) => s.slug === slug);
-        if (sticker)
+        if (sticker) {
+          const raw = m as Record<string, unknown>;
           return [
-            { type: 'sticker' as const, slug: sticker.slug, description: sticker.description },
+            {
+              type: 'sticker',
+              slug: sticker.slug,
+              description: sticker.description,
+              ...(typeof raw.emotion === 'string' && raw.emotion
+                ? { emotion: raw.emotion.slice(0, 40) }
+                : {}),
+              ...(typeof raw.intensity === 'number' && Number.isFinite(raw.intensity)
+                ? { intensity: Math.max(1, Math.min(4, Math.round(raw.intensity))) }
+                : {}),
+            },
           ];
+        }
+        return [];
       }
       return [];
     })
