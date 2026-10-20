@@ -72,12 +72,38 @@ export function dayAt(at: number, timeZone: string): string {
 function hourAt(at: number, timeZone: string) {
   return Number(hourFormatter(timeZone).format(new Date(at)));
 }
+/** Retry backoff for failed non-chat tasks: 1 min, 2, 4, 8… capped at 30 min.
+ *  attempt 1 is the first failure, so the Nth failure waits 2^(N-1) minutes. */
+export function taskBackoffMs(attempts: number): number {
+  return Math.min(30, 2 ** Math.max(0, attempts - 1)) * 60000;
+}
+/** A user→assistant pair wider than this is not a conversation exchange; the
+ *  assistant message is a proactive ping answering silence, so the rule-based
+ *  mood pulse must not read the old user message as fresh evidence. */
+const REPLY_PAIR_WINDOW_MS = 30 * 60000;
+/** Per-drain task budget for one peer. Delivery rounds also consume it, so it
+ *  bounds one pump cycle rather than one kind of work. */
+const MAX_WORK_ITERATIONS = 12;
 export function inQuietHours(hour: number, start: number, end: number) {
   return start === end
     ? false
     : start < end
       ? hour >= start && hour < end
       : hour >= start || hour < end;
+}
+/** Abortable pause: resolves early when `signal` fires, so shutdown and
+ *  supersede do not have to sit through the remaining delay. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
 }
 /** Loose overlap test for "did this message mention that plan": CJK bigrams and
  *  latin words of 3+ characters, ignoring stop-word-ish short tokens. */
@@ -147,6 +173,14 @@ export class Runtime {
     try {
       for (const peer of this.store.peers()) {
         if (this.stopped) return;
+        // A switched embedding model leaves the old vectors in place: they
+        // would never refresh (pendingEmbeddings only sees rows without any
+        // vector) and are not comparable with new query vectors. Drop them so
+        // the normal backfill re-embeds everything with the current model.
+        for (const stale of this.store.staleEmbeddingModels(peer.id, embedder.model)) {
+          this.store.dropEmbeddingsOfModel(stale);
+          this.options.log?.('检测到向量模型更换，已清理旧向量', { from: stale, to: embedder.model });
+        }
         for (;;) {
           const pending = this.store.pendingEmbeddings(peer.id, quick ? EMBED_BACKFILL_BATCH : 512);
           if (!pending.length) break;
@@ -186,10 +220,12 @@ export class Runtime {
       return { ...event, taskId };
     });
     const active = this.active.get(peer);
-    if (
-      active &&
-      (active.kind === 'diary' || active.kind === 'notes' || active.kind === 'proactive')
-    )
+    // Only a turn that produces user-facing output is worth cancelling: its
+    // reply would answer an already-superseded message. Diary and notes are
+    // background writes with no visible target — aborting them on every new
+    // user message meant a chatty contact's diary restarted forever and never
+    // finished (each abort also re-queued it 60s later, burning an LLM call).
+    if (active && (active.kind === 'chat' || active.kind === 'proactive'))
       active.controller.abort();
     this.pump();
     return result;
@@ -231,19 +267,30 @@ export class Runtime {
     this.active.delete(peerId);
   }
   private async work(peerId: string, entry: { controller: AbortController; kind?: string }) {
-    for (let n = 0; n < 12 && !this.stopped; n++) {
-      const peer = this.store.peer(peerId)!;
+    for (let n = 0; n < MAX_WORK_ITERATIONS && !this.stopped; n++) {
+      const peer = this.store.peer(peerId);
+      if (!peer) return;
       if (!peer.approved) return;
       const deliveries = this.store.pendingDeliveries(peerId);
       if (deliveries.length) {
         entry.kind = 'delivery';
-        const task = this.store.taskById(deliveries[0].task_id)!;
+        const task = this.store.taskById(deliveries[0].task_id);
+        if (!task) {
+          // The task row was pruned while its outbox rows survived. Retire the
+          // orphaned bubbles instead of dereferencing undefined and killing the
+          // whole peer's queue.
+          this.store.markDelivery(deliveries[0].id, 'cancelled', '所属任务已被清理');
+          continue;
+        }
         if (task.version !== peer.version && this.store.cancelUnsent(task)) continue;
         const own = deliveries.filter((d) => d.task_id === task.id);
-        for (const delivery of own) {
+        for (let i = 0; i < own.length; i++) {
+          const delivery = own[i]!;
           this.store.startDelivery(delivery.id);
           try {
-            await this.options.transport.send(this.store.peer(peerId)!, delivery.part, delivery.id);
+            const target = this.store.peer(peerId);
+            if (!target) break;
+            await this.options.transport.send(target, delivery.part, delivery.id);
             this.store.markDelivery(delivery.id, 'sent');
           } catch (error) {
             this.store.markDelivery(
@@ -253,14 +300,16 @@ export class Runtime {
             );
             return;
           }
-          if (delivery !== deliveries.at(-1)) {
+          if (i < own.length - 1) {
             // Human-like pacing: longer bubbles get longer pauses, never a
             // machine-gun burst. Capped so a batch still sends promptly.
-            const next = own[own.indexOf(delivery) + 1];
+            // Compared against `own`, not the whole pending list: another
+            // task queued behind this one must not add a pointless pause.
+            const next = own[i + 1];
             const chars = next?.part.type === 'text' ? (next.part.text?.length ?? 0) : 6;
-            await new Promise((r) =>
-              setTimeout(r, Math.min(2500, 400 + Math.min(80, chars) * 25)),
-            );
+            // Interruptible: stop() aborts the controller, and a bare setTimeout
+            // here kept the shutdown waiting out every remaining pause.
+            await sleep(Math.min(2500, 400 + Math.min(80, chars) * 25), entry.controller.signal);
           }
         }
         this.maybeMood(peerId);
@@ -279,13 +328,25 @@ export class Runtime {
         if (task.kind === 'chat' || task.kind === 'proactive') {
           // Greeting tasks are the first-contact hello queued on approval; the
           // normal proactive gate (silence clock, quiet hours) would veto a
-          // peer that has never messaged, so greetings skip it.
+          // peer that has never messaged, so a non-empty greeting skips it.
+          // Blank means "no opener configured" — the server no longer enqueues
+          // those, but a legacy row may still exist, and an empty string is
+          // falsy so it correctly falls through to the regular gate.
+          const isGreeting =
+            task.kind === 'proactive' &&
+            typeof task.payload.greeting === 'string' &&
+            (task.payload.greeting as string).trim() !== '';
           if (
             task.kind === 'proactive' &&
-            task.payload.greeting === undefined &&
+            !isGreeting &&
             !this.proactiveGate(task, peer, Date.now())
           ) {
-            this.store.finish(task.id);
+            // superseded, not done: the usual veto reason is that jitter pushed
+            // run_at into quiet hours (or the daily quota was consumed by a
+            // racing ping). `done` would burn that dedupe key for the whole
+            // day/loop period; `superseded` lets the next scheduler tick
+            // re-enqueue and try again inside the remaining window.
+            this.store.finish(task.id, 'superseded');
             continue;
           }
           const typing = this.options.transport.typing?.(peer, true).catch(() => {});
@@ -331,6 +392,12 @@ export class Runtime {
         } else {
           this.store.finish(task.id, 'failed', error instanceof Error ? error.message : '任务失败');
           this.options.log?.('任务失败', { task: task.id, kind: task.kind, error: String(error) });
+          // Backoff, not an immediate re-queue: a systematically failing task
+          // (bad model output, persona over budget) must not burn one LLM call
+          // per scheduler minute. state stays 'failed' so issues() keeps listing
+          // it and a newer user reply can still supersede it; manual retry via
+          // /api/tasks/:id/retry resets run_at to now and re-queues.
+          this.store.deferFailed(task.id, taskBackoffMs(task.attempts));
         }
       }
     }
@@ -343,16 +410,20 @@ export class Runtime {
   private async dedupeMemories(peer: string, updates: MemoryUpdate[], signal?: AbortSignal) {
     const embedder = this.options.embedder;
     if (!updates.length || !embedder || embedder.enabled === false || !embedder.configured) return;
-    const memories = this.store.embeddings(peer).filter((e) => e.kind === 'memory');
+    const memories = this.store.embeddings(peer, 'memory');
     if (!memories.length) return;
-    for (const update of updates) {
-      if (update.content.trim().length < 4) continue;
-      let vector: Float32Array | undefined;
-      try {
-        [vector] = await embedder.embed([update.content], signal);
-      } catch {
-        continue;
-      }
+    // One batched call instead of one HTTP round trip per update: this ran
+    // before saveReply, so every serial embed was added to the visible reply
+    // latency.
+    const contents = updates.map((u) => u.content.trim());
+    let vectors: (Float32Array | undefined)[];
+    try {
+      vectors = await embedder.embed(contents, signal);
+    } catch {
+      return;
+    }
+    for (let i = 0; i < updates.length; i++) {
+      const vector = vectors[i];
       if (!vector?.some((v) => v !== 0)) continue;
       let bestId = '',
         bestSim = 0;
@@ -365,8 +436,8 @@ export class Runtime {
         }
       }
       if (bestSim >= SIMILARITY_SUPERSEDE) {
-        const superseded = new Set([...(update.supersedes ?? []), bestId]);
-        update.supersedes = [...superseded].slice(0, 12);
+        const superseded = new Set([...(updates[i].supersedes ?? []), bestId]);
+        updates[i].supersedes = [...superseded].slice(0, 12);
       }
     }
   }
@@ -386,7 +457,8 @@ export class Runtime {
       peer = task.peer_id,
       now = Date.now();
     store.expireOpenLoops(peer, now);
-    for (const id of reply.resolveLoops ?? []) store.resolveOpenLoop(peer, id, now);
+    for (const id of reply.resolveLoops ?? [])
+      store.resolveOpenLoop(peer, id, now, this.options.config().timeZone);
     for (const loop of reply.openLoops ?? []) {
       if (!Number.isFinite(loop.dueAt) || loop.dueAt < now - 86400000) continue;
       if (!loop.sources.length) continue;
@@ -420,7 +492,16 @@ export class Runtime {
     const recent = this.store.history(peerId, 2);
     const user = [...recent].reverse().find((m) => m.role === 'user');
     const assistant = [...recent].reverse().find((m) => m.role === 'assistant');
-    if (user && assistant && user.created_at <= assistant.created_at)
+    // Only a genuine exchange pulses: the user message must be inside the reply
+    // window before the assistant turn. Without this guard, a proactive ping
+    // paired itself with a days-old user message and re-injected the same stale
+    // mood (last week's "好累") on every ping.
+    if (
+      user &&
+      assistant &&
+      user.created_at <= assistant.created_at &&
+      assistant.created_at - user.created_at <= REPLY_PAIR_WINDOW_MS
+    )
       this.store.pulseMoodFromExchange(
         peerId,
         { user: user.content, assistant: assistant.content, userAt: user.created_at },
@@ -469,7 +550,7 @@ export class Runtime {
     this.pump();
     return id;
   }
-  proactiveAllowed(peer: Peer, now: number, dueLoops = 0): boolean {
+  proactiveAllowed(peer: Peer, now: number): boolean {
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
     if (
@@ -522,20 +603,37 @@ export class Runtime {
     const streak = this.store.unansweredProactiveStreak(peer.id);
     if (streak >= PROACTIVE_IGNORE_LIMIT)
       return now - peer.last_proactive_at >= PROACTIVE_IGNORE_COOLDOWN_DAYS * 86400000;
-    // Independent of the casual daily quota, but never right after a ping —
-    // the due-loop dedupe key makes this a one-shot per loop per day anyway.
+    // The due-loop quota is independent of the daily casual one on purpose — a
+    // promise outranks small talk, so a loop may still be asked on a day the
+    // casual ping already went out. The 12-hour spacing is what bounds the
+    // write rate here; tying it to the calendar day as well made the two gates
+    // identical and the "independent quota" a no-op.
     return now - peer.last_proactive_at >= 12 * 3600000;
   }
   schedule(now = Date.now()) {
     if (this.stopped) return;
     const c = this.options.config(),
       hour = hourAt(now, c.timeZone);
+    // Housekeeping piggybacks on the one-minute scheduler tick instead of
+    // having its own timer. It must never take the scheduler down with it: one
+    // failing sweep (a constraint, a locked row) used to throw out of the
+    // setInterval callback, which stops every diary, ping and loop reminder —
+    // and, unhandled, exited the process.
+    try {
+      this.store.pruneTasks(now);
+    } catch (error) {
+      this.options.log?.('清理旧任务失败，本轮跳过', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     for (const peer of this.store.peers().filter((p) => p.approved)) {
       if (hour >= c.diaryHour) this.queueDiary(peer.id, false, now);
       const casualAllowed = this.proactiveAllowed(peer, now);
+      // dueOpenLoops already filters asked=0 in SQL; re-filtering here did
+      // nothing except suggest the query was untrusted.
       const dueLoops = casualAllowed
         ? []
-        : this.store.dueOpenLoops(peer.id, now).filter((l) => !l.asked);
+        : this.store.dueOpenLoops(peer.id, now);
       const loopPing = !casualAllowed && dueLoops.length && this.loopPingAllowed(peer, now);
       if (casualAllowed || loopPing) {
         // Randomized delay so proactive pings do not land at the same minute

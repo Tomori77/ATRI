@@ -20,3 +20,13 @@ backups/
 .DS_Store
 Thumbs.db
 restore.compose.yaml
+# 提交脚本的临时产物
+.commitmsg
+# 其他工具的本地记忆文件
+.monkeycode/
+# 本地调试用
+.env.local
+data-local/
+# 沙箱工作目录（本地预览时落在仓库根）与沙箱临时目录
+/sandbox/
+atri-sandbox-*/

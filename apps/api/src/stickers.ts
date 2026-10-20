@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve, join, sep } from 'node:path';
 import type { Store } from '@atri/db';
 import type { Sticker } from '@atri/core';
@@ -81,9 +81,33 @@ export class Stickers {
     this.store.setSetting('stickers:custom', list);
   }
   disable(slug: string) {
+    if (!this.list(true).some((s) => s.slug === slug)) throw new Error('表情不存在');
     this.store.setSetting('stickers:disabled', [
       ...new Set([...this.store.getSetting<string[]>('stickers:disabled', []), slug]),
     ]);
+  }
+  /** Custom stickers can be deleted outright; built-in ones only disabled.
+   *  "Disable" on an uploaded file used to leave the image on disk forever, and
+   *  the 32-item cap counts enabled stickers, so upload→disable→upload grew
+   *  data/custom without bound and every backup carried the orphans. */
+  remove(slug: string) {
+    const custom = this.store.getSetting<Sticker[]>('stickers:custom', []);
+    const item = custom.find((s) => s.slug === slug);
+    if (!item) throw new Error('内置表情不能删除，只能停用');
+    this.store.setSetting(
+      'stickers:custom',
+      custom.filter((s) => s.slug !== slug),
+    );
+    this.store.setSetting(
+      'stickers:disabled',
+      this.store.getSetting<string[]>('stickers:disabled', []).filter((s) => s !== slug),
+    );
+    // The file may already be gone; the setting is the source of truth.
+    try {
+      rmSync(join(this.dataDir, item.file), { force: true });
+    } catch {
+      // Losing the file is not worth failing the delete.
+    }
   }
   enable(slug: string) {
     const item = this.list(true).find((s) => s.slug === slug);

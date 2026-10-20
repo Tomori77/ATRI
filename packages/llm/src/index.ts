@@ -13,8 +13,6 @@ export interface ModelConfig {
   vision: boolean;
   contextWindowTokens?: number;
   inputBudgetTokens?: number;
-  embeddingModel?: string;
-  embeddingDims?: number;
 }
 export interface ToolDefinition {
   name: string;
@@ -46,7 +44,15 @@ export interface Model {
   complete(
     messages: ModelMessage[],
     tools?: ToolDefinition[],
-    options?: { signal?: AbortSignal; sessionId?: string; maxTokens?: number },
+    options?: {
+      signal?: AbortSignal;
+      sessionId?: string;
+      maxTokens?: number;
+      /** Wall-clock deadline of the whole turn. A retry that cannot finish
+       *  before it is skipped, so the original upstream error surfaces instead
+       *  of being replaced by the caller's timeout. */
+      deadlineAt?: number;
+    },
   ): Promise<Completion>;
 }
 export class ModelError extends Error {
@@ -95,6 +101,14 @@ function argumentsOf(value: unknown): Record<string, unknown> {
     return {};
   }
 }
+/** Some models inline reasoning as <think>…</think> in content itself instead
+ *  of a dedicated field. Strip it — balanced tags removed, then a stray
+ *  unmatched tag (often truncated by an output cap) dropped too. */
+function stripThinkTags(text: string): string {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  out = out.replace(/<\/?think>/gi, '');
+  return out.trimStart();
+}
 function imageParts(message: ModelMessage, format: ApiFormat): unknown[] {
   const parts: unknown[] = [
     { text: message.content, ...(format === 'anthropic' ? { type: 'text' } : {}) },
@@ -118,7 +132,12 @@ export class HttpModel implements Model {
   async complete(
     messages: ModelMessage[],
     tools: ToolDefinition[] = [],
-    options: { signal?: AbortSignal; sessionId?: string; maxTokens?: number } = {},
+    options: {
+      signal?: AbortSignal;
+      sessionId?: string;
+      maxTokens?: number;
+      deadlineAt?: number;
+    } = {},
   ): Promise<Completion> {
     const c = this.config;
     if (!c.apiKey || !c.model) throw new ModelError('请先配置模型名称和 API 密钥');
@@ -247,6 +266,11 @@ export class HttpModel implements Model {
     // per-request timeout lives inside attempt(), so every try gets its full
     // budget; the caller's signal (turn timeout, cancel) cuts across all of it.
     const outer = options.signal;
+    // A retry must fit inside the caller's turn budget. Each attempt gets the
+    // full per-request timeout, and with the defaults (45 s x 3 attempts plus
+    // backoff) the retries alone outlive the 90 s turn timeout: the third try
+    // was always cut off by the caller's signal, so the user saw "no reply"
+    // instead of the upstream error that actually caused it.
     let lastError: ModelError;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -267,6 +291,13 @@ export class HttpModel implements Model {
       // Full jitter: several peers failing at once must not retry in lockstep
       // and rebuild the same spike that upset the upstream.
       const delay = base * (0.8 + Math.random() * 0.4);
+      // A retry that cannot finish inside the turn is worse than no retry: it is
+      // aborted mid-flight and reports the cancellation instead of the real
+      // upstream failure. Give up with the original error while there is still
+      // time to surface it.
+      const deadline = options.deadlineAt;
+      if (typeof deadline === 'number' && Date.now() + delay + c.timeoutMs > deadline)
+        throw lastError;
       await pause(delay, outer);
     }
   }
@@ -355,10 +386,16 @@ export class HttpModel implements Model {
       outputTokens = Number(data.usageMetadata?.candidatesTokenCount ?? 0);
     } else {
       const message: Json = data.choices?.[0]?.message ?? {};
+      // Thinking models (GLM, DeepSeek-R1, Qwen-W…, and OpenAI-compatible
+      // gateways generally) return reasoning in dedicated fields. They must
+      // never reach the conversation history: replaying them back inflates
+      // every later request, and they are not meant to be shown or stored.
+      delete message.reasoning_content;
+      delete message.reasoning;
       raw = message;
       text =
         typeof message.content === 'string'
-          ? message.content
+          ? stripThinkTags(message.content)
           : Array.isArray(message.content)
             ? message.content
                 .filter((p: Json) => p.type === 'text')

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { inQuietHours } from '@atri/core';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 test('跨午夜安静时段、静默时间和每日次数限制', (t) => {
   assert.equal(inQuietHours(1, 23, 8), true);

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 test('来源隔离、重复来源幂等，明确纠正替代旧记忆', (t) => {
   const f = fixture(t);

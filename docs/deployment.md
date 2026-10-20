@@ -42,9 +42,21 @@ ssh -L 3000:127.0.0.1:3000 user@server
 | LLM_VISION            | false；选用支持视觉的模型后启用                   |
 | TAVILY_API_KEY        | 搜索密钥，启用实时搜索需要填写                    |
 | TZ                    | Asia/Shanghai；控制日记和主动联系时区             |
+| EMBEDDING_ENABLED     | false；开启向量记忆检索                           |
+| EMBEDDING_BASE_URL    | 留空回退 LLM_BASE_URL                             |
+| EMBEDDING_API_KEY     | 向量密钥（独立，不回退模型密钥）                  |
+| EMBEDDING_MODEL       | 向量模型名，开启向量检索必填                      |
+| SANDBOX_ENABLED       | false；允许她在沙箱里运行命令                     |
+| SANDBOX_NETWORK       | false；允许沙箱联网（装包、拉数据）               |
+| SANDBOX_SIZE_MB       | 512；沙箱目录大小上限，0 不限制                   |
+| SANDBOX_MEMORY_MB     | 2048；单条命令内存上限，0 不限制                  |
+| ILINK_BASE_URL        | 微信协议服务地址（一般不需要改）                  |
 | WECHAT_ALLOWED_PEERS  | 逗号分隔的微信联系人 ID；仅用于初次出现时允许使用 |
 | ATRI_BIND / ATRI_PORT | 127.0.0.1 / 3000；Compose 发布地址与端口          |
 | COOKIE_SECURE         | false；HTTPS 部署设置为 true                      |
+
+以上模型/沙箱等业务配置均为「首次默认值」：在管理页保存过一次之后，改 .env 不会
+再生效（管理页的值优先）。ADMIN_PASSWORD、监听地址等进程设置始终由环境变量控制。
 
 模型地址示例：
 

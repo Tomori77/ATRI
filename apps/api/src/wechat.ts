@@ -257,7 +257,21 @@ export class WeChatBridge implements Transport {
     }
   }
   async images(message: Message): Promise<string[]> {
-    if (!this.settings.config().vision) return [];
+    if (!this.settings.config().vision) {
+      // Say so instead of returning an empty list. The prompt tells the model to
+      // understand this turn's image and to own up when it cannot; with the
+      // vision switch off it received a bare "[收到image附件]" and no signal, so
+      // the honest path was unavailable and inventing a description became the
+      // likely one — and that invention gets stored and retrieved as memory.
+      const media = message.media.map((item) =>
+        item.kind === 'image' && !item.description
+          ? { ...item, description: '图片识别未开启，无法看到画面内容' }
+          : item,
+      );
+      if (media.some((m, i) => m.description !== message.media[i]!.description))
+        this.store.updateMedia(message.peer_id, message.id, media);
+      return [];
+    }
     const images: string[] = [],
       media = [...message.media];
     let changed = false;

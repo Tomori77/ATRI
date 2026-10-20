@@ -5,6 +5,7 @@ import { Runtime, TavilyWeb } from '@atri/core';
 import { MOOD_PRESETS } from '@atri/core';
 import { Settings } from './config.js';
 import { Stickers } from './stickers.js';
+import { Sandbox } from './sandbox.js';
 import { WeChatBridge } from './wechat.js';
 import { createServer } from './server.js';
 
@@ -15,6 +16,18 @@ const settings = new Settings(store, root);
 const stickers = new Stickers(root, dataDir, store);
 const bridge = new WeChatBridge(store, settings, stickers, (message) => console.warn(message));
 const embeddings = new EmbeddingClient(() => settings.embedding());
+// The sandbox lives outside DATA_DIR on purpose: nsjail hides the app's data
+// directory behind an empty tmpfs, and the working directory has to survive that.
+const sandbox = new Sandbox(resolve(dataDir, '..', 'sandbox'), {
+  enabled: () => settings.config().sandboxEnabled,
+  network: () => settings.config().sandboxNetwork,
+  sizeLimitBytes: () => settings.config().sandboxSizeMb * 1024 * 1024,
+  // Address space cap only; nsjail needs no cgroup access for rlimits, and a
+  // cgroup-backed limit would require --cgroupns=host on the host, which would
+  // break the "just docker compose up" promise. 0 = unlimited.
+  memoryLimitMb: () => settings.config().sandboxMemoryMb,
+  timeZone: () => settings.config().timeZone,
+});
 /** The runtime treats `enabled` as a hard off switch, separate from creds. */
 const embedder = {
   get configured() {
@@ -45,13 +58,18 @@ const runtime = new Runtime({
   transport: bridge,
   log: (message, details) => console.warn(message, details),
   embedder,
+  sandbox,
   embedQuery: async (query) => {
     if (!settings.embeddingEnabled()) return undefined;
     const [vector] = await embeddings.embed([query]);
     return vector && vector.some((v) => v !== 0) ? vector : undefined;
   },
+  embeddingModel: () => settings.embedding().model,
 });
-const app = createServer({ store, settings, stickers, bridge, runtime });
+const app = createServer({ store, settings, stickers, bridge, runtime, sandbox });
+// The 试聊 preview peer must exist before the admin UI lists contacts, so the
+// contacts GET stays write-free.
+store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
@@ -59,6 +77,7 @@ async function shutdown() {
   bridge.stop();
   await runtime.stop();
   await app.close();
+  sandbox.dispose();
   store.close();
   process.exit(0);
 }

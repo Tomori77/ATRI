@@ -103,6 +103,8 @@ services:
   atri:
     image: ghcr.io/cy-2-u/atri:latest
     restart: unless-stopped
+    # 沙箱（nsjail）需要在容器内建挂载树，必须 privileged。
+    privileged: true
     env_file: .env
     environment:
       DATA_DIR: /data
@@ -112,8 +114,11 @@ services:
       - '127.0.0.1:3000:3000'
     volumes:
       - atri-data:/data
+      # 沙箱目录独立成卷：nsjail 会把 /data 遮蔽成空 tmpfs。
+      - atri-sandbox:/sandbox
 volumes:
   atri-data:
+  atri-sandbox:
 ```
 
 ## 来源与许可

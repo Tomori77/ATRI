@@ -94,13 +94,6 @@
           </svg>
           <span>表情</span>
         </button>
-        <button class="nav-item" id="tab-sticker-stats" role="tab" data-tab="sticker-stats" aria-selected="false">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M3 3v18h18" />
-            <path d="M7 15v3m5-9v9m5-13v13" />
-          </svg>
-          <span>表情统计</span>
-        </button>
         <button class="nav-item" id="tab-settings" role="tab" data-tab="settings" aria-selected="false">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3" />
@@ -124,7 +117,8 @@
               </div>
               <div id="chat-badges" class="badge-row"></div>
             </header>
-            <div id="messages" class="messages" aria-live="polite"></div>
+            <div id="messages" class="messages"></div>
+            <div id="messages-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
             <form id="chat-form" class="composer" hidden>
               <textarea id="chat-input" rows="1" maxlength="4000" placeholder="说点什么……"></textarea>
               <button class="btn primary send" type="submit" aria-label="发送">
@@ -147,17 +141,17 @@
             <button class="btn ghost" id="write-diary" type="button">整理今天的日记</button>
           </div>
           <div class="subtabs" role="tablist" aria-label="记录分类">
-            <button class="subtab selected" data-sub="diaries" aria-selected="true">日记</button>
-            <button class="subtab" data-sub="memories" aria-selected="false">记忆</button>
-            <button class="subtab" data-sub="loops" aria-selected="false">惦记的事</button>
+            <button class="subtab selected" role="tab" id="subtab-diaries" aria-selected="true" aria-controls="journal-diaries-wrap" data-sub="diaries">日记</button>
+            <button class="subtab" role="tab" id="subtab-memories" aria-selected="false" aria-controls="journal-memories-wrap" data-sub="memories">记忆</button>
+            <button class="subtab" role="tab" id="subtab-loops" aria-selected="false" aria-controls="journal-loops-wrap" data-sub="loops">惦记的事</button>
           </div>
-          <div class="stack" id="journal-diaries-wrap">
+          <div class="stack" id="journal-diaries-wrap" role="tabpanel" aria-labelledby="subtab-diaries">
             <div id="diaries" class="journal-list"></div>
           </div>
-          <div class="stack" id="journal-memories-wrap" hidden>
+          <div class="stack" id="journal-memories-wrap" role="tabpanel" aria-labelledby="subtab-memories" hidden>
             <div id="memories" class="journal-list"></div>
           </div>
-          <div class="stack" id="journal-loops-wrap" hidden>
+          <div class="stack" id="journal-loops-wrap" role="tabpanel" aria-labelledby="subtab-loops" hidden>
             <div id="loops" class="journal-list"></div>
           </div>
         </section>
@@ -227,42 +221,22 @@
                 <input id="sticker-file" type="file" accept="image/*" required />
               </label>
             </div>
-            <div class="actions end">
+            <div class="actions">
               <button class="btn primary" type="submit">加入目录</button>
             </div>
           </form>
-          <section class="card">
-            <h2>情绪库</h2>
-            <p class="hint">表情按情绪与强度（1-4 档）归类，模型先选情绪再选强度。未归类的表情进入「其他」。</p>
-            <div id="mood-list" class="chip-list"></div>
-            <form id="mood-form" class="actions">
-              <input id="mood-name" maxlength="20" required placeholder="新情绪名称，例如：吃醋" />
-              <button class="btn ghost" type="submit">添加情绪</button>
-            </form>
-          </section>
-          <section class="card">
-            <h2>表情归类与强度</h2>
-            <p class="hint">点开一张表情，勾选所属情绪并选择强度档位（1 轻度 → 4 强烈），可同时属于多个情绪。</p>
-            <div id="sticker-intensity-list" class="intensity-grid"></div>
-          </section>
           <div id="sticker-list" class="sticker-grid"></div>
         </section>
 
-        <section class="view" data-panel="sticker-stats" role="tabpanel" aria-labelledby="tab-sticker-stats">
-          <div class="section-head">
-            <div>
-              <h1>表情统计</h1>
-              <p>按联系人统计每张表情的发送次数，模型提示词会优先展示低频表情。</p>
-            </div>
-          </div>
-          <div id="sticker-usage" class="stack-tight"></div>
-        </section>
-
         <section class="view" data-panel="settings" role="tabpanel" aria-labelledby="tab-settings">
-          <form id="settings-form" class="settings-layout-page">
-            <div class="settings-stack">
+          <form id="settings-form" class="settings-columns">
+            <div class="settings-statusbar">
+              <span>设置</span>
+              <span id="settings-status-text" class="hint"></span>
+            </div>
+            <div class="settings-col">
             <section class="card">
-              <h2 class="settings-head-row"><span>模型服务</span><span class="settings-head-actions"><button class="btn primary" type="submit">保存全部设置</button><span id="settings-saved" class="hint"></span></span></h2>
+              <h2>模型服务</h2>
               <div class="grid-2">
                 <div class="field">
                   <span>接口格式</span>
@@ -302,7 +276,7 @@
                 <input id="vision" type="checkbox" />
                 <span>允许她看懂图片消息</span>
               </label>
-              <div class="actions end">
+              <div class="actions">
                 <button class="btn ghost" id="test-llm" type="button">测试模型连通</button>
               </div>
             </section>
@@ -313,6 +287,7 @@
                 <input id="embeddingEnabled" type="checkbox" />
                 <span>启用向量记忆检索</span>
               </label>
+              <p id="embedding-notice" class="hint alert-text" hidden></p>
               <div class="grid-2">
                 <label class="field">
                   <span>向量模型</span>
@@ -330,8 +305,34 @@
                 </label>
                 <button class="btn ghost" id="clear-embedding-key" type="button">清除</button>
               </div>
-              <div class="actions end">
+              <div class="actions">
                 <button class="btn ghost" id="test-embedding" type="button">测试向量连通</button>
+              </div>
+            </section>
+
+            <section class="card">
+              <h2>沙箱</h2>
+              <label class="check">
+                <input id="sandboxEnabled" type="checkbox" />
+                <span>允许她在沙箱里运行命令和读写文件</span>
+              </label>
+              <label class="check">
+                <input id="sandboxNetwork" type="checkbox" />
+                <span>允许沙箱联网（装包、拉数据）</span>
+              </label>
+              <label class="field">
+                <span>沙箱大小上限（MB，0 表示不限制）</span>
+                <input id="sandboxSizeMb" type="number" min="0" max="102400" step="64" required />
+              </label>
+              <label class="field">
+                <span>单条命令内存上限（MB，0 表示不限制）</span>
+                <input id="sandboxMemoryMb" type="number" min="0" max="262144" step="128" required />
+              </label>
+              <div id="sandbox-status" class="chip-row" role="status"></div>
+              <p id="sandbox-note" class="hint sandbox-note" hidden></p>
+              <div class="actions sandbox-actions">
+                <button class="btn ghost" id="refresh-sandbox" type="button">刷新状态</button>
+                <button class="btn ghost danger" id="clear-sandbox" type="button">清空沙箱目录</button>
               </div>
             </section>
 
@@ -348,15 +349,15 @@
                 </label>
                 <label class="field">
                   <span>沉默多久后可主动（小时）</span>
-                  <input id="proactiveAfterHours" type="number" min="1" max="720" step="1" required />
+                  <input id="proactiveAfterHours" type="number" min="1" max="168" step="1" required />
                 </label>
                 <label class="field">
                   <span>同时最多处理的联系人</span>
-                  <input id="maxConcurrentPeers" type="number" min="1" max="20" step="1" required />
+                  <input id="maxConcurrentPeers" type="number" min="1" max="12" step="1" required />
                 </label>
                 <label class="field">
                   <span>合并输入的等待（毫秒）</span>
-                  <input id="debounceMs" type="number" min="0" max="60000" step="100" required />
+                  <input id="debounceMs" type="number" min="0" max="10000" step="100" required />
                 </label>
                 <label class="field">
                   <span>写日记时刻（0–23 点）</span>
@@ -378,15 +379,15 @@
               <div class="grid-3">
                 <label class="field">
                   <span>上下文窗口（token）</span>
-                  <input id="contextWindowTokens" type="number" min="8192" step="1024" required />
+                  <input id="contextWindowTokens" type="number" min="8192" required />
                 </label>
                 <label class="field">
                   <span>输入预算（token）</span>
-                  <input id="inputBudgetTokens" type="number" min="512" step="512" required />
+                  <input id="inputBudgetTokens" type="number" min="512" required />
                 </label>
                 <label class="field">
                   <span>输出上限（token）</span>
-                  <input id="maxOutputTokens" type="number" min="512" step="256" required />
+                  <input id="maxOutputTokens" type="number" min="256" required />
                 </label>
               </div>
               <div class="budget-card">
@@ -401,11 +402,11 @@
               <div class="grid-2">
                 <label class="field">
                   <span>单次请求超时（秒）</span>
-                  <input id="requestTimeoutSeconds" type="number" min="10" max="600" step="1" required />
+                  <input id="requestTimeoutSeconds" type="number" min="10" max="300" step="1" required />
                 </label>
                 <label class="field">
                   <span>整轮处理超时（秒）</span>
-                  <input id="turnTimeoutSeconds" type="number" min="10" max="3600" step="1" required />
+                  <input id="turnTimeoutSeconds" type="number" min="10" max="600" step="1" required />
                 </label>
               </div>
             </section>
@@ -414,17 +415,23 @@
               <h2>维护</h2>
               <div class="actions">
                 <button class="btn ghost" id="backup" type="button">立即备份数据库</button>
+                <span id="settings-saved" class="hint"></span>
               </div>
             </section>
             </div>
-              <aside class="settings-aside">
-                <section class="card">
-                  <h2>模型用量</h2>
-                  <div id="usage" class="usage-grid"></div>
-                  <h3>近期调用</h3>
-                  <div id="recent-usage" class="recent-list"></div>
-                </section>
-              </aside>
+
+            <div class="settings-col">
+            <section class="card">
+              <h2>模型用量</h2>
+              <div id="usage" class="usage-grid"></div>
+              <h3>近期调用</h3>
+              <div id="recent-usage" class="recent-list"></div>
+            </section>
+            </div>
+
+            <div class="actions settings-submit">
+              <button class="btn primary" type="submit">保存全部设置</button>
+            </div>
           </form>
         </section>
       </main>
@@ -475,7 +482,7 @@
       </div>
     </div>
 
-    <div id="notice" class="toast" role="status" hidden></div>
+    <div id="notice" class="toast" role="alert" hidden></div>
     <script src="/app.js"></script>
   </body>
 </html>

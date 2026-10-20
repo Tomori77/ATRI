@@ -12,6 +12,7 @@ import { sniffMediaMime } from '@atri/ilink';
 import type { Settings } from './config.js';
 import { PERSONA_PRESETS } from './config.js';
 import type { Stickers } from './stickers.js';
+import type { Sandbox } from './sandbox.js';
 import type { WeChatBridge } from './wechat.js';
 
 export interface ServerOptions {
@@ -20,11 +21,21 @@ export interface ServerOptions {
   runtime: Runtime;
   bridge: WeChatBridge;
   stickers: Stickers;
+  sandbox?: Sandbox;
 }
 const digest = (v: string) => createHash('sha256').update(v).digest();
+/** Short stable digest for building task dedupe keys. */
+const hashGreeting = (v: string) => createHash('sha256').update(v).digest('hex').slice(0, 12);
 const text = (v: unknown, max = 12000) => {
   if (typeof v !== 'string' || !v.trim() || v.length > max)
     throw new Error(`文本需要 1–${max} 个字符`);
+  return v.trim();
+};
+/** Same as text() but accepts '' — for optional fields where clearing the value
+ *  is a real intention ("no opening line"). */
+const optionalText = (v: unknown, max = 12000) => {
+  if (typeof v !== 'string' || v.length > max)
+    throw new Error(`文本需要在 ${max} 个字符以内`);
   return v.trim();
 };
 export function createServer(o: ServerOptions) {
@@ -75,8 +86,10 @@ export function createServer(o: ServerOptions) {
   });
   app.setErrorHandler((error, request, reply) => {
     const e = error as Error & { statusCode?: number };
+    // 业务校验抛的是普通 Error，约定回 400；框架自身错误（解析失败、404）
+    // 自带 statusCode 会原样透传，不会被这里覆盖。
     reply
-      .code(e.statusCode && e.statusCode >= 400 && e.statusCode < 500 ? e.statusCode : 400)
+      .code(e.statusCode && e.statusCode >= 400 && e.statusCode < 600 ? e.statusCode : 400)
       .send({ error: e.message.slice(0, 300) });
   });
   app.get('/healthz', () => ({ ok: true }));
@@ -152,23 +165,25 @@ export function createServer(o: ServerOptions) {
       issues: o.store.issues(),
       // Read-only view of "how is she doing": mood, next proactive window,
       // loops waiting. Previously this data was invisible in the admin UI.
-      states: (() => {
-        const vectors = o.store.embeddingStatus().count;
-        return o.store.peers().map((peer) => {
-          const mood = o.store.mood(peer.id);
-          const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
-          return {
-            peerId: peer.id,
-            address: peer.address,
-            approved: !!peer.approved,
-            mood: mood.at ? mood : undefined,
-            dueLoops: dueLoops.length,
-            lastUserAt: peer.last_user_at,
-            lastProactiveAt: peer.last_proactive_at,
-            vectors,
-          };
-        });
-      })(),
+      // `vectors` used to be computed here with a GROUP BY over the whole
+      // embeddings table on every poll (the UI polls /api/status every 2.5 s)
+      // and was never rendered; the vector count lives on /api/sandbox-adjacent
+      // debug endpoints instead.
+      states: o.store.peers().map((peer) => {
+        const mood = o.store.mood(peer.id);
+        const dueLoops = o.store.dueOpenLoops(peer.id, Date.now());
+        return {
+          peerId: peer.id,
+          address: peer.address,
+          approved: !!peer.approved,
+          mood: mood.at ? mood : undefined,
+          dueLoops: dueLoops.length,
+          // Drives "她多久没来了" in the UI, which is the one field here the
+          // operator actually needs to judge whether a peer is still alive.
+          lastUserAt: peer.last_user_at,
+          lastProactiveAt: peer.last_proactive_at,
+        };
+      }),
     };
   });
   app.post('/api/wechat/login', () => o.bridge.login());
@@ -188,6 +203,24 @@ export function createServer(o: ServerOptions) {
   app.put<{ Body: Record<string, unknown> }>('/api/config', (request) =>
     o.settings.update(request.body),
   );
+  // Sandbox status for the settings page: enabled flag, what the directory
+  // currently holds, and what isolation this host actually provides.
+  app.get('/api/sandbox', async () => {
+    const sandbox = o.sandbox;
+    return {
+      enabled: Boolean(sandbox?.enabled),
+      root: sandbox ? sandbox.root : '',
+      usage: sandbox ? sandbox.usage() : { files: 0, bytes: 0 },
+      sizeLimitBytes: sandbox ? sandbox.sizeLimit : 0,
+      memoryLimitMb: o.settings.config().sandboxMemoryMb,
+      isolation: sandbox ? await sandbox.isolationInfo() : undefined,
+    };
+  });
+  app.post('/api/sandbox/clear', () => {
+    if (!o.sandbox) throw new Error('沙箱未配置');
+    o.sandbox.clear();
+    return { ok: true };
+  });
   app.get('/api/persona', () => ({ content: o.settings.personaPrompt() }));
   app.put<{ Body: { content: string } }>('/api/persona', (request) => {
     o.settings.savePersona(text(request.body.content));
@@ -200,9 +233,10 @@ export function createServer(o: ServerOptions) {
     );
     return { list, defaultId, bindings };
   });
-  app.get('/api/persona-presets', () =>
-    PERSONA_PRESETS.map(({ id, name, description }) => ({ id, name, description })),
-  );
+  // `content` is included on purpose: the create form builds the new persona
+  // straight from the chosen preset, and without the text every template
+  // silently produced the placeholder.
+  app.get('/api/persona-presets', () => PERSONA_PRESETS);
   app.post<{ Body: { name: string; content: string } }>('/api/personas', (request) =>
     o.settings.personaCreate(text(request.body.name, 40), text(request.body.content)),
   );
@@ -215,7 +249,9 @@ export function createServer(o: ServerOptions) {
       return o.settings.personaUpdate(request.params.id, {
         ...(input.name !== undefined ? { name: text(input.name, 40) } : {}),
         ...(input.content !== undefined ? { content: text(input.content) } : {}),
-        ...(input.greeting !== undefined ? { greeting: text(input.greeting, 200) } : {}),
+        // Empty is a meaningful value here — "no opening line" — so this uses
+        // the permissive sanitiser rather than text(), which rejects ''.
+        ...(input.greeting !== undefined ? { greeting: optionalText(input.greeting, 200) } : {}),
       });
     },
   );
@@ -306,22 +342,32 @@ export function createServer(o: ServerOptions) {
       model: e.model,
     };
   });
-  app.get('/api/peers', () => {
-    // 试聊 uses the preview peer, so it must exist for persona binding even
-    // before the first message.
-    o.store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
-    return o.store.peers().map(({ context_token, ...peer }) => peer);
-  });
+  app.get('/api/peers', () =>
+    // ensurePeer once at startup instead of on every GET: a read endpoint that
+    // writes on each call also gave DNS-rebinding probes a free DB write.
+    o.store.peers().map(({ context_token, ...peer }) => peer),
+  );
   app.put<{ Params: { id: string }; Body: { approved: boolean } }>('/api/peers/:id', (request) => {
     if (typeof request.body.approved !== 'boolean' || !o.store.peer(request.params.id))
       throw new Error('联系人或设置无效');
     const peer = o.store.peer(request.params.id)!;
     o.store.approve(request.params.id, request.body.approved);
-    // First approval of a real contact: queue a one-shot greeting proactive
-    // task. The dedupe key makes it fire at most once per peer, ever.
+    // First approval of a real contact: queue a one-shot greeting task. An empty
+    // greeting means the operator asked for no opener, so nothing is enqueued.
+    // The version-qualified dedupe key lets a later re-approval send the updated
+    // greeting: the previous key's task is already `done`, and enqueue only
+    // revives failed/superseded/interrupted rows, so reusing "greeting" froze
+    // every new opener behind the finished task.
     if (request.body.approved && !peer.approved && peer.channel === 'wechat') {
       const greeting = o.settings.personaGreetingFor(peer.id);
-      o.store.enqueue(peer.id, 'proactive', 'greeting', { greeting }, Date.now());
+      if (greeting.trim())
+        o.store.enqueue(
+          peer.id,
+          'proactive',
+          `greeting:${peer.version}:${hashGreeting(greeting)}`,
+          { greeting },
+          Date.now(),
+        );
     }
     o.runtime.pump();
     return { ok: true };
@@ -380,7 +426,12 @@ export function createServer(o: ServerOptions) {
     '/api/peers/:peer/loops/:id/resolve',
     (request) => {
       if (!o.store.peer(request.params.peer)) throw new Error('联系人不存在');
-      o.store.resolveOpenLoop(request.params.peer, request.params.id);
+      o.store.resolveOpenLoop(
+        request.params.peer,
+        request.params.id,
+        Date.now(),
+        o.settings.config().timeZone,
+      );
       return { ok: true };
     },
   );
@@ -391,6 +442,8 @@ export function createServer(o: ServerOptions) {
       return { ok: true };
     },
   );
+  // 试聊 uses the preview peer; created once at startup so GET /api/peers
+  // never needs to write, and re-ensured here (cheap upsert) before a chat.
   app.post<{ Body: { content: string; eventId?: string } }>('/api/chat', (request, reply) => {
     const peer = o.store.ensurePeer('preview:default', 'preview', '本地试聊', '', true);
     const event = o.runtime.accept(
@@ -413,26 +466,49 @@ export function createServer(o: ServerOptions) {
     o.runtime.pump();
     return { ok: true };
   });
+  app.post<{ Params: { id: string } }>('/api/tasks/:id/dismiss', (request) => {
+    // Without this a task that exhausted its retries sat in issues() until
+    // pruneTasks aged it out, which kept the admin bell permanently non-zero.
+    // An operator who has read the error and decided it needs no action must be
+    // able to clear it — otherwise they learn to ignore the bell, and a real
+    // delivery failure scrolls past unnoticed.
+    const task = o.store.taskById(request.params.id);
+    if (!task || task.state !== 'failed') throw new Error('只有失败任务可以忽略');
+    o.store.finish(task.id, 'done');
+    o.runtime.pump();
+    return { ok: true };
+  });
   app.post<{ Params: { id: string }; Body: { action: string } }>(
     '/api/deliveries/:id',
     (request) => {
-      const issue = o.store.issues().deliveries.find((d) => d.id === request.params.id);
-      if (!issue) throw new Error('待处理的发送记录不存在');
+      // Look the delivery up directly: issues() caps at 100 rows, so anything
+      // older was reported as "不存在" exactly when it was blocking a peer.
+      if (
+        !['confirmed', 'retry', 'skip'].includes(String(request.body?.action)) ||
+        !o.store.deliveryById(request.params.id)
+      )
+        throw new Error('待处理的发送记录不存在');
       const status =
         request.body.action === 'confirmed'
           ? 'sent'
           : request.body.action === 'retry'
             ? 'pending'
-            : request.body.action === 'skip'
-              ? 'cancelled'
-              : null;
-      if (!status) throw new Error('处理方式无效');
+            : 'cancelled';
       o.store.markDelivery(request.params.id, status);
       o.runtime.pump();
       return { ok: true };
     },
   );
-  app.get('/api/stickers', () => o.stickers.list(true).map(({ file, ...s }) => s));
+  app.get('/api/stickers', () => {
+    // `custom` lets the UI offer the right verb: an upload can be deleted, a
+    // bundled sticker can only be switched off.
+    const custom = new Set(
+      o.store.getSetting<{ slug: string }[]>('stickers:custom', []).map((s) => s.slug),
+    );
+    return o.stickers
+      .list(true)
+      .map(({ file, ...s }) => ({ ...s, custom: custom.has(s.slug) }));
+  });
   app.get<{ Params: { slug: string } }>('/api/stickers/:slug/image', (request, reply) => {
     const bytes = o.stickers.bytes(request.params.slug);
     return reply
@@ -456,7 +532,15 @@ export function createServer(o: ServerOptions) {
     },
   );
   app.delete<{ Params: { slug: string } }>('/api/stickers/:slug', (request) => {
+    // DELETE has always meant "stop using this one", and the card's button says
+    // 停用 — so it must stay reversible. Deleting an upload (row + file) is a
+    // separate, irreversible action with its own route so the two can never be
+    // confused by a label mismatch.
     o.stickers.disable(request.params.slug);
+    return { ok: true };
+  });
+  app.delete<{ Params: { slug: string } }>('/api/stickers/:slug/file', (request) => {
+    o.stickers.remove(request.params.slug);
     return { ok: true };
   });
   app.post<{ Params: { slug: string } }>('/api/stickers/:slug/enable', (request) => {

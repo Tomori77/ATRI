@@ -9,7 +9,7 @@ import {
   parseReply,
   type Sticker,
 } from '@atri/core';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 const stickers: Sticker[] = [
   { slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' },
@@ -144,12 +144,15 @@ test('表情目录按天轮换，窗口外的表情可达且近期用过的靠�
     file: 'x.png',
   }));
   const now = Date.now();
-  const day1 = rotateStickers(all, [], now);
-  const day2 = rotateStickers(all, [], now + 86400000);
-  assert.equal(day1.length, 32);
+  // The window is passed explicitly: this test is about the rotation
+  // mechanism, so it must not break every time PROMPT_STICKERS is retuned.
+  const window = 24;
+  const day1 = rotateStickers(all, [], now, window);
+  const day2 = rotateStickers(all, [], now + 86400000, window);
+  assert.equal(day1.length, window);
   assert.notDeepEqual(day1.map((s) => s.slug), day2.map((s) => s.slug), '隔天窗口不同');
   assert.ok(day1.every((s) => all.includes(s)));
-  const used = rotateStickers(all, [{ slug: 'cat000' }], now);
+  const used = rotateStickers(all, [{ slug: 'cat000' }], now, window);
   assert.ok(
     used.findIndex((s) => s.slug === 'cat000') > used.length / 2 ||
       !used.some((s) => s.slug === 'cat000'),

@@ -13,9 +13,20 @@ const numberSettings = [
   'proactiveAfterHours',
   'maxConcurrentPeers',
   'debounceMs',
+  'sandboxSizeMb',
+  'sandboxMemoryMb',
 ];
 const purposeName = (value) =>
-  ({ chat: '对话', diary: '日记', notes: '话题整理', proactive: '主动联系' })[value] || value;
+  ({
+    chat: '对话',
+    diary: '日记',
+    notes: '话题整理',
+    proactive: '主动联系',
+    chat_tool: '对话·工具查询',
+    diary_tool: '日记·工具查询',
+    notes_tool: '话题整理·工具查询',
+    proactive_tool: '主动联系·工具查询',
+  })[value] || value;
 const formatNumber = (value) => (Number.isFinite(value) ? value.toLocaleString('zh-CN') : '—');
 
 let authenticated = false,
@@ -30,7 +41,9 @@ let authenticated = false,
   noticeTimer,
   settingsVersion = 0,
   polling = false,
+  issuesSnapshot = '',
   chatSnapshot = '',
+  chatAnnouncedCount = 0,
   journalSnapshot = '',
   peersSnapshot = '',
   journalSub = 'diaries',
@@ -50,6 +63,19 @@ function el(tag, text, className) {
   return node;
 }
 
+/** Stable random id that also works outside a secure context.
+ *  `crypto.randomUUID` only exists on HTTPS or localhost, so opening the admin
+ *  page over a LAN address (ATRI_BIND=0.0.0.0, phone on the same network) made
+ *  "send" throw an unhelpful TypeError and the trial chat unusable. */
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function button(label, handler, classes = 'ghost small') {
   const node = el('button', label, 'btn ' + classes);
   node.type = 'button';
@@ -57,11 +83,16 @@ function button(label, handler, classes = 'ghost small') {
   return node;
 }
 
-async function perform(action, node) {
+async function perform(action, node, { rethrow = false } = {}) {
   try {
     if (node) node.disabled = true;
     await action();
   } catch (error) {
+    // Polling needs to see the failure to drive its own backoff; callers that
+    // want the toast keep the default. Swallowing unconditionally made the
+    // poller's own retry counter unreachable, so a server hiccup re-showed the
+    // error toast on every tick and the toast timer was reset forever.
+    if (rethrow) throw error;
     show(error.message, true);
   } finally {
     if (node) node.disabled = false;
@@ -107,6 +138,33 @@ function confirmButton(label, message, handler, classes = 'ghost small danger') 
     await handler();
   }, classes);
   return node;
+}
+
+/** Arm-to-confirm for a static button: replaces its onclick so the handler
+ *  only fires on the second tap (within 3s of the first). */
+function decorateConfirm(node, message) {
+  if (!node) return;
+  const label = node.textContent;
+  const inner = node.onclick;
+  node.onclick = (event) => {
+    if (node.dataset.armed === '1') {
+      node.dataset.armed = '';
+      node.textContent = label;
+      node.classList.remove('armed');
+      inner?.call(node, event);
+      return;
+    }
+    node.dataset.armed = '1';
+    node.textContent = message;
+    node.classList.add('armed');
+    setTimeout(() => {
+      if (node.dataset.armed === '1') {
+        node.dataset.armed = '';
+        node.textContent = label;
+        node.classList.remove('armed');
+      }
+    }, 3000);
+  };
 }
 
 const openDropdowns = new Set();
@@ -280,17 +338,57 @@ function dayLabel(ts) {
   );
 }
 
+let lastDrawerOpener = null;
 function openDrawer(id) {
+  lastDrawerOpener = document.activeElement;
   closeDrawers();
-  $(id).hidden = false;
   const backdrop = $(id);
+  backdrop.hidden = false;
   backdrop.onclick = (event) => {
-    if (event.target === backdrop) backdrop.hidden = true;
+    if (event.target === backdrop) dismissDrawer(backdrop);
   };
+  // Keyboard users used to land outside the dialog: focus its first control
+  // and keep Tab cycling inside while it is open.
+  const focusable = backdrop.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  );
+  (focusable[1] ?? focusable[0])?.focus();
 }
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Tab') return;
+  const open = ['drawer-connection', 'drawer-issues'].map((id) => $(id)).find((d) => !d.hidden);
+  if (!open) return;
+  const focusable = [...open.querySelectorAll('button, [href], input, select, textarea')].filter(
+    (n) => !n.disabled && n.offsetParent !== null,
+  );
+  if (!focusable.length) return;
+  const first = focusable[0],
+    last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
+// One dismiss path for every way a drawer can close. Backdrop clicks and the
+// close button used to set `hidden` directly, leaving lastDrawerOpener pointing
+// at a button inside a drawer that was already gone — so the next Escape press
+// anywhere in the app yanked focus back to that stale bell icon.
+function dismissDrawer(backdrop) {
+  if (!backdrop) return;
+  backdrop.hidden = true;
+  if (lastDrawerOpener?.isConnected) lastDrawerOpener.focus();
+  lastDrawerOpener = null;
+}
 function closeDrawers() {
-  for (const id of ['drawer-connection', 'drawer-issues']) $(id).hidden = true;
+  for (const id of ['drawer-connection', 'drawer-issues']) {
+    const backdrop = $(id);
+    if (!backdrop.hidden) dismissDrawer(backdrop);
+  }
+  lastDrawerOpener = null;
 }
 
 document.querySelectorAll('[data-drawer]').forEach((b) => {
@@ -301,11 +399,75 @@ document.querySelectorAll('[data-drawer]').forEach((b) => {
   };
 });
 document.querySelectorAll('[data-close]').forEach((b) => {
-  b.onclick = () => b.closest('.drawer-backdrop').hidden = true;
+  b.onclick = () => dismissDrawer(b.closest('.drawer-backdrop'));
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawers();
 });
+
+function renderIssues(state) {
+  const issues = $('issues');
+  issues.replaceChildren();
+  for (const task of state.issues.tasks) {
+    const row = el('div', undefined, 'card');
+    const actions = el('div', undefined, 'actions');
+    actions.append(
+      button('重试任务', async () => {
+        await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
+        issuesSnapshot = '';
+        await loadStatus();
+      }),
+      button(
+        '忽略',
+        async () => {
+          await api('/api/tasks/' + enc(task.id) + '/dismiss', 'POST');
+          issuesSnapshot = '';
+          await loadStatus();
+        },
+        'btn ghost',
+      ),
+    );
+    row.append(
+      el('p', task.address + ' · ' + task.kind + '：' + task.error, 'wrap'),
+      actions,
+    );
+    issues.append(row);
+  }
+  for (const delivery of state.issues.deliveries) {
+    const row = el('div', undefined, 'card');
+    row.append(
+      el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
+      el('p', delivery.content, 'wrap'),
+      el(
+        'p',
+        (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
+        'hint',
+      ),
+    );
+    const actions = el('div', undefined, 'actions');
+    for (const [label, action] of [
+      ['已在微信收到', 'confirmed'],
+      ['跳过', 'skip'],
+    ])
+      actions.append(
+        button(label, async () => {
+          await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
+          issuesSnapshot = '';
+          await loadStatus();
+        }),
+      );
+    // Two-step resend: first tap explains and arms, second tap actually
+    // requeues — the old button was a dead end that only showed a hint.
+    actions.append(confirmButton('重新发送', '确认重发？', async () => {
+      await api('/api/deliveries/' + enc(delivery.id), 'POST', { action: 'retry' });
+      issuesSnapshot = '';
+      await loadStatus();
+    }));
+    row.append(actions);
+    issues.append(row);
+  }
+  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。一切正常。');
+}
 
 async function loadStatus() {
   const state = await api('/api/status');
@@ -313,6 +475,12 @@ async function loadStatus() {
   const online = state.wechat.status === '已连接';
   $('connection-text').textContent = online ? '微信已连接' : '微信未连接';
   $('connection').classList.toggle('online', online);
+  // Primary action follows state: while connected, logout is the destructive
+  // primary and re-login recedes; disconnected, login is the way forward.
+  $('wechat-login').classList.toggle('primary', !online);
+  $('wechat-login').classList.toggle('ghost', online);
+  $('wechat-logout').classList.toggle('primary', online);
+  $('wechat-logout').classList.toggle('ghost', !online);
   $('wechat-state').textContent = state.wechat.status;
   $('wechat-error').textContent =
     state.wechat.error || (!state.config.hasApiKey ? '请先在「设置」里配置模型密钥。' : '');
@@ -329,51 +497,17 @@ async function loadStatus() {
   bell.textContent = issueCount > 99 ? '99+' : String(issueCount);
   bell.hidden = issueCount === 0;
 
-  const issues = $('issues');
-  issues.replaceChildren();
-  for (const task of state.issues.tasks) {
-    const row = el('div', undefined, 'card');
-    row.append(
-      el('p', task.address + ' · ' + task.kind + '：' + task.error),
-      button('重试任务', async () => {
-        await api('/api/tasks/' + enc(task.id) + '/retry', 'POST');
-        await loadStatus();
-      }),
-    );
-    issues.append(row);
+  // Snapshot guard: the issues list re-rendered every 2.5s poll, so the button
+  // a user was aiming at vanished mid-click. Rebuild only when the serialized
+  // content actually changed (same pattern the chat/journal views use).
+  const issuesSignature = JSON.stringify([
+    state.issues.tasks.map((t) => [t.id, t.error]),
+    state.issues.deliveries.map((d) => [d.id, d.status, d.error]),
+  ]);
+  if (issuesSignature !== issuesSnapshot) {
+    issuesSnapshot = issuesSignature;
+    renderIssues(state);
   }
-  for (const delivery of state.issues.deliveries) {
-    const row = el('div', undefined, 'card');
-    row.append(
-      el('p', delivery.address + ' · ' + relTime(delivery.created_at), 'hint'),
-      el('p', delivery.content),
-      el(
-        'p',
-        (delivery.status === 'uncertain' ? '送达情况不明' : '发送失败') + '：' + delivery.error,
-        'hint',
-      ),
-    );
-    const actions = el('div', undefined, 'actions');
-    for (const [label, action] of [
-      ['已在微信收到', 'confirmed'],
-      ['重新发送', 'retry'],
-      ['跳过', 'skip'],
-    ])
-      actions.append(
-        button(label, async () => {
-          if (action === 'retry') {
-            show('请先确认微信里没有收到这条消息，再选择重新发送。', true);
-            return;
-          }
-          await api('/api/deliveries/' + enc(delivery.id), 'POST', { action });
-          await loadStatus();
-        }),
-      );
-    row.append(actions);
-    issues.append(row);
-  }
-  if (!issues.childNodes.length) empty(issues, '目前没有需要处理的任务。一切正常。');
-
   const stuckPeers = new Set(state.issues.deliveries.map((d) => d.peer_id));
   const states = $('peer-states');
   states.replaceChildren();
@@ -391,7 +525,9 @@ async function loadStatus() {
       if (peer.mood.energy <= -0.3) parts.push('有点累');
       else if (peer.mood.energy >= 0.3) parts.push('精力足');
       if (parts.length) badges.append(el('span', parts.join(' · '), 'badge'));
-      if (peer.mood.reason) badges.append(el('span', peer.mood.reason, 'badge'));
+      // Only show the cause while the state it describes still holds; a carried
+      // -over reason used to print "心情不错 · 对方提到了不开心的事".
+      if (peer.mood.reason && parts.length) badges.append(el('span', peer.mood.reason, 'badge'));
     }
     if (peer.dueLoops) badges.append(el('span', '惦记 ' + peer.dueLoops + ' 件事', 'badge'));
     if (peer.lastProactiveAt)
@@ -477,31 +613,36 @@ async function loadPeers() {
   target.replaceChildren();
   if (!wechatPeers.length) empty(target, '扫码登录后，让朋友发来第一条微信消息。');
   for (const peer of wechatPeers) {
-    const row = el('div', undefined, 'row'),
-      heading = el('div', undefined, 'row-title');
+    const row = el('div', undefined, 'row peer-row'),
+      // ID on its own line (it wraps), status badge + toggle below: mixing a
+      // 40-char opaque ID with buttons in one flex row is what stretched the
+      // card sideways.
+      heading = el('div', undefined, 'row-title peer-name');
     heading.append(
       el('span', peer.address),
       el('span', peer.approved ? '回复中' : '未允许', 'badge'),
-      button(peer.approved ? '暂停回复' : '允许使用', async () => {
-        await api('/api/peers/' + enc(peer.id), 'PUT', { approved: !peer.approved });
-        await loadPeers();
-        await loadStatus();
-      }),
     );
-    if (peer.id !== 'preview:default')
-      heading.append(
-        confirmButton('删除', '确认删除？', async () => {
-          await api('/api/peers/' + enc(peer.id), 'DELETE');
-          await loadPeers();
-          await loadStatus();
-          show('联系人及其全部记录已删除。');
-        }),
-      );
-    row.append(heading, buildPersonaSelect(peer));
+    row.append(
+      heading,
+      // Pausing a peer silences her until re-approved; arm-to-confirm keeps a
+      // mis-tap next to the persona dropdown from doing that silently.
+      peer.approved
+        ? confirmButton('暂停回复', '确认暂停？', async () => {
+            await api('/api/peers/' + enc(peer.id), 'PUT', { approved: false });
+            await loadPeers();
+            await loadStatus();
+          })
+        : button('允许使用', async () => {
+            await api('/api/peers/' + enc(peer.id), 'PUT', { approved: true });
+            await loadPeers();
+            await loadStatus();
+          }),
+      buildPersonaSelect(peer),
+    );
     target.append(row);
   }
   if (previewPeer) {
-    const row = el('div', undefined, 'row'),
+    const row = el('div', undefined, 'row peer-row'),
       heading = el('div', undefined, 'row-title');
     heading.append(el('span', '本地试聊'));
     row.append(heading, buildPersonaSelect(previewPeer));
@@ -535,6 +676,9 @@ function renderChatPeerList(previewPeer) {
       if (currentPeer === item.id) return;
       currentPeer = item.id;
       chatSnapshot = '';
+      // Reset the announce cursor too: carrying the previous contact's message
+      // count over would anounce a slice of the wrong conversation.
+      chatAnnouncedCount = 0;
       waitingReply = false;
       renderChatPeerList(previewPeer);
       perform(loadChat);
@@ -624,6 +768,10 @@ async function loadChat() {
   chatSnapshot = snapshot;
   const container = $('messages');
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+  // Announce only what is new. #messages used to carry aria-live itself, and
+  // this function rebuilds the whole list on every 2.5s poll — so one new reply
+  // made a screen reader re-read the entire conversation from the top.
+  const announced = chatAnnouncedCount;
   container.replaceChildren();
   if (!history.length) empty(container, '这里还没有对话。发条消息，或等她先开口。');
   let lastDay = '';
@@ -645,12 +793,32 @@ async function loadChat() {
     const del = el('button', '删除', 'bubble-del');
     del.type = 'button';
     del.setAttribute('aria-label', '删除这条消息');
-    del.onclick = () =>
-      perform(async () => {
+    // Arm-to-confirm, same as every other destructive action on the page. On
+    // touch the button is always visible (hover is unavailable), so a single
+    // stray tap permanently deleted a message with no way back.
+    let armed = false;
+    let armTimer = 0;
+    del.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        del.textContent = '确认删除？';
+        del.classList.add('armed');
+        armTimer = window.setTimeout(() => {
+          if (!del.isConnected) return;
+          armed = false;
+          del.textContent = '删除';
+          del.classList.remove('armed');
+        }, 3000);
+        return;
+      }
+      window.clearTimeout(armTimer);
+      armed = false;
+      await perform(async () => {
         await api('/api/peers/' + enc(peer) + '/records/' + enc(message.id), 'DELETE');
         chatSnapshot = '';
         await loadChat();
       }, del);
+    };
     meta.append(del);
     const bubble = el('div', undefined, 'bubble');
     bubble.append(renderMessageContent(message.content));
@@ -659,19 +827,29 @@ async function loadChat() {
       if (media.description) msg.append(el('p', '图片：' + media.description, 'media-note'));
     container.append(msg);
   }
+  // Compare against the PREVIOUS baseline first: assigning it before the test
+  // made the condition permanently false, so the indicator never cleared even
+  // after her reply had been rendered.
+  if (waitingReply && assistantCount > waitingBaseline) waitingReply = false;
   waitingBaseline = assistantCount;
   if (waitingReply) {
-    if (assistantCount > waitingBaseline) {
-      waitingReply = false;
-    } else {
-      const typing = el('div', undefined, 'typing');
-      const dots = el('span', undefined, 'typing-dots');
-      dots.append(el('i'), el('i'), el('i'));
-      typing.append(dots, '她正在输入……');
-      container.append(typing);
-    }
+    const typing = el('div', undefined, 'typing');
+    const dots = el('span', undefined, 'typing-dots');
+    dots.append(el('i'), el('i'), el('i'));
+    typing.append(dots, '她正在输入……');
+    container.append(typing);
   }
   if (nearBottom) container.scrollTop = container.scrollHeight;
+  // Push just the tail into the live region.
+  const live = $('messages-live');
+  if (live) {
+    const fresh = history.slice(announced);
+    live.textContent = fresh
+      .filter((m) => m.role === 'assistant')
+      .map((m) => m.content)
+      .join(' ');
+    chatAnnouncedCount = history.length;
+  }
   const isPreview = peer === 'preview:default';
   $('chat-form').hidden = !isPreview;
   $('chat-title').textContent = peers.find((p) => p.id === peer)?.address || (isPreview ? '本地试聊' : peer);
@@ -700,7 +878,7 @@ $('chat-form').onsubmit = (event) => {
   perform(async () => {
     const result = await api('/api/chat', 'POST', {
       content,
-      eventId: crypto.randomUUID(),
+      eventId: uuid(),
     });
     lastTask = result.taskId;
     waitingReply = true;
@@ -967,6 +1145,8 @@ $('persona-form').onsubmit = (event) => {
   event.preventDefault();
   perform(async () => {
     if (!personaSelected) throw new Error('请先选择要编辑的人格');
+    // "留空则不发送开场白" is the documented behaviour, and a new persona starts
+    // with an empty greeting — so the field must be sendable as ''.
     await api('/api/personas/' + enc(personaSelected), 'PUT', {
       name: $('persona-name').value,
       content: $('persona-content').value,
@@ -978,13 +1158,7 @@ $('persona-form').onsubmit = (event) => {
 };
 
 async function loadStickers() {
-  const [stickers, moodData, usage] = await Promise.all([
-    refreshStickerMap(),
-    api('/api/sticker-moods'),
-    api('/api/sticker-usage'),
-  ]);
-  stickerMoodState = moodData;
-  stickerUsageState = usage;
+  const stickers = await refreshStickerMap();
   const container = $('sticker-list');
   container.replaceChildren();
   for (const sticker of stickers) {
@@ -997,177 +1171,33 @@ async function loadStickers() {
       img,
       el('strong', sticker.slug),
       el('p', sticker.description),
-      button(sticker.disabled ? '启用' : '停用', async () => {
-        await api(
-          '/api/stickers/' + enc(sticker.slug) + (sticker.disabled ? '/enable' : ''),
-          sticker.disabled ? 'POST' : 'DELETE',
-        );
-        await loadStickers();
-      }),
+      button(
+        sticker.disabled ? '启用' : '停用',
+        async () => {
+          await api(
+            '/api/stickers/' + enc(sticker.slug) + (sticker.disabled ? '/enable' : ''),
+            sticker.disabled ? 'POST' : 'DELETE',
+          );
+          await loadStickers();
+        },
+        'btn ghost small',
+      ),
+      // Deleting an upload removes the file for good, so it gets its own verb
+      // and its own confirmation instead of hiding behind 停用. Bundled stickers
+      // ship with the repo and have no delete affordance at all.
+      ...(sticker.custom
+        ? [
+            confirmButton('删除', '确认删除？', async () => {
+              await api('/api/stickers/' + enc(sticker.slug) + '/file', 'DELETE');
+              await loadStickers();
+            }),
+          ]
+        : []),
     );
     container.append(card);
   }
   if (!stickers.length) empty(container, '目录还是空的。上传一张图片，教她认识第一个表情。');
-  renderMoodList();
-  renderStickerIntensityList(stickers);
-  renderStickerUsage();
 }
-let stickerMoodState = { presets: [], custom: [] },
-  stickerUsageState = {};
-function allMoods() {
-  return [...stickerMoodState.presets, ...stickerMoodState.custom];
-}
-function renderMoodList() {
-  const target = $('mood-list');
-  target.replaceChildren();
-  for (const mood of allMoods()) {
-    const chip = el('span', undefined, 'chip');
-    chip.append(el('span', mood.name));
-    if (stickerMoodState.custom.some((m) => m.id === mood.id)) {
-      const remove = el('button', '×', 'chip-remove');
-      remove.type = 'button';
-      remove.setAttribute('aria-label', '删除情绪 ' + mood.name);
-      remove.onclick = () =>
-        perform(async () => {
-          await api('/api/sticker-moods/' + enc(mood.id), 'DELETE');
-          await loadStickers();
-        }, remove);
-      chip.append(remove);
-    }
-    target.append(chip);
-  }
-  if (!allMoods().length) empty(target, '还没有情绪。');
-}
-function renderStickerIntensityList(stickers) {
-  const target = $('sticker-intensity-list');
-  target.replaceChildren();
-  const moods = allMoods();
-  if (!moods.length) {
-    empty(target, '先添加情绪，再为表情归类。');
-    return;
-  }
-  const levelNames = [[1, '轻度'], [2, '中度'], [3, '较强'], [4, '强烈']];
-  for (const sticker of stickers) {
-    const card = el('article', undefined, 'intensity-card');
-    const img = document.createElement('img');
-    img.src = '/api/stickers/' + enc(sticker.slug) + '/image';
-    img.alt = sticker.description;
-    img.loading = 'lazy';
-    const toggle = el('button', undefined, 'intensity-toggle');
-    toggle.type = 'button';
-    toggle.setAttribute('aria-expanded', 'false');
-    toggle.append(
-      img,
-      el('strong', sticker.slug),
-      el('span', sticker.description, 'hint'),
-    );
-    const currentSummary = () =>
-      Object.entries(sticker.intensity ?? {})
-        .map(([id, lv]) => `${moods.find((m) => m.id === id)?.name ?? id}·${lv}`)
-        .join('、') || '未归类';
-    const summary = el('span', currentSummary(), 'hint');
-    toggle.append(summary);
-    const box = el('div', undefined, 'intensity-box');
-    box.hidden = true;
-    const rebuild = () => {
-      box.replaceChildren();
-      for (const mood of moods) {
-        const row = el('div', undefined, 'intensity-mood');
-        const check = document.createElement('input');
-        check.type = 'checkbox';
-        check.checked = (sticker.intensity?.[mood.id] ?? 0) > 0;
-        check.id = 'iv-' + sticker.slug + '-' + mood.id;
-        const level = document.createElement('select');
-        for (const [value, name] of levelNames) {
-          const option = el('option', name);
-          option.value = value;
-          level.append(option);
-        }
-        level.value = sticker.intensity?.[mood.id] || 2;
-        level.disabled = !check.checked;
-        check.onchange = () => {
-          level.disabled = !check.checked;
-        };
-        row.append(check, el('label', mood.name), level);
-        row.querySelector('label').htmlFor = check.id;
-        box.append(row);
-      }
-      const save = el('button', '保存归类', 'btn primary small');
-      save.type = 'button';
-      save.onclick = () =>
-        perform(async () => {
-          const intensity = {};
-          for (const moodRow of box.querySelectorAll('.intensity-mood')) {
-            const check = moodRow.querySelector('input[type=checkbox]');
-            const level = moodRow.querySelector('select');
-            const mood = moods[[...box.querySelectorAll('.intensity-mood')].indexOf(moodRow)];
-            if (check.checked) intensity[mood.id] = Number(level.value);
-          }
-          await api('/api/stickers/' + enc(sticker.slug) + '/intensity', 'PUT', { intensity });
-          sticker.intensity = Object.keys(intensity).length ? intensity : undefined;
-          summary.textContent = currentSummary();
-          box.hidden = true;
-          toggle.setAttribute('aria-expanded', 'false');
-          show('「' + sticker.slug + '」的归类已保存。');
-        }, save);
-      box.append(save);
-    };
-    toggle.onclick = () => {
-      box.hidden = !box.hidden;
-      toggle.setAttribute('aria-expanded', String(!box.hidden));
-      if (!box.hidden) rebuild();
-    };
-    card.append(toggle, box);
-    target.append(card);
-  }
-}
-async function loadStickerStats() {
-  stickerUsageState = await api('/api/sticker-usage');
-  renderStickerUsage();
-}
-function renderStickerUsage() {
-  const target = $('sticker-usage');
-  target.replaceChildren();
-  const peers = Object.entries(stickerUsageState);
-  if (!peers.length) {
-    empty(target, '还没有使用记录。');
-    return;
-  }
-  for (const [peerId, stats] of peers) {
-    const row = el('div', undefined, 'row');
-    const heading = el('div', undefined, 'row-title');
-    heading.append(el('span', peerId));
-    row.append(heading);
-    const sorted = Object.entries(stats).sort((a, b) => b[1].count - a[1].count);
-    const max = sorted[0]?.[1].count ?? 1;
-    const table = el('div', undefined, 'usage-bars');
-    for (const [slug, s] of sorted) {
-      const bar = el('div', undefined, 'usage-bar');
-      const fill = el('span');
-      fill.style.width = Math.max(6, Math.round((s.count / max) * 100)) + '%';
-      bar.append(el('span', slug, 'usage-slug'), fill, el('span', String(s.count), 'usage-count'));
-      table.append(bar);
-    }
-    row.append(table);
-    row.append(
-      confirmButton('清零', '确认清零？', async () => {
-        await api('/api/sticker-usage/' + enc(peerId), 'DELETE');
-        await loadStickers();
-        show('该联系人的表情统计已清零。');
-      }),
-    );
-    target.append(row);
-  }
-}
-$('mood-form').onsubmit = (event) => {
-  event.preventDefault();
-  perform(async () => {
-    await api('/api/sticker-moods', 'POST', { name: $('mood-name').value });
-    event.target.reset();
-    await loadStickers();
-    show('情绪已添加。');
-  }, event.submitter);
-};
 
 $('sticker-form').onsubmit = (event) => {
   event.preventDefault();
@@ -1197,13 +1227,41 @@ $('sticker-form').onsubmit = (event) => {
 
 async function loadSettings() {
   applySettings(await api('/api/config'));
+  // Sandbox status is advisory: a failure here must not block the settings page.
+  try {
+    renderSandbox(await api('/api/sandbox'));
+  } catch {
+    const fallback = $('sandbox-status');
+    fallback.replaceChildren(el('span', '沙箱状态读取失败。', 'hint'));
+  }
 }
 
 function applySettings(config) {
   for (const key of [...textSettings, ...numberSettings]) $(key).value = config[key];
   formatDropdown.value = config.format;
   $('temperature').value = config.temperature ?? '';
-  for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) $(key).checked = config[key];
+  for (const key of [
+  'vision',
+  'proactiveEnabled',
+  'embeddingEnabled',
+  'sandboxEnabled',
+  'sandboxNetwork',
+])
+  $(key).checked = config[key];
+  // Ticked but inert is the confusing state: the switch only takes effect once a
+  // model name AND the separate key are present, and the key deliberately does
+  // not fall back to the chat key. Say so instead of leaving a checkbox that
+  // claims the feature is on while nothing is ever embedded.
+  const embeddingNotice = $('embedding-notice');
+  if (embeddingNotice) {
+    const requested = config.embeddingEnabled === true;
+    const active = config.embeddingActive === true;
+    embeddingNotice.hidden = !requested || active;
+    embeddingNotice.textContent =
+      requested && !active
+        ? '已勾选但尚未生效：向量检索需要同时填写向量模型名称和独立的向量密钥，缺一项就不会调用。'
+        : '';
+  }
   $('apiKey').placeholder = config.hasApiKey ? '已配置，留空保持原值' : '尚未配置';
   $('tavilyKey').placeholder = config.hasTavilyKey ? '已配置，留空保持原值' : '尚未配置';
   $('embeddingApiKey').placeholder = config.hasEmbeddingApiKey
@@ -1315,6 +1373,54 @@ $('test-embedding').onclick = () =>
     show('向量连通正常：' + result.model + ' · 维度 ' + result.dims + ' · 延迟 ' + result.latencyMs + ' ms');
   }, $('test-embedding'));
 
+function renderSandbox(state) {
+  const kb = (state.usage.bytes / 1024).toFixed(1);
+  const limit = state.sizeLimitBytes ? state.sizeLimitBytes / 1024 / 1024 + ' MB' : '不限制';
+  const mem = state.memoryLimitMb ? state.memoryLimitMb + ' MB' : '不限制';
+  // Labeled chips instead of one long "·"-joined sentence: the old single line
+  // wrapped arbitrarily at any character on narrow screens.
+  const chips = [
+    ['状态', state.enabled ? '已开启' : '已关闭'],
+    ['文件', state.usage.files + ' 个 / ' + kb + ' KB'],
+    ['大小上限', limit],
+    ['内存上限', mem],
+  ];
+  if (state.isolation?.network) chips.push(['网络', state.isolation.network]);
+  // The backend already decides whether isolation is real or degraded; dropping
+  // the two fields left "已开启" as the only thing on screen. In the fallback
+  // path there is no namespace at all — /data (SQLite, API keys) is readable by
+  // any command and the network switch does nothing — so the operator must be
+  // told, not reassured.
+  const degraded = state.isolation?.level === 'directory';
+  if (state.isolation?.level)
+    chips.push(['隔离', degraded ? '目录级（已降级）' : 'nsjail 命名空间']);
+  $('sandbox-status').replaceChildren(
+    ...chips.map(([label, value]) => {
+      const chip = el('span', undefined, 'status-chip');
+      if (degraded && label === '隔离') chip.classList.add('status-chip-warn');
+      chip.append(el('span', label, 'status-chip-label'), el('span', value, 'status-chip-value'));
+      return chip;
+    }),
+  );
+  const note = $('sandbox-note');
+  if (note) {
+    note.textContent = state.isolation?.note ?? '';
+    note.hidden = !state.isolation?.note;
+    note.classList.toggle('warn', degraded);
+  }
+}
+$('refresh-sandbox').onclick = () =>
+  perform(async () => renderSandbox(await api('/api/sandbox')), $('refresh-sandbox'));
+$('clear-sandbox').onclick = () =>
+  perform(async () => {
+    await api('/api/sandbox/clear', 'POST');
+    renderSandbox(await api('/api/sandbox'));
+    show('沙箱目录已清空。');
+  }, $('clear-sandbox'));
+// Destructive: stage it behind the same arm-to-confirm the journal uses, so a
+// mis-tap next to 刷新状态 cannot wipe the directory.
+decorateConfirm($('clear-sandbox'), '确认清空？');
+
 for (const [id, field] of [
   ['clear-api-key', 'clearApiKey'],
   ['clear-tavily-key', 'clearTavilyKey'],
@@ -1327,9 +1433,17 @@ for (const [id, field] of [
       show('密钥已清除，对应服务在重新填写前不可用。');
     }, $(id));
 
+/** The single place that writes the save state, so the in-card hint and the
+ *  sticky status bar can never disagree. */
+function setSettingsStatus(text) {
+  $('settings-saved').textContent = text;
+  const bar = $('settings-status-text');
+  if (bar) bar.textContent = text;
+}
+
 function settingsChanged() {
   settingsVersion++;
-  $('settings-saved').textContent = '有尚未保存的修改。';
+  setSettingsStatus('有尚未保存的修改。');
   updateBudget();
 }
 $('settings-form').oninput = settingsChanged;
@@ -1345,11 +1459,18 @@ $('settings-form').onsubmit = (event) => {
     body.format = formatDropdown.value;
     for (const key of numberSettings) body[key] = $(key).valueAsNumber;
     body.temperature = $('temperature').value === '' ? null : $('temperature').valueAsNumber;
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled']) body[key] = $(key).checked;
+    for (const key of [
+  'vision',
+  'proactiveEnabled',
+  'embeddingEnabled',
+  'sandboxEnabled',
+  'sandboxNetwork',
+])
+  body[key] = $(key).checked;
     const saved = await api('/api/config', 'PUT', body);
     if (version === settingsVersion) {
       applySettings(saved);
-      $('settings-saved').textContent = '已保存 · ' + new Date().toLocaleTimeString('zh-CN');
+      setSettingsStatus('已保存 · ' + new Date().toLocaleTimeString('zh-CN'));
     }
     show(
       version === settingsVersion
@@ -1376,6 +1497,7 @@ $('wechat-logout').onclick = () =>
     await api('/api/wechat/logout', 'POST');
     await loadStatus();
   }, $('wechat-logout'));
+decorateConfirm($('wechat-logout'), '确认断开？');
 
 $('login-form').onsubmit = (event) => {
   event.preventDefault();
@@ -1397,7 +1519,29 @@ $('logout').onclick = () =>
     $('password').focus();
   });
 
+/** True when the settings form holds edits that were never submitted. */
+function settingsDirty() {
+  return (
+    currentTab === 'settings' && $('settings-saved').textContent.startsWith('有尚未保存的修改')
+  );
+}
+
 async function selectTab(tab) {
+  // Switching tabs used to discard a half-edited settings form with no warning:
+  // the form only lives in the DOM, and applySettings() overwrites it from the
+  // server on the next visit. Ask before throwing the edits away.
+  if (tab !== currentTab && settingsDirty()) {
+    const leave = window.confirm('设置里有尚未保存的修改，离开将会丢失。确定要离开吗？');
+    if (!leave) {
+      document.querySelectorAll('[data-tab]').forEach((b) => {
+        const selected = b.dataset.tab === currentTab;
+        b.classList.toggle('selected', selected);
+        b.setAttribute('aria-selected', String(selected));
+        b.tabIndex = selected ? 0 : -1;
+      });
+      return;
+    }
+  }
   currentTab = tab;
   document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== tab));
   document.querySelectorAll('[data-tab]').forEach((b) => {
@@ -1409,7 +1553,6 @@ async function selectTab(tab) {
   if (tab === 'chat') await loadChat();
   if (tab === 'journal') await loadJournal();
   if (tab === 'stickers') await loadStickers();
-  if (tab === 'sticker-stats') await loadStickerStats();
   if (tab === 'persona') await loadPersonas(personaSelected);
   if (tab === 'settings') await loadStatus();
 }
@@ -1442,9 +1585,12 @@ document.querySelectorAll('[data-tab]').forEach((b) => {
 });
 
 formatDropdown = createDropdown({
+  // All three formats the backend accepts; gemini was missing here even though
+  // config validation and the request builder both support it.
   options: [
-    { value: 'openai', label: 'openai' },
-    { value: 'anthropic', label: 'anthropic' },
+    { value: 'openai', label: 'OpenAI 兼容（含 DeepSeek）' },
+    { value: 'anthropic', label: 'Anthropic Messages' },
+    { value: 'gemini', label: 'Gemini' },
   ],
   value: 'openai',
   ariaLabel: '接口格式',
@@ -1490,33 +1636,49 @@ async function enter() {
   await selectTab(currentTab);
 }
 
+let pollFailures = 0;
 setInterval(async () => {
   if (!authenticated || document.hidden || polling) return;
+  // A short server hiccup used to re-show the error toast every tick (each
+  // show() reset the 12s timer, so the toast never went away). Back off and
+  // only re-toast after a run of consecutive failures.
+  if (pollFailures >= 3) {
+    pollFailures++;
+    if (pollFailures === 8) {
+      pollFailures = 0;
+      show('服务器连续无响应，仍在自动重试。', true);
+    }
+    return;
+  }
   polling = true;
   try {
-    await perform(async () => {
-      const state = await loadStatus();
-      if (lastTask) {
-        const task = await api('/api/tasks/' + enc(lastTask));
-        if (task.state === 'failed') {
-          show(task.error + '，可在右上角铃铛里重试。', true);
-          lastTask = null;
-          waitingReply = false;
-        } else if (['done', 'superseded'].includes(task.state)) {
-          lastTask = null;
-          // A finished task that produced no new assistant bubble (empty reply
-          // or skipped turn) must not leave the typing indicator up forever.
-          waitingReply = false;
+    // rethrow so this catch actually runs: perform() used to swallow the error,
+    // which made pollFailures unreachable and turned every hiccup into the
+    // repeated-toast bug the comment above describes.
+    await perform(
+      async () => {
+        const state = await loadStatus();
+        pollFailures = 0;
+        if (lastTask) {
+          const task = await api('/api/tasks/' + enc(lastTask));
+          if (task.state === 'failed') {
+            show(task.error + '，可在右上角铃铛里重试。', true);
+            lastTask = null;
+          } else if (['done', 'superseded'].includes(task.state)) lastTask = null;
         }
-      }
-      if (currentTab === 'chat') await loadChat();
-      if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
-        journalPoll = Date.now();
-        await loadJournal();
-      }
-      if ($('drawer-connection').hidden === false) await loadPeers();
-      return state;
-    });
+        if (currentTab === 'chat') await loadChat();
+        if (currentTab === 'journal' && Date.now() - journalPoll >= 10000) {
+          journalPoll = Date.now();
+          await loadJournal();
+        }
+        if ($('drawer-connection').hidden === false) await loadPeers();
+        return state;
+      },
+      null,
+      { rethrow: true },
+    );
+  } catch {
+    pollFailures++;
   } finally {
     polling = false;
   }

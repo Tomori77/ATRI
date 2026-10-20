@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { renderMood, parseReply, resolveDue } from '@atri/core';
 import { ModelError, HttpModel, type ModelConfig } from '@atri/llm';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 const stickers = [{ slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' }];
 const config: ModelConfig = {
@@ -21,7 +21,7 @@ test('P0-1 情绪 energy 保持符号：累了不会渲染成精力足', (t) => 
   f.store.pulseMood('p1', { valence: 0, energy: -0.6, reason: '加班' }, now - 60000);
   const mood = f.store.mood('p1');
   assert.ok(mood.energy < 0, '负能量读回应为负');
-  const prose = renderMood(mood, now, 'Asia/Shanghai');
+  const prose = renderMood(mood, now);
   assert.match(prose, /有点累/);
   assert.doesNotMatch(prose, /精力挺足/);
 });
@@ -119,7 +119,7 @@ test('P0-5 网络层错误参与重试', async () => {
 
 test('P0-6 embeddingEnabled 关闭后不再提供向量', async (t) => {
   const f = fixture(t);
-  const { Settings } = await import('../apps/api/src/config.js');
+  const { Settings } = await import('../../apps/api/src/config.js');
   const settings = new Settings(f.store, process.cwd(), {
     ADMIN_PASSWORD: 'x'.repeat(16),
     DATA_DIR: f.directory,

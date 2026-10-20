@@ -10,7 +10,7 @@ import {
 } from '@atri/core';
 import { parseOpenLoops, parseReply, resolveDue, parseMoodPulse } from '@atri/core';
 import { OPEN_LOOP_EXPIRE_DAYS, PROACTIVE_IGNORE_COOLDOWN_DAYS } from '@atri/db';
-import { fixture, FakeModel, completion } from './helpers.js';
+import { fixture, FakeModel, completion } from '../helpers.js';
 
 const stickers: Sticker[] = [
   { slug: 'happy', description: '开心', tags: ['开心'], file: 'happy.png' },
@@ -218,12 +218,12 @@ test('轻量心情：事件打脉冲、时间衰减、渲染成体感文字而�
   f.store.pulseMood('p1', { valence: -0.5, energy: -0.4, reason: '吵架' }, now - 2 * 3600000);
   const mood = f.store.mood('p1');
   assert.ok(mood.valence < 0 && mood.valence > -0.5, '离线期间向中性衰减');
-  const prose = renderMood(mood, now, 'Asia/Shanghai');
+  const prose = renderMood(mood, now);
   assert.match(prose, /低落/);
   assert.match(prose, /2 小时前/);
   assert.doesNotMatch(prose, /-?0\.\d+/);
   // 回到中性后不渲染
-  assert.equal(renderMood({ valence: 0, energy: 0, at: now }, now, 'Asia/Shanghai'), '');
+  assert.equal(renderMood({ valence: 0, energy: 0, at: now }, now), '');
   // 规则推断：抱怨降情绪，感谢升情绪
   f.store.pulseMoodFromExchange(
     'p1',

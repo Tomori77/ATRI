@@ -34,9 +34,29 @@ export function parseJson(text: string): any {
   try {
     return JSON.parse(cleaned);
   } catch {
-    const start = cleaned.indexOf('{'),
-      end = cleaned.lastIndexOf('}');
-    if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1));
+    const start = cleaned.indexOf('{');
+    if (start < 0) throw new Error('模型输出不是有效 JSON');
+    // Scan for the matching brace instead of taking the last '}' in the string:
+    // with trailing prose ("{...} 后面还有 {...}") lastIndexOf spliced both
+    // objects together and the parse failed on otherwise valid output.
+    let depth = 0,
+      inString = false,
+      escaped = false;
+    for (let i = start; i < cleaned.length; i++) {
+      const ch = cleaned[i]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (!depth) return JSON.parse(cleaned.slice(start, i + 1));
+      }
+    }
     throw new Error('模型输出不是有效 JSON');
   }
 }
@@ -76,7 +96,11 @@ export function extractInlineStickers(
 ): { parts: ReplyPart[]; text: string } {
   const parts: ReplyPart[] = [];
   const cleaned = text
-    .replace(/(\s*)[(\[{【]\s*(?:表情|sticker)\s*[：:]\s*([^\]】)}】]+?)\s*[\]】)}】](\s*)/gi, (_all, before: string, name: string, after: string) => {
+    // The inner character class is bounded: an unbounded lazy quantifier plus
+    // the two \s* groups made a run of unclosed "[表情：" backtrack quadratically
+    // (19k chars took 619 ms, on the event loop, freezing every peer). A sticker
+    // name is never near 40 characters, so the cap costs nothing.
+    .replace(/(\s*)[(\[{【]\s*(?:表情|sticker)\s*[：:]\s*([^\]】)}]{1,40}?)\s*[\]】)}](\s*)/gi, (_all, before: string, name: string, after: string) => {
       const query = name.trim().toLowerCase();
       if (!query) return before;
       const bySlug = stickers.find((s) => s.slug.toLowerCase() === query);
@@ -99,8 +123,7 @@ export function extractInlineStickers(
     })
     .replace(/^[ \t]+|[ \t]+$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  return { parts, text: cleaned };
+    .trim();  return { parts, text: cleaned };
 }
 /**
  * Models sometimes copy the "[来源 id | time]" annotation from rendered history
@@ -127,43 +150,46 @@ function normalizeTextParts(
   raw: unknown[],
   stickers: Sticker[],
 ): ReplyPart[] {
-  return raw.slice(0, MAX_REPLY_PARTS).flatMap((m: unknown) => {
-    if (typeof m === 'string' && m.trim()) {
-      const head = stripSourceAnnotations(m);
-      const segments = head.parts.length
-        ? head.parts.flatMap((p) => (p.type === 'text' && p.text ? [p.text] : []))
-        : [head.text];
-      return segments.flatMap((segment) => {
-        const { parts, text } = extractInlineStickers(segment, stickers);
-        const body = text.trim();
-        const stripped = stripSourceAnnotations(body);
-        const combined = [...parts, ...stripped.parts];
-        if (combined.length) return [...combined, ...(stripped.text ? [{ type: 'text' as const, text: stripped.text.slice(0, 6000) }] : [])];
-        if (stripped.text) return [{ type: 'text', text: stripped.text.slice(0, 6000) }];
-        return [];
-      });
-    }
-    if (m && typeof m === 'object' && 'type' in m && m.type === 'sticker' && 'slug' in m) {
-      const sticker = stickers.find((s) => s.slug === m.slug);
-      if (sticker) {
-        const raw = m as Record<string, unknown>;
-        return [
-          {
-            type: 'sticker',
-            slug: sticker.slug,
-            description: sticker.description,
-            ...(typeof raw.emotion === 'string' && raw.emotion
-              ? { emotion: raw.emotion.slice(0, 40) }
-              : {}),
-            ...(typeof raw.intensity === 'number' && Number.isFinite(raw.intensity)
-              ? { intensity: Math.max(1, Math.min(4, Math.round(raw.intensity))) }
-              : {}),
-          },
-        ];
+  // The slice bounds how many input messages are read, but one message can hold
+  // many inline stickers and each becomes its own part. Without the final cap a
+  // 6-message reply produced 66 bubbles, and the sender paces every bubble
+  // 400–2500 ms apart — a minute of spam from one model output.
+  return raw
+    .slice(0, MAX_REPLY_PARTS)
+    .flatMap<ReplyPart>((m: unknown) => {
+      if (typeof m === 'string' && m.trim()) {
+        const head = stripSourceAnnotations(m);
+        const segments = head.parts.length
+          ? head.parts.flatMap((p) => (p.type === 'text' && p.text ? [p.text] : []))
+          : [head.text];
+        return segments.flatMap<ReplyPart>((segment) => {
+          const { parts, text } = extractInlineStickers(segment, stickers);
+          const body = text.trim();
+          const stripped = stripSourceAnnotations(body);
+          const combined = [...parts, ...stripped.parts];
+          if (combined.length)
+            return [
+              ...combined,
+              ...(stripped.text
+                ? [{ type: 'text' as const, text: stripped.text.slice(0, 6000) }]
+                : []),
+            ];
+          if (stripped.text) return [{ type: 'text' as const, text: stripped.text.slice(0, 6000) }];
+          return [];
+        });
       }
-    }
-    return [];
-  });
+      if (m && typeof m === 'object' && 'type' in m && m.type === 'sticker' && 'slug' in m) {
+        const slug = m.slug;
+        if (typeof slug !== 'string') return [];
+        const sticker = stickers.find((s) => s.slug === slug);
+        if (sticker)
+          return [
+            { type: 'sticker' as const, slug: sticker.slug, description: sticker.description },
+          ];
+      }
+      return [];
+    })
+    .slice(0, MAX_REPLY_PARTS);
 }
 /** Open-loop entries from the model: content plus a due time. When `available`
  *  is given, every source ID must be visible this turn; without it (final JSON
@@ -207,18 +233,37 @@ export function resolveDue(
   now: number,
   timeZone: string,
 ): number | undefined {
-  const sane = (t: number) => t > now - 86400000 && t < now + 5 * 365 * 86400000;
+  // 366 (not 365) days per year: five calendar years span at least one leap day,
+  // so a legitimate date near the end of the window was rejected as insane.
+  const sane = (t: number) => t > now - 86400000 && t < now + 5 * 366 * 86400000;
   if (typeof dueAt === 'number' && Number.isFinite(dueAt) && dueAt > 0) {
     return sane(dueAt) ? dueAt : undefined;
   }
   if (typeof due !== 'string' || !due.trim()) return undefined;
   const text = due.trim().replace(/[：]/g, ':');
-  const iso = Date.parse(text);
-  if (!Number.isNaN(iso) && /\d{4}-\d{2}-\d{2}/.test(text)) return sane(iso) ? iso : undefined;
+  // ISO-style absolute dates are parsed in the *configured* zone, not the
+  // process zone: Date.parse treats "2027-01-05 08:00" as local and
+  // "2027-01-05" as UTC, so a server whose TZ differs from the app timeZone
+  // shifted every such plan by the offset.
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ](\d{1,2}):(\d{2}))?/.exec(text);
+  if (iso) {
+    const resolved = localWallTimeFromYMD(
+      Number(iso[1]),
+      Number(iso[2]),
+      Number(iso[3]),
+      Number(iso[4] ?? 9),
+      Number(iso[5] ?? 0),
+      timeZone,
+    );
+    return Number.isNaN(resolved) ? undefined : sane(resolved) ? resolved : undefined;
+  }
   // "明天 08:00" / "后天 14:30" / bare "08:00" — optional day word plus
   // local wall time; a bare time that already passed rolls to tomorrow.
   const dayWords: Record<string, number> = { 今天: 0, 明天: 1, 后天: 2, 大后天: 3 };
-  const dayMatch = /^(今天|明天|后天|大后天)?\s*(\d{1,2})(?::(\d{2}))?$/.exec(text);
+  // Longest alternative first: with 后天 ahead of 大后天 the alternation matched
+  // the optional group to nothing, the trailing digits then failed on "大", and
+  // every "大后天" plan was silently dropped.
+  const dayMatch = /^(大后天|今天|明天|后天)?\s*(\d{1,2})(?::(\d{2}))?$/.exec(text);
   if (dayMatch) {
     const named = !!dayMatch[1];
     const offset = dayMatch[1] ? dayWords[dayMatch[1]!]! : 0;
@@ -261,14 +306,46 @@ export function resolveDue(
 }
 /** Milliseconds for a local wall-clock time N days from `now` in `timeZone`. */
 function localWallTime(now: number, dayOffset: number, hour: number, minute: number, timeZone: string): number {
-  const date = new Intl.DateTimeFormat('en-CA', {
+  // Calendar arithmetic in UTC, not `now + dayOffset * 86400000`: adding a fixed
+  // 24 hours per day lands on the wrong local date across a DST transition, so
+  // "明天 08:00" resolved to the day after tomorrow in any zone with DST.
+  const parts = wallDateFormatter(timeZone)
+    .formatToParts(new Date(now))
+    .reduce<Record<string, string>>((acc, p) => ({ ...acc, [p.type]: p.value }), {});
+  const shifted = new Date(
+    Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day) + dayOffset),
+  );
+  return localWallTimeFromYMD(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth() + 1,
+    shifted.getUTCDate(),
+    hour,
+    minute,
     timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date(now + dayOffset * 86400000));
-  const [y, m, d] = date.split('-').map(Number);
-  return localWallTimeFromYMD(y!, m!, d!, hour, minute, timeZone);
+  );
+}
+const wallDateFormatters = new Map<string, Intl.DateTimeFormat>();
+function wallDateFormatter(timeZone: string): Intl.DateTimeFormat {
+  let formatter = wallDateFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    wallDateFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+const offsetFormatters = new Map<string, Intl.DateTimeFormat>();
+function offsetFormatter(timeZone: string): Intl.DateTimeFormat {
+  let formatter = offsetFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-GB', { timeZone, timeZoneName: 'longOffset' });
+    offsetFormatters.set(timeZone, formatter);
+  }
+  return formatter;
 }
 function localWallTimeFromYMD(
   year: number,
@@ -284,12 +361,12 @@ function localWallTimeFromYMD(
   if (Number.isNaN(utc)) return NaN;
   // The zone offset at that wall time (two probes cover DST boundaries):
   // local = UTC + offset, so the epoch is utc - offset.
+  const formatter = offsetFormatter(timeZone);
   let result = utc;
   for (let i = 0; i < 2; i++) {
-    const name = new Intl.DateTimeFormat('en-GB', { timeZone, timeZoneName: 'longOffset' })
+    const name = formatter
       .formatToParts(new Date(result))
-      .find((p) => p.type === 'timeZoneName')!
-      .value;
+      .find((p) => p.type === 'timeZoneName')!.value;
     const match = /GMT([+-])(\d{2}):?(\d{2})?/.exec(name);
     const sign = match?.[1] === '-' ? -1 : 1;
     const hh = Number(match?.[2] ?? 0),
@@ -321,16 +398,38 @@ export function parseReply(
   try {
     raw = parseJson(text);
   } catch {
-    if (!/[{}]|```|"messages"/.test(text) && text.trim()) {
-      const blob = text.trim().slice(0, 6000);
+    // Any blob that does not parse is treated as a plain-text reply as long as
+    // it has content — but only when it was not *meant* to be JSON. A blob that
+    // opens like an object or a JSON array is a failed JSON attempt: falling
+    // back to prose shipped `{"messages":broken}` to the user verbatim, and only
+    // the repair round can close a truncated object. The check is deliberately
+    // narrow: a "[来源 …]" annotation line also opens with a bracket, and that
+    // one must still reach the splitter below. Prose that merely *contains* a
+    // brace ("她说 {笑} 了一下") falls through too.
+    const blob = text.trim().slice(0, 6000);
+    const looksLikeJson = /^(?:\{\s*["}]|\[\s*[\[{"]|```\s*json)/i.test(blob);
+    if (blob && !looksLikeJson) {
+      // Split first, then clean each chunk. Doing it the other way round threw
+      // away the split points: stripSourceAnnotations only splits when the input
+      // still starts with an annotation, so after one pass the remaining three
+      // source blocks collapsed into a single bubble.
       const annotated = stripSourceAnnotations(blob);
-      const { parts: stickerParts, text: stickerText } = annotated.parts.length
-        ? { parts: annotated.parts, text: '' }
-        : extractInlineStickers(blob, stickers);
-      const { parts: splitParts, text: rest } = stripSourceAnnotations(stickerText);
-      const all = [...stickerParts, ...splitParts, ...(rest ? [{ type: 'text' as const, text: rest.slice(0, 6000) }] : [])];
+      const blocks = annotated.parts.length
+        ? annotated.parts.map((p) => p.text ?? '')
+        : [blob];
+      const all: ReplyPart[] = [];
+      for (const block of blocks) {
+        const { parts: stickerParts, text: stickerText } = extractInlineStickers(block, stickers);
+        all.push(...stickerParts);
+        const body = stickerText.trim();
+        const stripped = stripSourceAnnotations(body);
+        if (stripped.parts.length) all.push(...stripped.parts);
+        else if (stripped.text) all.push({ type: 'text' as const, text: stripped.text.slice(0, 6000) });
+      }
       return {
-        parts: all.length ? all : [{ type: 'text' as const, text: blob }],
+        parts: all.length
+          ? all.slice(0, MAX_REPLY_PARTS)
+          : [{ type: 'text' as const, text: blob }],
         memories: [],
         descriptions: [],
         openLoops: [],

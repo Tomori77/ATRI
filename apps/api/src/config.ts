@@ -27,6 +27,10 @@ export interface SavedConfig {  baseUrl: string;
   embeddingBaseUrl: string;
   embeddingApiKey: string;
   embeddingModel: string;
+sandboxEnabled: boolean;
+sandboxNetwork: boolean;
+sandboxSizeMb: number;
+  sandboxMemoryMb: number;
   maxConcurrentPeers: number;
   debounceMs: number;
 }
@@ -96,6 +100,42 @@ export const PERSONA_PRESETS: {
     ].join('\n'),
   },
 ];
+// Shared with update(): an empty field in the settings form means "keep the
+// built-in default", so both paths have to agree on one source of truth.
+function builtinDefaults(env: NodeJS.ProcessEnv): SavedConfig {
+  return {
+    baseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
+    apiKey: env.LLM_API_KEY || '',
+    model: env.LLM_MODEL || 'deepseek-chat',
+    format: (env.LLM_FORMAT || 'openai') as ApiFormat,
+    vision: env.LLM_VISION === 'true',
+    tavilyKey: env.TAVILY_API_KEY || '',
+    timeZone: env.TZ || 'Asia/Shanghai',
+    diaryHour: 3,
+    proactiveEnabled: false,
+    quietStart: 23,
+    quietEnd: 8,
+    proactiveAfterHours: 6,
+    contextWindowTokens: 65536,
+    inputBudgetTokens: 24000,
+    maxOutputTokens: 3000,
+    requestTimeoutSeconds: 45,
+    turnTimeoutSeconds: 90,
+    temperature: null,
+    embeddingEnabled: env.EMBEDDING_ENABLED === 'true',
+    embeddingBaseUrl: env.EMBEDDING_BASE_URL || env.LLM_BASE_URL || 'https://api.deepseek.com',
+    embeddingApiKey: env.EMBEDDING_API_KEY || '',
+    embeddingModel: env.EMBEDDING_MODEL || '',
+    sandboxEnabled: env.SANDBOX_ENABLED === 'true',
+    // Off by default: a command with no route out is the safer default, and
+    // the operator can turn it on when she needs to install packages.
+    sandboxNetwork: env.SANDBOX_NETWORK === 'true',
+    sandboxSizeMb: Number(env.SANDBOX_SIZE_MB || 512),
+    sandboxMemoryMb: Number(env.SANDBOX_MEMORY_MB || 2048),
+    maxConcurrentPeers: 3,
+    debounceMs: 800,
+  };
+}
 export class Settings {
   readonly dataDir: string;
   readonly adminPassword: string;
@@ -121,41 +161,36 @@ export class Settings {
       writeFileSync(passwordFile, this.adminPassword + '\n', { mode: 0o600, flag: 'wx' });
     }
     if (this.adminPassword.length < 12) throw new Error('ADMIN_PASSWORD 至少需要 12 个字符');
+    // Fail at startup, not on the first reply: an invalid TZ from the env only
+    // surfaced when a formatter first touched it, which crashed every turn
+    // with a stack trace instead of a readable message.
+    new Intl.DateTimeFormat('zh-CN', { timeZone: this.config().timeZone }).format();
   }
   config(): SavedConfig {
-    const env = this.env;
-    const defaults: SavedConfig = {
-      baseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com',
-      apiKey: env.LLM_API_KEY || '',
-      model: env.LLM_MODEL || 'deepseek-chat',
-      format: (env.LLM_FORMAT || 'openai') as ApiFormat,
-      vision: env.LLM_VISION === 'true',
-      tavilyKey: env.TAVILY_API_KEY || '',
-      timeZone: env.TZ || 'Asia/Shanghai',
-      diaryHour: 3,
-      proactiveEnabled: false,
-      quietStart: 23,
-      quietEnd: 8,
-      proactiveAfterHours: 6,
-      contextWindowTokens: 65536,
-      inputBudgetTokens: 24000,
-      maxOutputTokens: 3000,
-      requestTimeoutSeconds: 45,
-      turnTimeoutSeconds: 90,
-      temperature: null,
-      embeddingEnabled: env.EMBEDDING_ENABLED === 'true',
-      embeddingBaseUrl: env.EMBEDDING_BASE_URL || env.LLM_BASE_URL || 'https://api.deepseek.com',
-      embeddingApiKey: env.EMBEDDING_API_KEY || '',
-      embeddingModel: env.EMBEDDING_MODEL || '',
-      maxConcurrentPeers: 3,
-      debounceMs: 800,
-    };
-    return { ...defaults, ...this.store.getSetting<Partial<SavedConfig>>('config', {}) };
+    // The pump reads config every 300ms and proactiveGate twice per call;
+    // hitting SQLite plus JSON.parse each time is pure waste. The cache
+    // invalidates on every write (the only mutation path).
+    if (this.configCache) return this.configCache;
+    const defaults = builtinDefaults(this.env);
+    // Unknown keys from older versions are dropped, not merged forever.
+    const stored = this.store.getSetting<Partial<SavedConfig>>('config', {});
+    const merged = { ...defaults } as Record<string, unknown>;
+    for (const key of Object.keys(defaults) as (keyof SavedConfig)[])
+      if (stored[key] !== undefined) merged[key] = stored[key];
+    this.configCache = merged as unknown as SavedConfig;
+    return this.configCache;
   }
+  private configCache: SavedConfig | null = null;
   publicConfig() {
     const { apiKey, tavilyKey, embeddingApiKey, ...rest } = this.config();
     return {
       ...rest,
+      // `embeddingEnabled` stays the requested flag so the form round-trips what
+      // the operator ticked; `embeddingActive` is what actually runs. They differ
+      // when the model name or the separate key is missing, and in that state the
+      // checkbox alone read "已启用" while nothing was ever embedded. The form
+      // shows the requested value and warns when the two disagree.
+      embeddingActive: this.embeddingEnabled(),
       hasApiKey: !!apiKey,
       hasTavilyKey: !!tavilyKey,
       hasEmbeddingApiKey: !!embeddingApiKey,
@@ -167,6 +202,13 @@ export class Settings {
       throw new Error('设置格式无效');
     for (const field of ['baseUrl', 'model', 'timeZone', 'embeddingBaseUrl', 'embeddingModel'] as const)
       if (typeof input[field] === 'string') next[field] = input[field].trim();
+    // The settings form labels the API address field "留空用官方默认", so an
+    // empty string has to mean "keep the built-in default" rather than reaching
+    // new URL('') below and surfacing a raw `Invalid URL` to the operator.
+    const builtin = builtinDefaults(this.env);
+    if (!next.baseUrl) next.baseUrl = builtin.baseUrl;
+    if (!next.model) next.model = builtin.model;
+    if (!next.timeZone) next.timeZone = builtin.timeZone;
     if (typeof input.apiKey === 'string' && input.apiKey.trim()) next.apiKey = input.apiKey.trim();
     if (typeof input.tavilyKey === 'string' && input.tavilyKey.trim())
       next.tavilyKey = input.tavilyKey.trim();
@@ -180,7 +222,7 @@ export class Settings {
         throw new Error('模型接口格式无效');
       next.format = input.format as ApiFormat;
     }
-    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled'] as const)
+    for (const key of ['vision', 'proactiveEnabled', 'embeddingEnabled', 'sandboxEnabled', 'sandboxNetwork'] as const)
       if (input[key] !== undefined) {
         if (typeof input[key] !== 'boolean') throw new Error('开关格式无效');
         next[key] = input[key];
@@ -247,6 +289,20 @@ export class Settings {
       )
         throw new Error('向量模型地址需要是没有凭据和查询参数的 HTTP/HTTPS URL');
     }
+    if (input.sandboxSizeMb !== undefined) {
+      const n = Number(input.sandboxSizeMb);
+      // 0 means unlimited, so the floor has to allow it explicitly.
+      if (!Number.isInteger(n) || n < 0 || n > 102400)
+        throw new Error('沙箱大小需要 0（不限制）到 102400 MB 之间的整数');
+      next.sandboxSizeMb = n;
+    }
+    if (input.sandboxMemoryMb !== undefined) {
+      const n = Number(input.sandboxMemoryMb);
+      // 0 means unlimited, so the floor has to allow it explicitly.
+      if (!Number.isInteger(n) || n < 0 || n > 262144)
+        throw new Error('沙箱内存需要 0（不限制）到 262144 MB 之间的整数');
+      next.sandboxMemoryMb = n;
+    }
     if (input.maxConcurrentPeers !== undefined) {
       const n = Number(input.maxConcurrentPeers);
       if (!Number.isInteger(n) || n < 1 || n > 12)
@@ -260,6 +316,7 @@ export class Settings {
       next.debounceMs = n;
     }
     new Intl.DateTimeFormat('zh-CN', { timeZone: next.timeZone }).format();
+    this.configCache = null;
     this.store.setSetting('config', next);
     return this.publicConfig();
   }
@@ -304,11 +361,22 @@ export class Settings {
       maxConcurrentPeers: c.maxConcurrentPeers,
     };
   }
+  /** Prompt files are deploy-time constants, so read each one at most once.
+   *  `readFileSync` used to run as the *argument* to getSetting, which meant it
+   *  fired unconditionally on every turn — two or three blocking disk reads on
+   *  the reply path even when the database already held an override that made
+   *  the file's contents irrelevant. */
+  private promptFiles = new Map<PromptName, string>();
+  private promptFile(name: PromptName): string {
+    let text = this.promptFiles.get(name);
+    if (text === undefined) {
+      text = readFileSync(join(this.root, 'shared', 'prompts', `${name}.md`), 'utf8');
+      this.promptFiles.set(name, text);
+    }
+    return text;
+  }
   prompt(name: PromptName): string {
-    return this.store.getSetting<string>(
-      `prompt:${name}`,
-      readFileSync(join(this.root, 'shared', 'prompts', `${name}.md`), 'utf8'),
-    );
+    return this.store.getSetting<string>(`prompt:${name}`, this.promptFile(name));
   }
   /** `prompt('persona')` still backs the legacy endpoint, so it must reflect
    *  the default persona's current text rather than the stale seed. */

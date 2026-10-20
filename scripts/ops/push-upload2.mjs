@@ -36,6 +36,13 @@ const blobs = new Map();
 let done = 0;
 const work = [...items];
 async function uploadOne(item) {
+  if (item.sha === null) {
+    // Deletion: no blob to upload, and nothing to count toward progress.
+    blobs.set(item.path, null);
+    done++;
+    console.log(`deleted ${item.path}`);
+    return;
+  }
   const res = post(`repos/${repo}/git/blobs`, {
     content: item.content,
     encoding: 'base64',
@@ -58,7 +65,9 @@ const tree = items.map((item) => ({
   path: item.path,
   mode: '100644',
   type: 'blob',
-  sha: blobs.get(item.path),
+  // A null sha in a tree entry removes the path, which is how deletions are
+  // expressed; every other item has already uploaded a real blob.
+  sha: item.sha === null ? null : blobs.get(item.path),
 }));
 const treeRes = post(`repos/${repo}/git/trees`, { base_tree: baseSha, tree });
 console.log('tree:', treeRes.sha);
